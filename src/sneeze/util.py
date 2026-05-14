@@ -44,6 +44,14 @@ class Constant:
         super().__setattr__(name, value)
 
 
+class classproperty:
+    def __init__(self, func):
+        self.func = func
+
+    def __get__(self, obj, owner):
+        return self.func(owner)
+
+
 def iterable(obj):
     if isinstance(obj, str) or not isinstance(obj, Iterable):
         return (obj,)

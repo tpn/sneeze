@@ -5,7 +5,7 @@ from configparser import RawConfigParser
 from os.path import abspath, basename, dirname, expanduser, expandvars
 
 from .path import join_path
-from .util import Options
+from .util import Options, classproperty
 
 CONFIG = None
 CONFIG_CLASS = None
@@ -100,8 +100,7 @@ class Config(RawConfigParser):
             raise ConfigObjectAlreadyCreated()
         CONFIG = self
 
-    @classmethod
-    @property
+    @classproperty
     def namespace(cls):
         return basename(dirname(inspect.getsourcefile(cls)))
 
@@ -111,13 +110,11 @@ class Config(RawConfigParser):
         base = dirname(join_path(path, "../.."))
         return join_path(base, name)
 
-    @classmethod
-    @property
+    @classproperty
     def conf_dir(cls):
         return cls._resolve_dir("conf")
 
-    @classmethod
-    @property
+    @classproperty
     def data_dir(cls):
         path = cls._resolve_dir("data")
         os.makedirs(path, exist_ok=True)

@@ -421,6 +421,7 @@ class CLI:
                 if cmdline in ("-v", "-V", "--version"):
                     self.version()
                     exit_code = self.returncode or 0
+                    return self._exit(exit_code)
                 else:
                     cl = self.commandline = self._find_commandline(cmdline)
                     if cl:
@@ -536,14 +537,20 @@ def extract_command_args_and_kwds(*args_):
 
 def run(*args_, **kwds):
     global INTERACTIVE
+    previous_interactive = INTERACTIVE
+    interactive_request = False
     if len(args_) == 1 and isinstance(args_[0], str):
         args_ = tuple(args_[0].split(" "))
-        INTERACTIVE = True
-    args, parsed_kwds = extract_command_args_and_kwds(*args_)
-    parsed_kwds.update(kwds)
-    sneeze.config._clear_config_if_already_created()
-    cli = CLI(*args, **parsed_kwds)
-    return cli.commandline.command if INTERACTIVE else cli
+        interactive_request = True
+    INTERACTIVE = interactive_request
+    try:
+        args, parsed_kwds = extract_command_args_and_kwds(*args_)
+        parsed_kwds.update(kwds)
+        sneeze.config._clear_config_if_already_created()
+        cli = CLI(*args, **parsed_kwds)
+        return cli.commandline.command if interactive_request else cli
+    finally:
+        INTERACTIVE = previous_interactive
 
 
 def main(argv=None):

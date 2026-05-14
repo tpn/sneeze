@@ -25,6 +25,49 @@ def test_cli_introspection_loads_core_commands_without_output(capsys):
     assert captured.err == ""
 
 
+def test_version_flags_exit_cleanly(capsys, monkeypatch, tmp_path):
+    from sneeze import runlog
+
+    monkeypatch.setattr(runlog, "SNEEZE_RUN_DIR", str(tmp_path))
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "--version",
+        auto_plugins=False,
+    )
+    captured = capsys.readouterr()
+
+    assert cli.returncode == 0
+    assert captured.out == "0.1\n"
+    assert "Unknown subcommand" not in captured.err
+
+
+def test_interactive_run_does_not_poison_later_runs(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from sneeze import runlog
+
+    monkeypatch.setattr(runlog, "SNEEZE_RUN_DIR", str(tmp_path))
+
+    interactive_command = sneeze_cli.run("sne sneeze run-history")
+    capsys.readouterr()
+
+    assert interactive_command.interactive is True
+    assert sneeze_cli.INTERACTIVE is False
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "run-history",
+        auto_plugins=False,
+    )
+
+    assert cli.commandline.command.interactive is False
+
+
 def test_cli_prefixes_duplicate_plugin_command_names(
     tmp_path,
     monkeypatch,
