@@ -211,6 +211,7 @@ class CLI:
         self.returncode = 0
         self.commandline = None
         self.modules = []
+        self._skip_run_log_once = False
         self._help = self.__help__
         self._commands_by_name = {}
         self._commands_by_shortname = {}
@@ -495,7 +496,9 @@ class CLI:
         finally:
             if exit_code is None:
                 exit_code = self.returncode or 1
-            if not isinstance(error, RunLogError):
+            skip_run_log = self._skip_run_log_once
+            self._skip_run_log_once = False
+            if not skip_run_log and not isinstance(error, RunLogError):
                 self._finish_run_log(run_ctx, exit_code, error)
 
     def _finish_run_log(self, run_ctx, exit_code, error):
@@ -539,6 +542,7 @@ class CLI:
                 help_args += args
             self.args = help_args
             self._process_commandline()
+            self._skip_run_log_once = True
         else:
             self._error(self._help + os.linesep)
 

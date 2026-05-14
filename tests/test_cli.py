@@ -85,6 +85,35 @@ def test_command_help_is_not_logged_as_error(
     assert instances[0].error_message is None
 
 
+def test_help_subcommand_writes_single_run_log_entry(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from sneeze import runlog
+    from sneeze.runlog import load_run_instances
+
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "help",
+        "run-history",
+        auto_plugins=False,
+    )
+    capsys.readouterr()
+
+    instances = load_run_instances(
+        [runlog.get_run_log_path(run_dir=str(tmp_path / "run"))]
+    )
+
+    assert cli.returncode == 0
+    assert len(instances) == 1
+    assert instances[0].argv[-2:] == ["run-history", "-h"]
+    assert instances[0].error_type is None
+
+
 def test_interactive_run_does_not_poison_later_runs(
     monkeypatch,
     tmp_path,
