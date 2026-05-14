@@ -430,8 +430,8 @@ class CLI:
         )
         error = None
         exit_code = None
-        cmdline = args.pop(0).lower()
         try:
+            cmdline = args.pop(0).lower()
             if cmdline and cmdline[0] != "_":
                 if "-" not in cmdline and hasattr(self, cmdline):
                     getattr(self, cmdline)(args)

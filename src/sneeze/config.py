@@ -1,6 +1,6 @@
 import inspect
 import os
-import subprocess
+import socket
 from configparser import RawConfigParser
 from os.path import abspath, basename, dirname, expanduser, expandvars
 
@@ -39,12 +39,7 @@ SNEEZE_RUN_DIR = os.environ.get(
     join_path(XDG_STATE_HOME, "sneeze/run"),
 )
 
-try:
-    HOSTFQDN = (
-        subprocess.check_output(["hostname"], text=True).strip().lower()
-    )
-except (OSError, subprocess.CalledProcessError):
-    HOSTFQDN = "localhost"
+HOSTFQDN = (socket.getfqdn() or socket.gethostname() or "localhost").lower()
 HOSTNAME = HOSTFQDN.split(".")[0]
 
 
