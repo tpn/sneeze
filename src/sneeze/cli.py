@@ -270,11 +270,22 @@ class CLI:
             except BaseException as err:
                 error = err
                 exit_code = err.code if isinstance(err, SystemExit) else 1
+                self._drain_queue_after_error()
                 raise
             finally:
                 self.args_queue.task_done()
                 if not isinstance(error, RunLogError):
                     self._finish_run_log(run_ctx, exit_code, error)
+
+    def _drain_queue_after_error(self):
+        from queue import Empty
+
+        while True:
+            try:
+                self.args_queue.get_nowait()
+            except Empty:
+                return
+            self.args_queue.task_done()
 
     def _import_modules(self):
         include_core = True

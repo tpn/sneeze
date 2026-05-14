@@ -131,6 +131,35 @@ def test_queue_marks_task_done_when_command_raises(monkeypatch, tmp_path):
     assert queue.unfinished_tasks == 0
 
 
+def test_queue_marks_pending_tasks_done_when_command_raises(
+    monkeypatch,
+    tmp_path,
+):
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+    queue = Queue()
+    queue.put(
+        [
+            "run-history",
+            "--start-date",
+            "2026-01-03",
+            "--end-date",
+            "2026-01-02",
+        ]
+    )
+    queue.put(["run-history"])
+    cli = sneeze_cli.CLI(
+        program_name="sne",
+        module_names=["sneeze"],
+        args_queue=queue,
+        auto_plugins=False,
+    )
+
+    with pytest.raises(Exception, match="end date"):
+        cli.run()
+
+    assert queue.unfinished_tasks == 0
+
+
 def test_cli_prefixes_duplicate_plugin_command_names(
     tmp_path,
     monkeypatch,

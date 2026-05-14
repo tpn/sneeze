@@ -35,6 +35,20 @@ def test_install_target_falls_back_to_github():
     assert target == "git+https://github.com/tpn/sneeze-plugin-tpn.git"
 
 
+def test_install_target_accepts_explicit_github_shorthand():
+    target = resolve_plugin_install_target("gh:tpn/sneeze-plugin-tpn")
+
+    assert target == "git+https://github.com/tpn/sneeze-plugin-tpn.git"
+
+
+def test_install_target_accepts_explicit_url():
+    target = resolve_plugin_install_target(
+        "git+https://github.com/tpn/sneeze-plugin-tpn.git"
+    )
+
+    assert target == "git+https://github.com/tpn/sneeze-plugin-tpn.git"
+
+
 def test_scaffold_plugin_writes_expected_files(tmp_path):
     path = scaffold_plugin(
         "tpn",

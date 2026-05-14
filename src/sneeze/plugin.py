@@ -57,10 +57,10 @@ def github_shorthand_to_url(spec):
 
 
 def resolve_plugin_install_target(spec, src_dir=None):
-    if os.sep in spec or spec.startswith((".", "~")):
-        return os.path.abspath(os.path.expanduser(spec))
     if spec.startswith(("gh:", "git+", "http://", "https://")):
         return github_shorthand_to_url(spec)
+    if os.sep in spec or spec.startswith((".", "~")):
+        return os.path.abspath(os.path.expanduser(spec))
 
     username = validate_username(spec)
     local_dir = default_plugin_dir(username, base_dir=src_dir)
