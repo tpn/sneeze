@@ -233,12 +233,17 @@ class Command(metaclass=ABCMeta):
 
     def __exit__(self, *exc_info):
         self.exited = True
-        suppress = self._deallocate(*exc_info)
-        self.formatter.end(suppress, *exc_info)
-        Command.__active_command__ = self.prev
-        if not self.prev:
-            self._first_exit()
-            Command.__first_command__ = None
+        suppress = False
+        try:
+            suppress = self._deallocate(*exc_info)
+            self.formatter.end(suppress, *exc_info)
+        finally:
+            Command.__active_command__ = self.prev
+            if not self.prev:
+                try:
+                    self._first_exit()
+                finally:
+                    Command.__first_command__ = None
         exit_functions = self._exit_functions
         self._exit_functions = []
         for fn, args, kwds in exit_functions:

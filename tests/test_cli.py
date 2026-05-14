@@ -198,6 +198,24 @@ def test_reused_command_instances_do_not_replay_exit_functions():
     assert calls == ["called", "called"]
 
 
+def test_command_exit_clears_active_command_after_deallocate_error():
+    class FailingExitCommand(Command):
+        def run(self):
+            pass
+
+        def _deallocate(self, *exc_info):
+            raise RuntimeError("deallocate failed")
+
+    command = FailingExitCommand()
+    command.options = Options()
+
+    with pytest.raises(RuntimeError, match="deallocate failed"):
+        command.start()
+
+    assert Command.get_active_command() is None
+    assert Command.get_first_command() is None
+
+
 def test_cli_prefixes_duplicate_plugin_command_names(
     tmp_path,
     monkeypatch,
