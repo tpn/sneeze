@@ -182,6 +182,38 @@ def test_queue_marks_pending_tasks_done_when_command_raises(
     assert queue.unfinished_tasks == 0
 
 
+def test_direct_commandline_logs_unexpected_command_exception(
+    monkeypatch,
+    tmp_path,
+):
+    from sneeze import runlog
+    from sneeze.runlog import load_run_instances
+
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+
+    def fail(self, args):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(sneeze_cli.CommandLine, "run", fail)
+
+    with pytest.raises(ValueError, match="boom"):
+        sneeze_cli.run(
+            "sne",
+            "sneeze",
+            "run-history",
+            auto_plugins=False,
+        )
+
+    instances = load_run_instances(
+        [runlog.get_run_log_path(run_dir=str(tmp_path / "run"))]
+    )
+
+    assert len(instances) == 1
+    assert instances[0].exit_code == 1
+    assert instances[0].error_type == "ValueError"
+    assert instances[0].error_message == "boom"
+
+
 def test_reused_command_instances_do_not_replay_exit_functions():
     calls = []
 

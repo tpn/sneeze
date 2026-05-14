@@ -463,6 +463,15 @@ class CLI:
                             error = err
                             self._commandline_error(cl, str(err))
                             exit_code = self.returncode or 1
+                        except BaseException as err:
+                            error = err
+                            exit_code = (
+                                err.code
+                                if isinstance(err, SystemExit)
+                                and isinstance(err.code, int)
+                                else 1
+                            )
+                            raise
             if not self.returncode:
                 if not error:
                     error = CommandError(
