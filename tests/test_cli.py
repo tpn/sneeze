@@ -1,5 +1,4 @@
 import sys
-from pathlib import Path
 
 from sneeze import cli as sneeze_cli
 from sneeze.plugin import PluginSpec
@@ -30,17 +29,18 @@ def test_version_flags_exit_cleanly(capsys, monkeypatch, tmp_path):
 
     monkeypatch.setattr(runlog, "SNEEZE_RUN_DIR", str(tmp_path))
 
-    cli = sneeze_cli.run(
-        "sne",
-        "sneeze",
-        "--version",
-        auto_plugins=False,
-    )
-    captured = capsys.readouterr()
+    for flag in ("--version", "-v", "-V"):
+        cli = sneeze_cli.run(
+            "sne",
+            "sneeze",
+            flag,
+            auto_plugins=False,
+        )
+        captured = capsys.readouterr()
 
-    assert cli.returncode == 0
-    assert captured.out == "0.1\n"
-    assert "Unknown subcommand" not in captured.err
+        assert cli.returncode == 0
+        assert captured.out == "0.1\n"
+        assert "Unknown subcommand" not in captured.err
 
 
 def test_interactive_run_does_not_poison_later_runs(
@@ -140,4 +140,3 @@ class {class_name}(InvariantAwareCommand):
 """.lstrip(),
         encoding="utf-8",
     )
-    sys.path.insert(0, str(Path(tmp_path)))
