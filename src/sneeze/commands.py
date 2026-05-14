@@ -196,8 +196,6 @@ class RunHistoryCommand(InvariantAwareCommand):
             self._out(f"{host}:")
             for inst in by_host[host]:
                 argv = list(inst.argv or [])
-                if argv:
-                    argv[0] = "sne"
                 cmdline = " ".join(shlex.quote(arg) for arg in argv)
                 if self.friendly_timestamps:
                     timestamp = inst.started_at
