@@ -157,7 +157,6 @@ def scaffold_plugin(username, output_dir=None, force=False, init_git=True):
         "README.md": readme,
         "AGENTS.md": _plugin_agents_md(username),
         "pyproject.toml": _plugin_pyproject(dist_name, package),
-        "src/sneeze/__init__.py": _namespace_init(),
         f"src/sneeze/{username}/__init__.py": '__version__ = "0.1"\n',
         f"src/sneeze/{username}/config.py": _plugin_config_py(),
         f"src/sneeze/{username}/commands.py": _plugin_commands_py(username),
@@ -171,13 +170,6 @@ def scaffold_plugin(username, output_dir=None, force=False, init_git=True):
     if init_git and not (path / ".git").exists():
         subprocess.run(["git", "init"], cwd=path, check=False)
     return path
-
-
-def _namespace_init():
-    return (
-        "from pkgutil import extend_path\n\n"
-        "__path__ = extend_path(__path__, __name__)\n"
-    )
 
 
 def _plugin_gitignore():
@@ -221,6 +213,7 @@ package-dir = {{"" = "src"}}
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["sneeze*"]
+namespaces = true
 
 [tool.black]
 line-length = 78

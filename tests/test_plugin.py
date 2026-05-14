@@ -43,6 +43,7 @@ def test_scaffold_plugin_writes_expected_files(tmp_path):
     assert (path / "README.md").exists()
     assert (path / "AGENTS.md").exists()
     assert (path / "pyproject.toml").exists()
+    assert not (path / "src/sneeze/__init__.py").exists()
     assert (path / "src/sneeze/tpn/commands.py").exists()
     assert "../sneeze/agents/PLUGINS.md" in (path / "AGENTS.md").read_text(
         encoding="utf-8"
