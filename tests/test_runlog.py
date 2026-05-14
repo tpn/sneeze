@@ -181,6 +181,19 @@ def test_append_run_instance_times_out_for_live_lock(
         )
 
 
+def test_default_repo_root_uses_current_working_directory(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.runlog import CommandRunContext
+
+    monkeypatch.chdir(tmp_path)
+
+    ctx = CommandRunContext(["sne", "run-history"])
+
+    assert ctx.repo_root == str(tmp_path)
+
+
 def test_cli_run_history_fails_loudly_for_corrupted_log(
     tmp_path,
     monkeypatch,

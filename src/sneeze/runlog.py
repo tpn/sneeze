@@ -359,9 +359,15 @@ def _iter_run_log_items(text, path=None, strict=True):
             )
 
 
-@lru_cache(maxsize=1)
 def _default_repo_root():
-    return join_path(os.path.dirname(os.path.abspath(__file__)), "../..")
+    current = os.path.abspath(os.getcwd())
+    while True:
+        if os.path.exists(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return os.path.abspath(os.getcwd())
+        current = parent
 
 
 @lru_cache(maxsize=8)

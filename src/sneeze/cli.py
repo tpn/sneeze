@@ -242,6 +242,7 @@ class CLI:
             run_ctx = CommandRunContext(
                 argv=[self.program_name] + raw_args,
                 command=cmdline_norm,
+                repo_root=find_repo_root(),
             )
             error = None
             exit_code = 0
@@ -424,6 +425,7 @@ class CLI:
         run_ctx = CommandRunContext(
             argv=[argv0] + raw_args,
             command=cmdline_norm,
+            repo_root=find_repo_root(),
         )
         error = None
         exit_code = None
