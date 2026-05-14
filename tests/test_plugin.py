@@ -1,3 +1,5 @@
+import tomllib
+
 from sneeze.plugin import (
     github_shorthand_to_url,
     pip_install_plugin,
@@ -55,15 +57,46 @@ def test_scaffold_plugin_writes_expected_files(tmp_path):
         output_dir=tmp_path / "sneeze-plugin-tpn",
         init_git=False,
     )
+    pyproject = tomllib.loads(
+        (path / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    commands_py = (path / "src/sneeze/tpn/commands.py").read_text(
+        encoding="utf-8"
+    )
 
     assert (path / "README.md").exists()
     assert (path / "AGENTS.md").exists()
     assert (path / "pyproject.toml").exists()
     assert not (path / "src/sneeze/__init__.py").exists()
     assert (path / "src/sneeze/tpn/commands.py").exists()
+    assert (
+        pyproject["project"]["entry-points"]["sneeze.plugins"]["tpn"]
+        == "sneeze.tpn"
+    )
+    assert "class TpnPluginInfo" in commands_py
     assert "../sneeze/agents/PLUGINS.md" in (path / "AGENTS.md").read_text(
         encoding="utf-8"
     )
+
+
+def test_scaffold_plugin_formats_underscore_username(tmp_path):
+    path = scaffold_plugin(
+        "trent_nelson",
+        output_dir=tmp_path / "sneeze-plugin-trent-nelson",
+        init_git=False,
+    )
+    pyproject = tomllib.loads(
+        (path / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    commands_py = (path / "src/sneeze/trent_nelson/commands.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        pyproject["project"]["entry-points"]["sneeze.plugins"]["trent_nelson"]
+        == "sneeze.trent_nelson"
+    )
+    assert "class TrentNelsonPluginInfo" in commands_py
 
 
 def test_pip_helpers_use_current_interpreter(monkeypatch):
