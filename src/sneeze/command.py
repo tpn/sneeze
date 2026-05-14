@@ -235,19 +235,21 @@ class Command(metaclass=ABCMeta):
         self.exited = True
         suppress = False
         try:
-            suppress = self._deallocate(*exc_info)
-            self.formatter.end(suppress, *exc_info)
+            try:
+                suppress = self._deallocate(*exc_info)
+                self.formatter.end(suppress, *exc_info)
+            finally:
+                Command.__active_command__ = self.prev
+                if not self.prev:
+                    try:
+                        self._first_exit()
+                    finally:
+                        Command.__first_command__ = None
         finally:
-            Command.__active_command__ = self.prev
-            if not self.prev:
-                try:
-                    self._first_exit()
-                finally:
-                    Command.__first_command__ = None
-        exit_functions = self._exit_functions
-        self._exit_functions = []
-        for fn, args, kwds in exit_functions:
-            fn(*args, **kwds)
+            exit_functions = self._exit_functions
+            self._exit_functions = []
+            for fn, args, kwds in exit_functions:
+                fn(*args, **kwds)
         return suppress
 
     @property
