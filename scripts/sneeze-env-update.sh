@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -uo pipefail
+set -euo pipefail
 
 ENV_NAME="${1:-sneeze314t}"
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,14 +27,9 @@ pick_env_yml() {
   fi
 }
 
-try_cmd() {
+run_cmd() {
   note "+ $*"
   "$@"
-  local rc=$?
-  if [[ "${rc}" -ne 0 ]]; then
-    note "WARN: command failed (exit=${rc}): $*"
-  fi
-  return 0
 }
 
 CONDA_BIN="$(pick_conda || true)"
@@ -44,14 +39,10 @@ if [[ -z "${CONDA_BIN}" ]]; then
 fi
 
 ENV_YML="$(pick_env_yml "${ENV_NAME}")"
-YES_ARGS=()
-if [[ "${CONDA_BIN}" == "conda" ]]; then
-  YES_ARGS+=(--yes)
-fi
+YES_ARGS=(--yes)
 
 note "Using ${CONDA_BIN}; env name: ${ENV_NAME}; env file: ${ENV_YML}"
-try_cmd "${CONDA_BIN}" env update -n "${ENV_NAME}" -f "${ENV_YML}" \
+run_cmd "${CONDA_BIN}" env update -n "${ENV_NAME}" -f "${ENV_YML}" \
   "${YES_ARGS[@]}"
-try_cmd "${CONDA_BIN}" run -n "${ENV_NAME}" python -m pip install \
+run_cmd "${CONDA_BIN}" run -n "${ENV_NAME}" python -m pip install \
   -e "${ROOT_DIR}[dev]"
-

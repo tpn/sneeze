@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -uo pipefail
+set -euo pipefail
 
 ENV_NAME="${1:-sneeze314t}"
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,14 +27,9 @@ pick_env_yml() {
   fi
 }
 
-try_cmd() {
+run_cmd() {
   note "+ $*"
   "$@"
-  local rc=$?
-  if [[ "${rc}" -ne 0 ]]; then
-    note "WARN: command failed (exit=${rc}): $*"
-  fi
-  return 0
 }
 
 CONDA_BIN="$(pick_conda || true)"
@@ -45,6 +40,7 @@ fi
 
 ENV_YML="$(pick_env_yml "${ENV_NAME}")"
 note "Using ${CONDA_BIN}; env name: ${ENV_NAME}; env file: ${ENV_YML}"
-try_cmd "${CONDA_BIN}" env create -n "${ENV_NAME}" -f "${ENV_YML}" -y
-try_cmd "${ROOT_DIR}/scripts/sneeze-env-update.sh" "${ENV_NAME}"
-
+if ! run_cmd "${CONDA_BIN}" env create -n "${ENV_NAME}" -f "${ENV_YML}" -y; then
+  note "WARN: env create failed; trying update for an existing env."
+fi
+run_cmd "${ROOT_DIR}/scripts/sneeze-env-update.sh" "${ENV_NAME}"

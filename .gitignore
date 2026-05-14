@@ -28,6 +28,5 @@ venv/
 
 # Local runtime state
 logs/
-.roborev/last-review.md
+.roborev/*.md
 .roborev/commit-reviews/
-
