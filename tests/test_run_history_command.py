@@ -83,13 +83,24 @@ def test_run_history_friendly_timestamps_all_hosts(
         auto_plugins=False,
     )
     captured = capsys.readouterr()
+    install_stamp = dt.datetime.fromisoformat(
+        "2026-01-02T10:00:00+00:00"
+    ).astimezone()
+    remove_stamp = dt.datetime.fromisoformat(
+        "2026-01-02T11:00:00+00:00"
+    ).astimezone()
 
     assert cli.returncode == 0
     assert f"{runlog.HOSTNAME}:" in captured.out
     assert "other:" in captured.out
-    assert "    [" in captured.out
-    assert "sne install-plugin" in captured.out
-    assert "sne remove-plugin" in captured.out
+    assert (
+        f"    [{install_stamp:%Y-%m-%d %H:%M:%S}] sne install-plugin"
+        in captured.out
+    )
+    assert (
+        f"    [{remove_stamp:%Y-%m-%d %H:%M:%S}] sne remove-plugin"
+        in captured.out
+    )
 
 
 def test_run_history_filters_argv_and_git_rev(
