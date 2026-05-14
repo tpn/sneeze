@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sneeze"
+version = "0.1"
+description = "Plugin-oriented command tools."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "Trent Nelson" },
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "black>=26.3.1",
+  "mypy",
+  "pytest",
+  "ruff>=0.15.12",
+]
+
+[project.scripts]
+sne = "sneeze.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 78
+target-version = ["py312"]
+include = "src/sneeze/.*\\.pyi?$|tests/.*\\.pyi?$"
+
+[tool.ruff]
+line-length = 78
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.pycodestyle]
+max-line-length = 78
+
+[tool.mypy]
+install_types = true
+non_interactive = true
+
