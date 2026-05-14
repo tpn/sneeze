@@ -86,6 +86,26 @@ def test_interactive_unknown_command_returns_cli(
     assert "Unknown subcommand 'nope'" in captured.err
 
 
+def test_cli_does_not_dispatch_arbitrary_instance_attributes(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+
+    for name in ("modules", "run"):
+        cli = sneeze_cli.run(
+            "sne",
+            "sneeze",
+            name,
+            auto_plugins=False,
+        )
+        captured = capsys.readouterr()
+
+        assert cli.returncode == 1
+        assert f"Unknown subcommand '{name}'" in captured.err
+
+
 def test_queue_unknown_command_fails_without_attribute_error(
     monkeypatch,
     tmp_path,

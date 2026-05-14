@@ -33,6 +33,7 @@ from .util import (
 INTERACTIVE = False
 DEFAULT_PROGRAM_NAME = "sne"
 DEFAULT_MODULE_NAMES = "sneeze"
+CLI_METHOD_COMMANDS = {"help", "usage", "version"}
 
 
 @dataclass
@@ -443,7 +444,7 @@ class CLI:
         try:
             cmdline = args.pop(0).lower()
             if cmdline and cmdline[0] != "_":
-                if "-" not in cmdline and hasattr(self, cmdline):
+                if cmdline in CLI_METHOD_COMMANDS:
                     getattr(self, cmdline)(args)
                     exit_code = 0
                     return self._exit(0)
