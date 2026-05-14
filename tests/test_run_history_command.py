@@ -129,6 +129,37 @@ def test_run_history_friendly_without_timestamps(
     assert "    [" not in captured.out
 
 
+def test_run_history_friendly_preserves_logged_argv0(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _use_run_dir(tmp_path, monkeypatch)
+    _write_log(
+        tmp_path,
+        runlog.HOSTNAME,
+        [
+            _instance(
+                "install-plugin",
+                "2026-01-02T10:00:00+00:00",
+                argv=["custom-sne", "install-plugin", "tpn"],
+            )
+        ],
+    )
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "run-history",
+        "--friendly",
+        auto_plugins=False,
+    )
+    captured = capsys.readouterr()
+
+    assert cli.returncode == 0
+    assert "custom-sne install-plugin tpn" in captured.out
+
+
 def test_run_history_filters_hostnames(tmp_path, monkeypatch, capsys):
     _use_run_dir(tmp_path, monkeypatch)
     _write_log(
