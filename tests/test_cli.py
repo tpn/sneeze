@@ -1,3 +1,4 @@
+import logging
 import sys
 from queue import Queue
 from types import SimpleNamespace
@@ -5,9 +6,14 @@ from types import SimpleNamespace
 import pytest
 
 from sneeze import cli as sneeze_cli
-from sneeze.command import Command
+from sneeze.command import Command, resolve_log_level
 from sneeze.plugin import PluginSpec
 from sneeze.util import Options
+
+
+def test_resolve_log_level_uses_public_standard_levels():
+    assert resolve_log_level(logging.WARNING) == ("WARNING", logging.WARNING)
+    assert resolve_log_level("warn") == ("WARNING", logging.WARNING)
 
 
 def test_default_program_name_matches_console_script():

@@ -31,9 +31,7 @@ _LEVEL_VALUE_BY_NAME = {
     name: getattr(logging, name) for name in STANDARD_LOG_LEVEL_NAMES
 }
 _LEVEL_NAME_BY_VALUE = {
-    value: name
-    for value, name in logging._levelToName.items()
-    if isinstance(value, int)
+    getattr(logging, name): name for name in STANDARD_LOG_LEVEL_NAMES
 }
 DEFAULT_LOG_DIR = os.environ.get(
     "SNEEZE_LOG_DIR",
