@@ -8,6 +8,7 @@ import pytest
 
 from sneeze.runlog import (
     RunLogCorruptionError,
+    RunLogError,
     SneezeCommandRunInstance,
     append_run_instance,
     load_run_instances,
@@ -158,6 +159,26 @@ def test_append_run_instance_waits_for_live_lock_release(
         "run-history",
     ]
     assert not os.path.exists(lock_path)
+
+
+def test_append_run_instance_times_out_for_live_lock(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "sne-air.json"
+    lock_path = str(path) + ".lock"
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        json.dump({"pid": os.getpid(), "hostname": "air"}, handle)
+
+    monkeypatch.setattr("sneeze.runlog._LOCK_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("sneeze.runlog._LOCK_TIMEOUT_S", 0.02)
+
+    with pytest.raises(RunLogError, match="timed out acquiring run log lock"):
+        append_run_instance(
+            _make_instance("run-history"),
+            hostname="air",
+            run_dir=str(tmp_path),
+        )
 
 
 def test_cli_run_history_fails_loudly_for_corrupted_log(

@@ -122,8 +122,10 @@ def configure_logging(level, log_format=DEFAULT_LOG_FORMAT, log_file=None):
         try:
             handler.flush()
         finally:
-            handler.close()
-        root.removeHandler(handler)
+            try:
+                handler.close()
+            finally:
+                root.removeHandler(handler)
     handler = logging.FileHandler(filename, encoding="utf-8")
     handler.setLevel(level)
     if log_format:

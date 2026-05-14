@@ -16,6 +16,7 @@ RUN_LOG_SUFFIX = ".json"
 RUN_LOG_LOCK_SUFFIX = ".lock"
 _LOCK_POLL_INTERVAL_S = 0.05
 _LOCK_STALE_GRACE_S = 5.0
+_LOCK_TIMEOUT_S = float(os.environ.get("SNEEZE_RUN_LOG_LOCK_TIMEOUT", "30"))
 
 
 class RunLogError(Exception):
@@ -213,6 +214,7 @@ def _acquire_run_log_lock(path):
     directory = os.path.dirname(lock_path)
     if directory:
         os.makedirs(directory, exist_ok=True)
+    deadline = time.monotonic() + _LOCK_TIMEOUT_S
     while True:
         try:
             fd = os.open(
@@ -221,6 +223,10 @@ def _acquire_run_log_lock(path):
                 0o600,
             )
         except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise RunLogError(
+                    f"timed out acquiring run log lock: {lock_path}"
+                ) from None
             if _break_stale_run_log_lock(lock_path):
                 continue
             time.sleep(_LOCK_POLL_INTERVAL_S)

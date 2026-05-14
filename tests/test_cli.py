@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 from sneeze import cli as sneeze_cli
 from sneeze.plugin import PluginSpec
@@ -117,6 +118,148 @@ def test_cli_keeps_core_name_and_prefixes_plugin_collision(
     assert "alpha-run-history" in cli._commands_by_name
 
 
+def test_init_plugin_cli_happy_path(tmp_path, monkeypatch, capsys):
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+    plugin_dir = tmp_path / "sneeze-plugin-acme"
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "init-plugin",
+        "acme",
+        "--output-dir",
+        str(plugin_dir),
+        "--no-git",
+        auto_plugins=False,
+    )
+    captured = capsys.readouterr()
+
+    assert cli.returncode == 0
+    assert "initialized plugin at" in captured.out
+    assert (plugin_dir / "pyproject.toml").exists()
+    assert not (plugin_dir / ".git").exists()
+
+
+def test_init_plugin_cli_formats_errors(tmp_path, monkeypatch, capsys):
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "init-plugin",
+        "bad!",
+        auto_plugins=False,
+    )
+    captured = capsys.readouterr()
+
+    assert cli.returncode == 1
+    assert "sne init-plugin failed:" in captured.err
+
+
+def test_install_plugin_cli_happy_path(tmp_path, monkeypatch, capsys):
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+    local = tmp_path / "sneeze-plugin-tpn"
+    local.mkdir()
+    calls = []
+
+    def fake_install(target, editable=True):
+        calls.append((target, editable))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("sneeze.commands.pip_install_plugin", fake_install)
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "install-plugin",
+        "tpn",
+        "--src-dir",
+        str(tmp_path),
+        auto_plugins=False,
+    )
+    captured = capsys.readouterr()
+
+    assert cli.returncode == 0
+    assert calls == [(str(local), True)]
+    assert "installed editable plugin" in captured.out
+
+
+def test_install_plugin_cli_reports_pip_failure(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "sneeze.commands.pip_install_plugin",
+        lambda target, editable=True: SimpleNamespace(returncode=7),
+    )
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "install-plugin",
+        "tpn",
+        "--src-dir",
+        str(tmp_path),
+        auto_plugins=False,
+    )
+    captured = capsys.readouterr()
+
+    assert cli.returncode == 1
+    assert "pip install failed with exit 7" in captured.err
+
+
+def test_remove_plugin_cli_happy_path(tmp_path, monkeypatch, capsys):
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_uninstall(name):
+        calls.append(name)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(
+        "sneeze.commands.pip_uninstall_plugin", fake_uninstall
+    )
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "remove-plugin",
+        "tpn",
+        auto_plugins=False,
+    )
+    captured = capsys.readouterr()
+
+    assert cli.returncode == 0
+    assert calls == ["tpn"]
+    assert "removed plugin tpn" in captured.out
+
+
+def test_remove_plugin_cli_reports_pip_failure(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "sneeze.commands.pip_uninstall_plugin",
+        lambda name: SimpleNamespace(returncode=9),
+    )
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "remove-plugin",
+        "tpn",
+        auto_plugins=False,
+    )
+    captured = capsys.readouterr()
+
+    assert cli.returncode == 1
+    assert "pip uninstall failed with exit 9" in captured.err
+
+
 def _write_plugin(tmp_path, package, username, class_name="Foo"):
     for name in [package, f"{package}.commands", f"{package}.config"]:
         sys.modules.pop(name, None)
@@ -140,3 +283,9 @@ class {class_name}(InvariantAwareCommand):
 """.lstrip(),
         encoding="utf-8",
     )
+
+
+def _use_tmp_run_dir(tmp_path, monkeypatch):
+    from sneeze import runlog
+
+    monkeypatch.setattr(runlog, "SNEEZE_RUN_DIR", str(tmp_path / "run"))

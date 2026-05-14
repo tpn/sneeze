@@ -249,7 +249,7 @@ class InitPlugin(InvariantAwareCommand):
         try:
             path = scaffold_plugin(
                 username,
-                output_dir=self._output_dir,
+                output_dir=self.output_dir,
                 force=self.force,
                 init_git=not self.no_git,
             )
@@ -284,9 +284,7 @@ class InstallPlugin(InvariantAwareCommand):
     def run(self):
         spec = self.args[0]
         try:
-            target = resolve_plugin_install_target(
-                spec, src_dir=self._src_dir
-            )
+            target = resolve_plugin_install_target(spec, src_dir=self.src_dir)
         except PluginError as exc:
             raise CommandError(str(exc)) from exc
         result = pip_install_plugin(target, editable=not self.no_editable)

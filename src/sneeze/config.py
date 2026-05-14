@@ -13,18 +13,30 @@ CONFIG_CLASS = None
 PATH = dirname(abspath(__file__))
 NAMESPACE = basename(PATH)
 
-SNEEZE_WORKSPACE_DIR = join_path(PATH, "../../..")
+XDG_DATA_HOME = os.environ.get(
+    "XDG_DATA_HOME",
+    join_path(expanduser("~"), ".local/share"),
+)
+XDG_STATE_HOME = os.environ.get(
+    "XDG_STATE_HOME",
+    join_path(expanduser("~"), ".local/state"),
+)
+XDG_CONFIG_HOME = os.environ.get(
+    "XDG_CONFIG_HOME",
+    join_path(expanduser("~"), ".config"),
+)
+
 SNEEZE_DATA_DIR = os.environ.get(
     "SNEEZE_DATA_DIR",
-    join_path(SNEEZE_WORKSPACE_DIR, "sneeze-data"),
+    join_path(XDG_DATA_HOME, "sneeze"),
 )
 SNEEZE_CONF_DIR = os.environ.get(
     "SNEEZE_CONF_DIR",
-    join_path(SNEEZE_WORKSPACE_DIR, "sneeze-conf"),
+    join_path(XDG_CONFIG_HOME, "sneeze"),
 )
 SNEEZE_RUN_DIR = os.environ.get(
     "SNEEZE_RUN_DIR",
-    join_path(SNEEZE_WORKSPACE_DIR, "sneeze-run"),
+    join_path(XDG_STATE_HOME, "sneeze/run"),
 )
 
 try:
