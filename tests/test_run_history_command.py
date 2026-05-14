@@ -103,6 +103,69 @@ def test_run_history_friendly_timestamps_all_hosts(
     )
 
 
+def test_run_history_friendly_without_timestamps(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _use_run_dir(tmp_path, monkeypatch)
+    _write_log(
+        tmp_path,
+        runlog.HOSTNAME,
+        [_instance("install-plugin", "2026-01-02T10:00:00+00:00")],
+    )
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "run-history",
+        "--friendly",
+        auto_plugins=False,
+    )
+    captured = capsys.readouterr()
+
+    assert cli.returncode == 0
+    assert "    sne install-plugin" in captured.out
+    assert "    [" not in captured.out
+
+
+def test_run_history_filters_hostnames(tmp_path, monkeypatch, capsys):
+    _use_run_dir(tmp_path, monkeypatch)
+    _write_log(
+        tmp_path,
+        runlog.HOSTNAME,
+        [_instance("install-plugin", "2026-01-02T10:00:00+00:00")],
+    )
+    _write_log(
+        tmp_path,
+        "other",
+        [
+            _instance(
+                "remove-plugin",
+                "2026-01-02T11:00:00+00:00",
+                host="other",
+            )
+        ],
+    )
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "run-history",
+        "--hostnames",
+        "other",
+        "--friendly",
+        auto_plugins=False,
+    )
+    captured = capsys.readouterr()
+
+    assert cli.returncode == 0
+    assert "other:" in captured.out
+    assert f"{runlog.HOSTNAME}:" not in captured.out
+    assert "sne remove-plugin" in captured.out
+    assert "sne install-plugin" not in captured.out
+
+
 def test_run_history_filters_argv_and_git_rev(
     tmp_path,
     monkeypatch,
