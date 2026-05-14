@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from .config import HOSTFQDN, HOSTNAME, SNEEZE_RUN_DIR
-from .path import join_path
+from .path import find_repo_root, join_path
 
 RUN_LOG_PREFIX = "sne-"
 RUN_LOG_SUFFIX = ".json"
@@ -359,15 +359,11 @@ def _iter_run_log_items(text, path=None, strict=True):
             )
 
 
+_DEFAULT_REPO_ROOT = object()
+
+
 def _default_repo_root():
-    current = os.path.abspath(os.getcwd())
-    while True:
-        if os.path.exists(os.path.join(current, ".git")):
-            return current
-        parent = os.path.dirname(current)
-        if parent == current:
-            return os.path.abspath(os.getcwd())
-        current = parent
+    return find_repo_root()
 
 
 @lru_cache(maxsize=8)
@@ -440,10 +436,12 @@ def append_run_instance(instance, hostname=None, run_dir=None):
 
 
 class CommandRunContext:
-    def __init__(self, argv, command=None, repo_root=None):
+    def __init__(self, argv, command=None, repo_root=_DEFAULT_REPO_ROOT):
         self.argv = list(argv) if argv else []
         self.command = command
-        self.repo_root = repo_root or _default_repo_root()
+        if repo_root is _DEFAULT_REPO_ROOT:
+            repo_root = _default_repo_root()
+        self.repo_root = repo_root
         self.started_at = dt.datetime.now(dt.UTC)
         self._start_perf = time.perf_counter()
         self._start_usage = _get_rusage()

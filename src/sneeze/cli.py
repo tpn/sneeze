@@ -19,6 +19,7 @@ from .command import (
 )
 from .config import ConfigObjectAlreadyCreated, get_config
 from .invariant import Invariant
+from .path import find_repo_root
 from .plugin import discover_plugins, import_plugin_modules
 from .runlog import CommandRunContext, RunLogError
 from .util import (
@@ -518,17 +519,6 @@ class CLI:
             self._process_commandline()
         else:
             self._error(self._help + os.linesep)
-
-
-def find_repo_root(start_dir=None):
-    current = os.path.abspath(start_dir or os.getcwd())
-    while True:
-        if os.path.exists(os.path.join(current, ".git")):
-            return current
-        parent = os.path.dirname(current)
-        if parent == current:
-            return None
-        current = parent
 
 
 def _prefix_default_cli_args(args):

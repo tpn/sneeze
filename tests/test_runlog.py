@@ -181,7 +181,7 @@ def test_append_run_instance_times_out_for_live_lock(
         )
 
 
-def test_default_repo_root_uses_current_working_directory(
+def test_default_repo_root_is_none_outside_git_repo(
     tmp_path,
     monkeypatch,
 ):
@@ -191,7 +191,7 @@ def test_default_repo_root_uses_current_working_directory(
 
     ctx = CommandRunContext(["sne", "run-history"])
 
-    assert ctx.repo_root == str(tmp_path)
+    assert ctx.repo_root is None
 
 
 def test_cli_run_history_fails_loudly_for_corrupted_log(
