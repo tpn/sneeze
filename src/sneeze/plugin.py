@@ -258,8 +258,6 @@ def _plugin_commands_py(username):
 class {class_name}PluginInfo(InvariantAwareCommand):
     """Show basic information about this plugin."""
 
-    _shortname_ = "{username[:1]}pi"
-
     def run(self):
         self._out("sneeze plugin: {username}")
 '''

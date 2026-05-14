@@ -5,7 +5,9 @@ from types import SimpleNamespace
 import pytest
 
 from sneeze import cli as sneeze_cli
+from sneeze.command import Command
 from sneeze.plugin import PluginSpec
+from sneeze.util import Options
 
 
 def test_default_program_name_matches_console_script():
@@ -158,6 +160,22 @@ def test_queue_marks_pending_tasks_done_when_command_raises(
         cli.run()
 
     assert queue.unfinished_tasks == 0
+
+
+def test_reused_command_instances_do_not_replay_exit_functions():
+    calls = []
+
+    class ExitCommand(Command):
+        def run(self):
+            self.on_exit(calls.append, "called")
+
+    command = ExitCommand()
+    command.options = Options()
+
+    command.start()
+    command.start()
+
+    assert calls == ["called", "called"]
 
 
 def test_cli_prefixes_duplicate_plugin_command_names(

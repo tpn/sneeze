@@ -239,7 +239,9 @@ class Command(metaclass=ABCMeta):
         if not self.prev:
             self._first_exit()
             Command.__first_command__ = None
-        for fn, args, kwds in self._exit_functions:
+        exit_functions = self._exit_functions
+        self._exit_functions = []
+        for fn, args, kwds in exit_functions:
             fn(*args, **kwds)
         return suppress
 
