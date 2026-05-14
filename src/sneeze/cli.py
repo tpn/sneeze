@@ -265,15 +265,14 @@ class CLI:
                         )
                     )
                     exit_code = self.returncode or 1
-                    self.args_queue.task_done()
                     continue
                 cl.run(args)
-                self.args_queue.task_done()
             except BaseException as err:
                 error = err
                 exit_code = err.code if isinstance(err, SystemExit) else 1
                 raise
             finally:
+                self.args_queue.task_done()
                 if not isinstance(error, RunLogError):
                     self._finish_run_log(run_ctx, exit_code, error)
 

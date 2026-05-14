@@ -2,6 +2,8 @@ import sys
 from queue import Queue
 from types import SimpleNamespace
 
+import pytest
+
 from sneeze import cli as sneeze_cli
 from sneeze.plugin import PluginSpec
 
@@ -102,6 +104,31 @@ def test_queue_unknown_command_fails_without_attribute_error(
 
     assert cli.returncode == 1
     assert "Unknown subcommand 'nope'" in captured.err
+
+
+def test_queue_marks_task_done_when_command_raises(monkeypatch, tmp_path):
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+    queue = Queue()
+    queue.put(
+        [
+            "run-history",
+            "--start-date",
+            "2026-01-03",
+            "--end-date",
+            "2026-01-02",
+        ]
+    )
+    cli = sneeze_cli.CLI(
+        program_name="sne",
+        module_names=["sneeze"],
+        args_queue=queue,
+        auto_plugins=False,
+    )
+
+    with pytest.raises(Exception, match="end date"):
+        cli.run()
+
+    assert queue.unfinished_tasks == 0
 
 
 def test_cli_prefixes_duplicate_plugin_command_names(
