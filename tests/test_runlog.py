@@ -107,6 +107,15 @@ def test_repair_run_log_rewrites_recoverable_fragments(tmp_path):
     ]
 
 
+def test_repair_run_log_missing_path_is_noop(tmp_path):
+    path = tmp_path / "missing.json"
+
+    repaired = repair_run_log(str(path))
+
+    assert repaired == 0
+    assert not path.exists()
+
+
 def test_append_run_instance_removes_stale_lock(tmp_path):
     path = tmp_path / "sne-air.json"
     lock_path = str(path) + ".lock"
@@ -220,3 +229,28 @@ def test_cli_run_history_fails_loudly_for_corrupted_log(
     assert cli.returncode == 1
     assert "sne run-history failed:" in captured.err
     assert "recoverable trailing items" in captured.err
+
+
+def test_cli_dispatch_appends_run_log_entry(tmp_path, monkeypatch, capsys):
+    from sneeze import cli as sneeze_cli
+    from sneeze import runlog
+
+    monkeypatch.setattr(runlog, "SNEEZE_RUN_DIR", str(tmp_path))
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "--version",
+        auto_plugins=False,
+    )
+    capsys.readouterr()
+
+    instances = load_run_instances(
+        [runlog.get_run_log_path(run_dir=str(tmp_path))]
+    )
+
+    assert cli.returncode == 0
+    assert len(instances) == 1
+    assert instances[0].argv[-1] == "--version"
+    assert instances[0].command == "--version"
+    assert instances[0].exit_code == 0

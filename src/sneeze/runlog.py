@@ -297,6 +297,8 @@ def _append_json_list(path, entry_json):
 
 
 def repair_run_log(path):
+    if not os.path.exists(path):
+        return 0
     lock_path = _acquire_run_log_lock(path)
     try:
         instances = load_run_instances([path], strict=False)
