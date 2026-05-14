@@ -3,6 +3,7 @@ import os
 import re
 from abc import ABCMeta, abstractmethod
 
+from .config import SNEEZE_DATA_DIR
 from .util import (
     Dict,
     add_linesep_if_missing,
@@ -34,8 +35,9 @@ _LEVEL_NAME_BY_VALUE = {
     for value, name in logging._levelToName.items()
     if isinstance(value, int)
 }
-DEFAULT_LOG_DIR = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "../logs")
+DEFAULT_LOG_DIR = os.environ.get(
+    "SNEEZE_LOG_DIR",
+    os.path.join(SNEEZE_DATA_DIR, "logs"),
 )
 DEFAULT_LOG_FILENAME = "sneeze.log"
 LOG_FILE_ENV = "SNEEZE_LOG_FILE"

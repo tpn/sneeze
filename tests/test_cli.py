@@ -1,4 +1,5 @@
 import sys
+from queue import Queue
 from types import SimpleNamespace
 
 from sneeze import cli as sneeze_cli
@@ -67,6 +68,40 @@ def test_interactive_run_does_not_poison_later_runs(
     )
 
     assert cli.commandline.command.interactive is False
+
+
+def test_interactive_unknown_command_returns_cli(
+    monkeypatch, tmp_path, capsys
+):
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+
+    cli = sneeze_cli.run("sne sneeze nope")
+    captured = capsys.readouterr()
+
+    assert cli.returncode == 1
+    assert "Unknown subcommand 'nope'" in captured.err
+
+
+def test_queue_unknown_command_fails_without_attribute_error(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+    queue = Queue()
+    queue.put(["nope"])
+    cli = sneeze_cli.CLI(
+        program_name="sne",
+        module_names=["sneeze"],
+        args_queue=queue,
+        auto_plugins=False,
+    )
+
+    cli.run()
+    captured = capsys.readouterr()
+
+    assert cli.returncode == 1
+    assert "Unknown subcommand 'nope'" in captured.err
 
 
 def test_cli_prefixes_duplicate_plugin_command_names(

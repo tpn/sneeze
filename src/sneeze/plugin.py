@@ -4,6 +4,7 @@ import os
 import pkgutil
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -117,7 +118,7 @@ def import_plugin_modules(spec):
 
 
 def pip_install_plugin(target, editable=True):
-    args = ["python", "-m", "pip", "install"]
+    args = [sys.executable, "-m", "pip", "install"]
     if editable and os.path.isdir(target):
         args.append("-e")
     args.append(target)
@@ -131,7 +132,7 @@ def pip_uninstall_plugin(name):
         else plugin_dist_name(name)
     )
     return subprocess.run(
-        ["python", "-m", "pip", "uninstall", "-y", dist],
+        [sys.executable, "-m", "pip", "uninstall", "-y", dist],
         check=False,
     )
 

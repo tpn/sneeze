@@ -1,5 +1,7 @@
 from sneeze.plugin import (
     github_shorthand_to_url,
+    pip_install_plugin,
+    pip_uninstall_plugin,
     plugin_dist_name,
     plugin_package_name,
     resolve_plugin_install_target,
@@ -48,3 +50,20 @@ def test_scaffold_plugin_writes_expected_files(tmp_path):
     assert "../sneeze/agents/PLUGINS.md" in (path / "AGENTS.md").read_text(
         encoding="utf-8"
     )
+
+
+def test_pip_helpers_use_current_interpreter(monkeypatch):
+    calls = []
+
+    def fake_run(args, check=False):
+        calls.append((args, check))
+        return object()
+
+    monkeypatch.setattr("sneeze.plugin.subprocess.run", fake_run)
+
+    pip_install_plugin("/tmp/plugin")
+    pip_uninstall_plugin("tpn")
+
+    assert calls[0][0][0] == calls[1][0][0]
+    assert calls[0][0][1:4] == ["-m", "pip", "install"]
+    assert calls[1][0][1:5] == ["-m", "pip", "uninstall", "-y"]

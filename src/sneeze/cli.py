@@ -249,7 +249,23 @@ class CLI:
                 cmdline = args.pop(0).lower()
                 if cmdline not in cmdlines:
                     cmdlines[cmdline] = self._find_commandline(cmdline)
-                cmdlines[cmdline].run(args)
+                cl = cmdlines[cmdline]
+                if not cl:
+                    error = CommandError(
+                        self.__unknown_subcommand__ % cmdline
+                    )
+                    self._error(
+                        os.linesep.join(
+                            (
+                                self.__unknown_subcommand__ % cmdline,
+                                self.__usage__,
+                            )
+                        )
+                    )
+                    exit_code = self.returncode or 1
+                    self.args_queue.task_done()
+                    continue
+                cl.run(args)
                 self.args_queue.task_done()
             except BaseException as err:
                 error = err
@@ -548,7 +564,9 @@ def run(*args_, **kwds):
         parsed_kwds.update(kwds)
         sneeze.config._clear_config_if_already_created()
         cli = CLI(*args, **parsed_kwds)
-        return cli.commandline.command if interactive_request else cli
+        if interactive_request and cli.commandline:
+            return cli.commandline.command
+        return cli
     finally:
         INTERACTIVE = previous_interactive
 
