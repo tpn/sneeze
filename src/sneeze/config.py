@@ -123,7 +123,11 @@ class Config(RawConfigParser):
 
     @classproperty
     def data_dir(cls):
-        path = cls._resolve_dir("data")
+        return cls._resolve_dir("data")
+
+    @classmethod
+    def ensure_data_dir(cls):
+        path = cls.data_dir
         os.makedirs(path, exist_ok=True)
         return path
 
