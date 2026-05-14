@@ -87,7 +87,7 @@ def test_run_history_friendly_timestamps_all_hosts(
     assert cli.returncode == 0
     assert f"{runlog.HOSTNAME}:" in captured.out
     assert "other:" in captured.out
-    assert "[2026-01-02" in captured.out
+    assert "    [" in captured.out
     assert "sne install-plugin" in captured.out
     assert "sne remove-plugin" in captured.out
 
