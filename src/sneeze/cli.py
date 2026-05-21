@@ -64,6 +64,8 @@ class CommandLine:
         self.shortname = display_shortname
         if display_shortname is None:
             self.shortname = self.command.shortname
+        self.command.cli_display_name = self.name
+        self.command.cli_display_shortname = self.shortname
         self.prog = f"{self.program_name} {self.name}"
         self.parser = None
         self.conf = None
@@ -592,6 +594,23 @@ def run(*args_, **kwds):
 def main(argv=None):
     args = _prefix_default_cli_args(sys.argv[1:] if argv is None else argv)
     cli = run(*args)
+    sys.exit(cli.returncode)
+
+
+def branded_main(
+    program_name,
+    module_names,
+    argv=None,
+    *,
+    auto_plugins=False,
+):
+    modules = ",".join(module_names)
+    # Branded entry points provide their own program/module prefix, so they
+    # intentionally do not use the default `sne,sneeze` prefix.
+    args = [program_name, modules] + list(
+        sys.argv[1:] if argv is None else argv
+    )
+    cli = run(*args, auto_plugins=auto_plugins)
     sys.exit(cli.returncode)
 
 

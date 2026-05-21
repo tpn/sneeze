@@ -15,6 +15,9 @@ authors = [
 dependencies = []
 
 [project.optional-dependencies]
+slackbot = [
+  "slack-sdk>=3.30",
+]
 dev = [
   "black>=26.3.1",
   "mypy",
@@ -50,4 +53,3 @@ max-line-length = 78
 [tool.mypy]
 install_types = true
 non_interactive = true
-

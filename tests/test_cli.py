@@ -20,6 +20,54 @@ def test_default_program_name_matches_console_script():
     assert sneeze_cli.DEFAULT_PROGRAM_NAME == "sne"
 
 
+def test_branded_main_forwards_program_modules_and_auto_plugins(monkeypatch):
+    calls = []
+
+    def fake_run(*args, **kwds):
+        calls.append((args, kwds))
+        return SimpleNamespace(returncode=7)
+
+    monkeypatch.setattr(sneeze_cli, "run", fake_run)
+
+    with pytest.raises(SystemExit) as exc_info:
+        sneeze_cli.branded_main(
+            "example",
+            ["sneeze", "sneeze.example"],
+            ["help"],
+            auto_plugins=False,
+        )
+
+    assert exc_info.value.code == 7
+    assert calls == [
+        (
+            ("example", "sneeze,sneeze.example", "help"),
+            {"auto_plugins": False},
+        )
+    ]
+
+
+def test_branded_main_defaults_to_sys_argv_tail(monkeypatch):
+    calls = []
+
+    def fake_run(*args, **kwds):
+        calls.append((args, kwds))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(sneeze_cli, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["example", "version"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        sneeze_cli.branded_main("example", ["sneeze", "sneeze.example"])
+
+    assert exc_info.value.code == 0
+    assert calls == [
+        (
+            ("example", "sneeze,sneeze.example", "version"),
+            {"auto_plugins": False},
+        )
+    ]
+
+
 def test_cli_introspection_loads_core_commands_without_output(capsys):
     cli = sneeze_cli.CLI(
         program_name="sne",
