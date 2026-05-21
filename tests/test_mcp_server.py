@@ -105,8 +105,7 @@ def test_canonical_mcp_url_normalizes_loopback_and_path():
         == "http://localhost:8945/mcp/"
     )
     assert (
-        canonical_mcp_url("127.0.0.1", 8945, "/")
-        == "http://localhost:8945/"
+        canonical_mcp_url("127.0.0.1", 8945, "/") == "http://localhost:8945/"
     )
 
 

@@ -600,12 +600,7 @@ def managed_env_values(
     keys = prefixed_env_keys(profile)
 
     def current_value(key: str, default: str | None = None) -> str:
-        return (
-            current.get(keys[key])
-            or current.get(key)
-            or default
-            or ""
-        )
+        return current.get(keys[key]) or current.get(key) or default or ""
 
     values: OrderedDict[str, str] = OrderedDict()
     values[keys[SLACK_TEAM_DOMAIN_ENV]] = (
@@ -1179,9 +1174,7 @@ def slack_response_url_post(
         with urllib.request.urlopen(request, timeout=30) as response:
             body = response.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, OSError) as exc:
-        raise SlackbotError(
-            f"Slack response_url post failed: {exc}"
-        ) from exc
+        raise SlackbotError(f"Slack response_url post failed: {exc}") from exc
     return {"ok": True, "body": body}
 
 
@@ -1334,10 +1327,9 @@ def read_slack_thread(
             payload,
         )
         messages.extend(response.get("messages") or [])
-        cursor = (
-            (response.get("response_metadata") or {}).get("next_cursor")
-            or None
-        )
+        cursor = (response.get("response_metadata") or {}).get(
+            "next_cursor"
+        ) or None
         if not cursor:
             return messages
 
@@ -1979,8 +1971,8 @@ def run_schedule(
     }
     if error:
         report["error"] = error
-    report_dir = (
-        Path(config.paths.schedule_reports_dir) / safe_schedule_name(name)
+    report_dir = Path(config.paths.schedule_reports_dir) / safe_schedule_name(
+        name
     )
     report_dir.mkdir(parents=True, exist_ok=True)
     report_name = (
@@ -2290,9 +2282,8 @@ class SlackSocketBot:
             else None
         )
         try:
-            while (
-                not stop_event.is_set()
-                and (deadline is None or time.monotonic() < deadline)
+            while not stop_event.is_set() and (
+                deadline is None or time.monotonic() < deadline
             ):
                 self.drain_ingress()
                 stop_event.wait(1.0)
@@ -2616,9 +2607,7 @@ class SlackSocketBot:
                         },
                     )
             text = (
-                result["last_message"]
-                or result["stderr"]
-                or result["stdout"]
+                result["last_message"] or result["stderr"] or result["stdout"]
             )
             if result["returncode"]:
                 text = f"Codex exited with {result['returncode']}.\n\n{text}"
