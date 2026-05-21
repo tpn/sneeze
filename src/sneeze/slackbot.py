@@ -2271,7 +2271,8 @@ class SlackSocketBot:
             emit(
                 self.out,
                 "No Slackbot allowed users or channels configured; "
-                "all Slack requests will be rejected.",
+                "direct messages will still be accepted, but app mentions, "
+                "slash commands, and group DMs will be rejected.",
             )
         deadline = (
             time.monotonic() + max_runtime_seconds
@@ -2411,7 +2412,11 @@ class SlackSocketBot:
             dm_user_id=user_id if channel_type == "im" else None,
             thread_ts=thread_ts,
         )
-        if not self._is_authorized(user_id, channel):
+        if not self._is_authorized(
+            user_id,
+            channel,
+            channel_type=channel_type,
+        ):
             self._post_unauthorized(route)
             return
         if self._maybe_handle_agent_tmux(text, route):
@@ -2445,7 +2450,11 @@ class SlackSocketBot:
         self,
         user_id: str | None,
         channel_id: str | None,
+        *,
+        channel_type: str | None = None,
     ) -> bool:
+        if channel_type == "im":
+            return True
         allowed_users = self.config.allowed_user_ids
         allowed_channels = self.config.allowed_channel_ids
         if not allowed_users and not allowed_channels:

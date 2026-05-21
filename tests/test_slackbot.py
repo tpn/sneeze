@@ -793,6 +793,46 @@ def test_dm_thread_reply_preserves_thread_context(tmp_path, monkeypatch):
     assert '"thread_ts": "1.000001"' in prompts[0]
 
 
+def test_dm_message_dispatches_without_allowlist(tmp_path, monkeypatch):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bot = SlackSocketBot(load_config(profile))
+    prompts = []
+
+    class FakeRunner:
+        def run(self, prompt, session_id=None):
+            prompts.append(prompt)
+            return {
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "last_message": "done",
+                "session_id": "codex-session-1",
+            }
+
+    bot.runner = FakeRunner()
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: {"ts": "2.000001", "channel": "D123"},
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.update_slack_message",
+        lambda *args, **kwds: {"ok": True},
+    )
+
+    bot._handle_event(
+        {
+            "type": "message",
+            "channel_type": "im",
+            "user": "U222",
+            "channel": "D123",
+            "text": "hello from a DM",
+        }
+    )
+
+    assert "hello from a DM" in prompts[0]
+
+
 def test_placeholder_failure_replies_in_original_thread(
     tmp_path, monkeypatch
 ):
@@ -958,6 +998,15 @@ def test_authorization_defaults_fail_closed(tmp_path):
     bot = SlackSocketBot(load_config(profile))
 
     assert not bot._is_authorized("U111", "C123")
+    assert not bot._is_authorized("U111", "G123", channel_type="mpim")
+
+
+def test_authorization_always_allows_direct_messages(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bot = SlackSocketBot(load_config(profile))
+
+    assert bot._is_authorized("U111", "D123", channel_type="im")
 
 
 def test_authorization_allows_user_or_channel_match(tmp_path):
