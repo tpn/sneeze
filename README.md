@@ -51,4 +51,3 @@ local repo is missing, it falls back to
 Multiple plugins can be installed. If two plugins expose the same command name,
 Sneeze prefixes the plugin username, such as `tpn-foo` and `dave-foo`. Core
 commands keep the unprefixed name.
-

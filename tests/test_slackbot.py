@@ -76,7 +76,8 @@ def test_scaffold_runtime_writes_prefixed_env_and_prompt(tmp_path):
     assert config.paths.system_prompt_path == str(custom_prompt)
     assert config.codex_mode == "workspace-write"
     assert not any(
-        word in env_text + prompt_text for word in ("legacy-internal-tool", "ticket-system")
+        word in env_text + prompt_text
+        for word in ("legacy-internal-tool", "ticket-system")
     )
     mode = os.stat(tmp_path / "runtime" / ".env").st_mode & 0o777
     assert mode == 0o600
@@ -283,10 +284,7 @@ def test_extract_codex_session_id_ignores_event_id():
                 '"session_id":"wrong-session"}}'
             ),
             '{"type":"item","id":"event-not-session"}',
-            (
-                '{"type":"session_meta",'
-                '"payload":{"id":"real-session-id"}}'
-            ),
+            ('{"type":"session_meta",' '"payload":{"id":"real-session-id"}}'),
         ]
     )
 
@@ -349,8 +347,10 @@ def test_systemd_service_has_no_source_project_leaks(tmp_path):
     assert "--state-dir=" in text
     assert "--system-prompt-path=" in text
     assert "--unit-name=sample-slackbot.service" in text
-    assert "EnvironmentFile=\"" in text
-    assert not any(word in text for word in ("legacy-internal-tool", "ticket-system"))
+    assert 'EnvironmentFile="' in text
+    assert not any(
+        word in text for word in ("legacy-internal-tool", "ticket-system")
+    )
 
 
 def test_launchd_service_includes_only_non_secret_env(tmp_path, monkeypatch):
@@ -414,9 +414,7 @@ def test_post_slack_message_renders_mentions(tmp_path, monkeypatch):
     assert calls == ["<@U999> hello"]
 
 
-def test_post_slack_message_uses_response_url_fallback(
-    tmp_path, monkeypatch
-):
+def test_post_slack_message_uses_response_url_fallback(tmp_path, monkeypatch):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
     config = load_config(profile)

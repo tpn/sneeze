@@ -29,4 +29,3 @@ synthesis_agent = "claude-code"
 review_types = ["default"]
 reasoning = "thorough"
 min_severity = "medium"
-
