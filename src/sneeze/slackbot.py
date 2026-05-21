@@ -2453,10 +2453,10 @@ class SlackSocketBot:
         *,
         channel_type: str | None = None,
     ) -> bool:
-        if channel_type == "im":
-            return True
         allowed_users = self.config.allowed_user_ids
         allowed_channels = self.config.allowed_channel_ids
+        if channel_type == "im":
+            return not allowed_users or bool(user_id in allowed_users)
         if not allowed_users and not allowed_channels:
             return False
         return bool(
