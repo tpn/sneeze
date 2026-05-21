@@ -1018,6 +1018,18 @@ def test_authorization_restricts_dm_with_user_allowlist(tmp_path):
     assert not bot._is_authorized("U222", "D123", channel_type="im")
 
 
+def test_authorization_restricts_dm_with_dm_user_allowlist(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bot = SlackSocketBot(
+        replace(load_config(profile), allowed_dm_user_ids=("U111",))
+    )
+
+    assert bot._is_authorized("U111", "D123", channel_type="im")
+    assert not bot._is_authorized("U222", "D123", channel_type="im")
+    assert not bot._is_authorized("U111", "C123")
+
+
 def test_authorization_allows_user_or_channel_match(tmp_path):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")

@@ -156,6 +156,7 @@ class SlackbotConfig:
     codex_profile: str | None = None
     codex_workdir: str = ""
     codex_extra_args: tuple[str, ...] = ()
+    allowed_dm_user_ids: tuple[str, ...] = ()
     allowed_user_ids: tuple[str, ...] = ()
     allowed_channel_ids: tuple[str, ...] = ()
     worker_count: int = 2
@@ -545,6 +546,7 @@ def prefixed_env_keys(profile: SlackbotProfile) -> OrderedDict[str, str]:
         "SLACKBOT_CODEX_MODEL",
         "SLACKBOT_CODEX_PROFILE",
         "SLACKBOT_CODEX_EXTRA_ARGS",
+        "SLACKBOT_ALLOWED_DM_USER_IDS",
         "SLACKBOT_ALLOWED_USER_IDS",
         "SLACKBOT_ALLOWED_CHANNEL_IDS",
         "SLACKBOT_SYSTEM_PROMPT_PATH",
@@ -669,6 +671,9 @@ def managed_env_values(
             "SLACKBOT_CODEX_EXTRA_ARGS",
             " ".join(profile.default_codex_extra_args),
         )
+    ).strip()
+    values[keys["SLACKBOT_ALLOWED_DM_USER_IDS"]] = current_value(
+        "SLACKBOT_ALLOWED_DM_USER_IDS"
     ).strip()
     values[keys["SLACKBOT_ALLOWED_USER_IDS"]] = current_value(
         "SLACKBOT_ALLOWED_USER_IDS"
@@ -920,6 +925,9 @@ def load_config(
                 "SLACKBOT_CODEX_EXTRA_ARGS",
                 " ".join(profile.default_codex_extra_args),
             )
+        ),
+        allowed_dm_user_ids=parse_csv(
+            env_lookup(profile, env, "SLACKBOT_ALLOWED_DM_USER_IDS")
         ),
         allowed_user_ids=parse_csv(
             env_lookup(profile, env, "SLACKBOT_ALLOWED_USER_IDS")
@@ -2265,8 +2273,10 @@ class SlackSocketBot:
             f"{self.team_name or 'unknown team'} "
             f"({self.team_domain or 'unknown domain'})",
         )
-        if not self.config.allowed_user_ids and not (
-            self.config.allowed_channel_ids
+        if not (
+            self.config.allowed_dm_user_ids
+            or self.config.allowed_user_ids
+            or self.config.allowed_channel_ids
         ):
             emit(
                 self.out,
@@ -2453,9 +2463,12 @@ class SlackSocketBot:
         *,
         channel_type: str | None = None,
     ) -> bool:
+        allowed_dm_users = self.config.allowed_dm_user_ids
         allowed_users = self.config.allowed_user_ids
         allowed_channels = self.config.allowed_channel_ids
         if channel_type == "im":
+            if allowed_dm_users:
+                return bool(user_id in allowed_dm_users)
             return not allowed_users or bool(user_id in allowed_users)
         if not allowed_users and not allowed_channels:
             return False
@@ -2471,7 +2484,8 @@ class SlackSocketBot:
                 route,
                 (
                     "This Slackbot is not configured to accept that request. "
-                    "Set SLACKBOT_ALLOWED_USER_IDS or "
+                    "Set SLACKBOT_ALLOWED_DM_USER_IDS, "
+                    "SLACKBOT_ALLOWED_USER_IDS, or "
                     "SLACKBOT_ALLOWED_CHANNEL_IDS in its env file."
                 ),
             )
