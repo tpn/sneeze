@@ -18,11 +18,19 @@ dependencies = []
 slackbot = [
   "slack-sdk>=3.30",
 ]
+mcp = [
+  "mcp>=1.27",
+  "starlette>=0.37",
+  "uvicorn>=0.30",
+]
 dev = [
   "black>=26.3.1",
+  "mcp>=1.27",
   "mypy",
   "pytest",
   "ruff>=0.15.12",
+  "starlette>=0.37",
+  "uvicorn>=0.30",
 ]
 
 [project.scripts]
