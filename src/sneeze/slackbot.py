@@ -156,6 +156,9 @@ class SlackbotProfile:
     user_config_secret_fields: tuple[SlackbotUserConfigSecretField, ...] = ()
     child_env_scrub_allowlist: tuple[str, ...] = ()
     static_responses: tuple[SlackbotStaticResponse, ...] = ()
+    default_allowed_dm_user_ids: tuple[str, ...] = ()
+    default_allowed_user_ids: tuple[str, ...] = ()
+    default_allowed_channel_ids: tuple[str, ...] = ()
 
     @property
     def normalized_env_prefix(self) -> str:
@@ -358,6 +361,10 @@ def parse_csv(value: str | Iterable[str] | None) -> tuple[str, ...]:
             item.strip() for item in value.split(",") if item.strip()
         )
     return tuple(str(item).strip() for item in value if str(item).strip())
+
+
+def render_csv(value: Iterable[str] | None) -> str:
+    return ",".join(parse_csv(value))
 
 
 def parse_extra_args(value: str | Iterable[str] | None) -> tuple[str, ...]:
@@ -693,6 +700,21 @@ def env_lookup(
     return default
 
 
+def env_lookup_allow_empty(
+    profile: SlackbotProfile,
+    env_values: dict[str, str],
+    key: str,
+    default: str | None = None,
+) -> str | None:
+    prefixed = profile.env_name(key)
+    for candidate in (prefixed, key):
+        if candidate in os.environ:
+            return os.environ[candidate]
+        if candidate in env_values:
+            return env_values[candidate]
+    return default
+
+
 def managed_env_values(
     profile: SlackbotProfile,
     current: OrderedDict[str, str],
@@ -717,8 +739,18 @@ def managed_env_values(
 ) -> OrderedDict[str, str]:
     keys = prefixed_env_keys(profile)
 
-    def current_value(key: str, default: str | None = None) -> str:
-        return current.get(keys[key]) or current.get(key) or default or ""
+    def current_value(
+        key: str,
+        default: str | None = None,
+        *,
+        allow_empty: bool = False,
+    ) -> str:
+        for candidate in (keys[key], key):
+            if candidate in current:
+                value = current[candidate]
+                if allow_empty or value:
+                    return value
+        return default or ""
 
     values: OrderedDict[str, str] = OrderedDict()
     values[keys[SLACK_TEAM_DOMAIN_ENV]] = (
@@ -786,13 +818,19 @@ def managed_env_values(
         )
     ).strip()
     values[keys["SLACKBOT_ALLOWED_DM_USER_IDS"]] = current_value(
-        "SLACKBOT_ALLOWED_DM_USER_IDS"
+        "SLACKBOT_ALLOWED_DM_USER_IDS",
+        render_csv(profile.default_allowed_dm_user_ids),
+        allow_empty=True,
     ).strip()
     values[keys["SLACKBOT_ALLOWED_USER_IDS"]] = current_value(
-        "SLACKBOT_ALLOWED_USER_IDS"
+        "SLACKBOT_ALLOWED_USER_IDS",
+        render_csv(profile.default_allowed_user_ids),
+        allow_empty=True,
     ).strip()
     values[keys["SLACKBOT_ALLOWED_CHANNEL_IDS"]] = current_value(
-        "SLACKBOT_ALLOWED_CHANNEL_IDS"
+        "SLACKBOT_ALLOWED_CHANNEL_IDS",
+        render_csv(profile.default_allowed_channel_ids),
+        allow_empty=True,
     ).strip()
     values[keys["SLACKBOT_SYSTEM_PROMPT_PATH"]] = paths.system_prompt_path
     values[keys["SLACKBOT_WORKER_COUNT"]] = str(
@@ -1044,13 +1082,28 @@ def load_config(
             )
         ),
         allowed_dm_user_ids=parse_csv(
-            env_lookup(profile, env, "SLACKBOT_ALLOWED_DM_USER_IDS")
+            env_lookup_allow_empty(
+                profile,
+                env,
+                "SLACKBOT_ALLOWED_DM_USER_IDS",
+                render_csv(profile.default_allowed_dm_user_ids),
+            )
         ),
         allowed_user_ids=parse_csv(
-            env_lookup(profile, env, "SLACKBOT_ALLOWED_USER_IDS")
+            env_lookup_allow_empty(
+                profile,
+                env,
+                "SLACKBOT_ALLOWED_USER_IDS",
+                render_csv(profile.default_allowed_user_ids),
+            )
         ),
         allowed_channel_ids=parse_csv(
-            env_lookup(profile, env, "SLACKBOT_ALLOWED_CHANNEL_IDS")
+            env_lookup_allow_empty(
+                profile,
+                env,
+                "SLACKBOT_ALLOWED_CHANNEL_IDS",
+                render_csv(profile.default_allowed_channel_ids),
+            )
         ),
         worker_count=normalize_positive_int(
             env_lookup(profile, env, "SLACKBOT_WORKER_COUNT"),

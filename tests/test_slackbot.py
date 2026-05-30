@@ -167,6 +167,41 @@ def test_scaffold_runtime_honors_profile_state_and_prompt_defaults(tmp_path):
     assert os.stat(result["state_dir"]).st_mode & 0o777 == 0o700
 
 
+def test_scaffold_runtime_honors_profile_default_allowlists(tmp_path):
+    profile = replace(
+        make_profile(tmp_path),
+        default_allowed_channel_ids=("C999",),
+    )
+
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+
+    assert config.allowed_channel_ids == ("C999",)
+    env_path = Path(config.paths.env_path)
+    assert "SAMPLE_SLACKBOT_ALLOWED_CHANNEL_IDS=C999" in env_path.read_text(
+        encoding="utf-8"
+    )
+    assert SlackSocketBot(config)._is_authorized("U222", "C999")
+
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8").replace(
+            "SAMPLE_SLACKBOT_ALLOWED_CHANNEL_IDS=C999",
+            "SAMPLE_SLACKBOT_ALLOWED_CHANNEL_IDS=",
+        ),
+        encoding="utf-8",
+    )
+    cleared_config = load_config(profile)
+
+    assert cleared_config.allowed_channel_ids == ()
+    assert not SlackSocketBot(cleared_config)._is_authorized("U222", "C999")
+
+    scaffold_runtime(profile)
+
+    assert "SAMPLE_SLACKBOT_ALLOWED_CHANNEL_IDS=\n" in env_path.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_slackbot_profile_keeps_existing_positional_optionals_stable(
     tmp_path,
 ):
