@@ -4,7 +4,12 @@ from io import StringIO
 
 import pytest
 
-from sneeze.mcp_commands import McpCallBase, McpRunBase, McpStatusBase
+from sneeze.mcp_commands import (
+    McpCallBase,
+    McpDevBase,
+    McpRunBase,
+    McpStatusBase,
+)
 from sneeze.mcp_server import (
     McpServerError,
     McpServerProfile,
@@ -201,3 +206,118 @@ def test_mcp_command_bases_report_status_and_call_tools(monkeypatch):
             {"host": "0.0.0.0", "port": 9999, "path": "/mcp/"},
         )
     ]
+
+
+def test_mcp_dev_metadata_does_not_require_tmux(monkeypatch):
+    profile = make_profile(
+        McpToolSpec(
+            "hello", "Say hello.", {"type": "object"}, lambda args: ""
+        )
+    )
+
+    class DevCommand(McpDevBase):
+        mcp_profile = profile
+
+    def fake_required(requested, *names):
+        if "tmux" in names:
+            raise AssertionError("status should not resolve tmux")
+        return f"/tmp/{names[0]}"
+
+    out = StringIO()
+    command = DevCommand(None, out, None)
+    command.args = ("metadata",)
+    monkeypatch.setattr(
+        "sneeze.tmux_dev.resolve_required_executable",
+        fake_required,
+    )
+
+    command.run()
+    payload = json.loads(out.getvalue())
+
+    assert payload["url"] == "http://localhost:8945/mcp/"
+    assert payload["tools"] == ["hello"]
+
+
+def test_mcp_dev_status_uses_tmux(monkeypatch):
+    profile = make_profile(
+        McpToolSpec(
+            "hello", "Say hello.", {"type": "object"}, lambda args: ""
+        )
+    )
+
+    class DevCommand(McpDevBase):
+        mcp_profile = profile
+
+    class FakeController:
+        def status(self, *, out):
+            out("running: sample")
+
+    out = StringIO()
+    command = DevCommand(None, out, None)
+    command.args = ("status",)
+    monkeypatch.setattr(
+        "sneeze.tmux_dev.TmuxDevCommandMixin._tmux_controller",
+        lambda self: FakeController(),
+    )
+
+    command.run()
+
+    assert out.getvalue() == "running: sample\n"
+
+
+def test_mcp_dev_child_command_splits_display_name():
+    profile = make_profile(
+        McpToolSpec(
+            "hello", "Say hello.", {"type": "object"}, lambda args: ""
+        )
+    )
+
+    class DevCommand(McpDevBase):
+        mcp_profile = profile
+
+    command = DevCommand(None, None, None)
+    command.cli_display_name = "sample dev-mcp"
+    command._cli_bin = "/tmp/sne"
+    command._mamba_bin = "/tmp/mamba"
+
+    child = command._child_command()
+    cli_index = child.index("/tmp/sne")
+
+    assert child[cli_index + 1 : cli_index + 3] == ["sample", "dev-mcp"]
+
+
+def test_mcp_dev_app_slug_only_strips_mcp_suffix():
+    profile = McpServerProfile(
+        name="my-mcp_server-mcp",
+        tools_factory=tuple,
+        default_host="127.0.0.1",
+        default_port=8945,
+    )
+
+    class DevCommand(McpDevBase):
+        mcp_profile = profile
+
+    command = DevCommand(None, None, None)
+
+    assert command._app_slug() == "my-mcp-server"
+
+
+def test_mcp_dev_expands_runtime_root_and_log_path(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    profile = make_profile(
+        McpToolSpec(
+            "hello", "Say hello.", {"type": "object"}, lambda args: ""
+        )
+    )
+
+    class DevCommand(McpDevBase):
+        mcp_profile = profile
+
+    command = DevCommand(None, None, None)
+    command._runtime_root = "~/mcp-root"
+    command._log_path = "~/logs/mcp.log"
+    monkeypatch.setenv("HOME", str(home))
+
+    assert command._runtime_root_value() == str(home / "mcp-root")
+    assert command._log_path_value() == str(home / "logs" / "mcp.log")

@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sys
+from pathlib import Path
 
 from .command import CommandError
 from .commandinvariant import InvariantAwareCommand
@@ -14,24 +15,34 @@ from .invariant import (
     StringInvariant,
 )
 from .slackbot import (
+    SLACK_APP_TOKEN_ENV,
+    SLACK_BOT_TOKEN_ENV,
     SlackbotProfile,
     SlackbotRoute,
     bind_agent_tmux_thread,
     enqueue_ingress,
+    env_lookup,
     install_service,
     list_agent_tmux_jobs,
     list_schedules,
     query_agent_tmux_thread,
     query_status,
+    read_env_file,
     read_slack_thread,
     remove_schedule,
     remove_service,
     render_thread_transcript,
+    resolve_paths,
     run_schedule,
     run_slackbot,
     scaffold_runtime,
     service_status,
     upsert_schedule,
+)
+from .tmux_dev import (
+    TMUX_ACTIONS,
+    TmuxDevCommandMixin,
+    resolve_required_executable,
 )
 
 
@@ -304,6 +315,262 @@ class SlackbotRunBase(ProfiledSlackbotCommand):
         )
 
 
+class SlackbotDevBase(TmuxDevCommandMixin, SlackbotInitBase):
+    """Manage a profiled Slackbot development runtime."""
+
+    max_runtime_seconds = None
+    _max_runtime_seconds = None
+
+    class MaxRuntimeSecondsArg(NonNegativeIntegerInvariant):
+        _arg = "--max-runtime-seconds"
+        _help = "Stop run/smoke after this many seconds; 0 means no limit."
+        _mandatory = False
+
+    def _app_slug(self) -> str:
+        return self._profile().app_slug
+
+    def _env_prefix(self) -> str:
+        return self._profile().env_prefix
+
+    def _runtime_root_value(self) -> str:
+        return resolve_paths(self._profile(), **self._common()).runtime_root
+
+    def _env_path_value(self) -> str:
+        return resolve_paths(self._profile(), **self._common()).env_path
+
+    def _env_file_value(self, key: str) -> str | None:
+        return env_lookup(
+            self._profile(), read_env_file(self._env_path_value()), key
+        )
+
+    def _managed_env_file_value(self, key: str) -> str | None:
+        env = read_env_file(self._env_path_value())
+        prefixed = self._profile().env_name(key)
+        return env.get(prefixed) or env.get(key) or None
+
+    def _codex_workdir_value(self) -> str:
+        value = (
+            self._codex_workdir
+            or self.codex_workdir
+            or self._env_file_value("SLACKBOT_CODEX_WORKDIR")
+            or self._profile().default_codex_workdir
+        )
+        if not value:
+            return os.getcwd()
+        return str(Path(value).expanduser().resolve())
+
+    def _codex_bin_value(self) -> str:
+        value = self._codex_bin or self.codex_bin
+        if value:
+            return value
+        env_value = env_lookup(
+            self._profile(),
+            os.environ,
+            "SLACKBOT_CODEX_BIN",
+        )
+        if env_value:
+            return env_value
+        env_value = os.environ.get(f"{self._env_prefix()}_CODEX_BIN")
+        if env_value:
+            return env_value
+        env_file_value = self._env_file_value("SLACKBOT_CODEX_BIN")
+        if env_file_value:
+            return env_file_value
+        candidate = Path(sys.prefix) / "bin" / "codex"
+        if candidate.exists():
+            return str(candidate)
+        return resolve_required_executable(None, "codex")
+
+    def _scaffold_codex_bin_value(self) -> str | None:
+        value = self._codex_bin or self.codex_bin
+        if value:
+            return value
+        env_value = env_lookup(
+            self._profile(),
+            os.environ,
+            "SLACKBOT_CODEX_BIN",
+        )
+        if env_value:
+            return env_value
+        env_value = os.environ.get(f"{self._env_prefix()}_CODEX_BIN")
+        if env_value:
+            return env_value
+        return self._env_file_value("SLACKBOT_CODEX_BIN")
+
+    def _tmux_session_env_name(self) -> str:
+        return f"{self._env_prefix()}_SLACKBOT_TMUX_SESSION"
+
+    def _tmux_session_default(self) -> str:
+        return f"{self._app_slug()}-slackbot-dev"
+
+    def _log_path_env_name(self) -> str:
+        return f"{self._env_prefix()}_SLACKBOT_DEV_LOG"
+
+    def _log_path_default(self) -> str:
+        return str(
+            Path(self._runtime_root_value()) / "var" / "dev-slackbot.log"
+        )
+
+    def _log_lines_env_name(self) -> str:
+        return f"{self._env_prefix()}_SLACKBOT_LOG_LINES"
+
+    def _tmux_root(self) -> str:
+        return self._codex_workdir_value()
+
+    def _max_seconds_value(self) -> int | None:
+        value = (
+            self._max_runtime_seconds
+            if self._max_runtime_seconds is not None
+            else self.max_runtime_seconds
+        )
+        if value == 0:
+            return None
+        return value
+
+    @staticmethod
+    def _append_child_arg(args: list[str], flag: str, value) -> None:
+        if value is None or value == "":
+            return
+        args.extend([flag, str(value)])
+
+    def _scaffold(self) -> None:
+        scaffold_runtime(
+            self._profile(),
+            **self._common(),
+            slack_domain=self._slack_domain or self.slack_domain,
+            app_id=self._app_id or self.app_id,
+            client_id=self._client_id or self.client_id,
+            bot_token=self._managed_env_file_value(SLACK_BOT_TOKEN_ENV),
+            app_token=self._managed_env_file_value(SLACK_APP_TOKEN_ENV),
+            bot_name=self._bot_name or self.bot_name,
+            command_name=self._command_name or self.command_name,
+            codex_bin=self._scaffold_codex_bin_value(),
+            codex_mode=self._codex_mode or self.codex_mode,
+            codex_model=self._codex_model or self.codex_model,
+            codex_profile=self._codex_profile or self.codex_profile,
+            codex_workdir=self._codex_workdir_value(),
+            codex_extra_args=(
+                self._codex_extra_args or self.codex_extra_args
+            ),
+            worker_count=self._worker_count or self.worker_count,
+            mcp_server_url=self._mcp_server_url or self.mcp_server_url,
+            team_config_path=(
+                self._team_config_path or self.team_config_path
+            ),
+            out=self._err,
+        )
+        self._err(
+            "Slack tokens are file/env-only; populate the generated env "
+            "file instead of passing tokens on the command line."
+        )
+
+    def _child_command(self) -> list[str]:
+        args = [
+            self._mamba_bin_value(),
+            "run",
+            "-n",
+            self._env_name_value(),
+            self._cli_bin_value(),
+            *self._child_cli_args(),
+            "run",
+        ]
+        for flag, value in (
+            ("--runtime-root", self._runtime_root_value()),
+            ("--env-path", self._env_path_value()),
+            ("--state-dir", self._state_dir or self.state_dir),
+            (
+                "--system-prompt-path",
+                self._system_prompt_path or self.system_prompt_path,
+            ),
+            ("--unit-name", self._unit_name or self.unit_name),
+            ("--slack-domain", self._slack_domain or self.slack_domain),
+            ("--app-id", self._app_id or self.app_id),
+            ("--client-id", self._client_id or self.client_id),
+            ("--bot-name", self._bot_name or self.bot_name),
+            ("--command-name", self._command_name or self.command_name),
+            ("--codex-bin", self._scaffold_codex_bin_value()),
+            ("--codex-mode", self._codex_mode or self.codex_mode),
+            ("--codex-model", self._codex_model or self.codex_model),
+            ("--codex-profile", self._codex_profile or self.codex_profile),
+            ("--codex-workdir", self._codex_workdir_value()),
+            (
+                "--codex-extra-args",
+                self._codex_extra_args or self.codex_extra_args,
+            ),
+            ("--worker-count", self._worker_count or self.worker_count),
+            ("--mcp-server-url", self._mcp_server_url or self.mcp_server_url),
+            (
+                "--team-config-path",
+                self._team_config_path or self.team_config_path,
+            ),
+            (
+                "--max-runtime-seconds",
+                (
+                    self._max_runtime_seconds
+                    if self._max_runtime_seconds is not None
+                    else self.max_runtime_seconds
+                ),
+            ),
+        ):
+            self._append_child_arg(args, flag, value)
+        return args
+
+    def _run_slackbot(
+        self, *, max_runtime_seconds: int | None = None
+    ) -> None:
+        self._ensure_scaffolded()
+        run_slackbot(
+            self._profile(),
+            **self._common(),
+            slack_domain=self._slack_domain or self.slack_domain,
+            app_id=self._app_id or self.app_id,
+            client_id=self._client_id or self.client_id,
+            bot_name=self._bot_name or self.bot_name,
+            command_name=self._command_name or self.command_name,
+            codex_bin=self._codex_bin or self.codex_bin,
+            codex_mode=self._codex_mode or self.codex_mode,
+            codex_model=self._codex_model or self.codex_model,
+            codex_profile=self._codex_profile or self.codex_profile,
+            codex_workdir=self._codex_workdir or self.codex_workdir,
+            codex_extra_args=(
+                self._codex_extra_args or self.codex_extra_args
+            ),
+            worker_count=self._worker_count or self.worker_count,
+            mcp_server_url=self._mcp_server_url or self.mcp_server_url,
+            team_config_path=(
+                self._team_config_path or self.team_config_path
+            ),
+            max_runtime_seconds=max_runtime_seconds,
+            out=self._out,
+        )
+
+    def _ensure_scaffolded(self) -> None:
+        if Path(self._env_path_value()).exists():
+            return
+        self._scaffold()
+
+    def _smoke(self) -> None:
+        self._ensure_scaffolded()
+        self._json(query_status(self._profile(), **self._common()))
+        self._run_slackbot(max_runtime_seconds=self._max_seconds_value() or 3)
+
+    def run(self):
+        self._run_dev_action(
+            {
+                "init": self._scaffold,
+                "status": lambda: self._json(
+                    query_status(self._profile(), **self._common())
+                ),
+                "run": lambda: self._run_slackbot(
+                    max_runtime_seconds=self._max_seconds_value()
+                ),
+                "smoke": self._smoke,
+            },
+            command_name="dev-slackbot",
+            choices=("init", "status", "run", "smoke", *TMUX_ACTIONS),
+        )
+
+
 class SlackbotServiceInstallBase(ProfiledSlackbotCommand):
     cli_bin = None
     _cli_bin = None
@@ -490,6 +757,7 @@ class SlackbotEnqueueCodexBase(SlackbotRouteCommand):
             ),
             project=self._project or self.project,
             session=self._session or self.session,
+            system_scoped=True,
         )
         self._out(path)
 

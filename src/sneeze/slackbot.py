@@ -79,6 +79,57 @@ CHILD_ENV_PASSTHROUGH = {
     "USER",
 }
 CODEX_SESSION_EVENT_TYPES = ("session_meta", "session_created")
+USER_CONFIG_MODAL_CALLBACK_ID = "sneeze_user_config"
+USER_CONFIG_OPEN_ACTION_ID = "sneeze_open_user_config"
+USER_CONFIG_CODEX_ACTION_ID = "codex_enabled"
+USER_CONFIG_CODEX_OPTION_VALUE = "enabled"
+USER_CONFIG_TRIGGER_WORDS = {
+    "bootstrap",
+    "configure",
+    "config",
+    "onboard",
+    "setup",
+}
+SECRET_ENV_NAME_PARTS = {
+    "CREDENTIAL",
+    "CREDENTIALS",
+    "KEY",
+    "KEYS",
+    "PASS",
+    "PASSWORD",
+    "SECRET",
+    "TOKEN",
+    "TOKENS",
+}
+SECRET_ENV_NAME_EXCEPTIONS = {
+    "SSH_AUTH_SOCK",
+}
+USER_CONFIG_FIELDS = {
+    "display_name": ("display_name", "display_name"),
+    "default_project": ("default_project", "default_project"),
+    "notes": ("notes", "notes"),
+}
+
+
+@dataclass(frozen=True)
+class SlackbotUserConfigSecretField:
+    service_name: str
+    label: str
+    env_names: tuple[str, ...]
+    block_id: str | None = None
+    action_id: str | None = None
+    placeholder_name: str | None = None
+    scrub_env_names: tuple[str, ...] = ()
+    required: bool = False
+
+
+@dataclass(frozen=True)
+class SlackbotStaticResponse:
+    names: tuple[str, ...]
+    text: str
+
+
+CORE_USER_CONFIG_SECRET_FIELDS: tuple[SlackbotUserConfigSecretField, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -100,6 +151,11 @@ class SlackbotProfile:
     default_codex_extra_args: tuple[str, ...] = ()
     default_mcp_server_url: str | None = None
     default_team_config_path: str | None = None
+    default_state_dir: str | None = None
+    default_system_prompt_path: str | None = None
+    user_config_secret_fields: tuple[SlackbotUserConfigSecretField, ...] = ()
+    child_env_scrub_allowlist: tuple[str, ...] = ()
+    static_responses: tuple[SlackbotStaticResponse, ...] = ()
 
     @property
     def normalized_env_prefix(self) -> str:
@@ -125,6 +181,7 @@ class SlackbotPaths:
     schedule_dir: str
     schedule_reports_dir: str
     agents_dir: str
+    user_config_dir: str
     systemd_dir: str
     launchd_dir: str
     system_prompt_path: str
@@ -186,6 +243,8 @@ class SlackbotIngressPayload:
     execution_mode: str = "raw"
     project: str | None = None
     session: str | None = None
+    slack_user_id: str | None = None
+    system_scoped: bool = False
     created_at: str = ""
 
 
@@ -424,6 +483,62 @@ def child_process_env(config: SlackbotConfig) -> dict[str, str]:
     return env
 
 
+def is_secret_env_name(env_name: str) -> bool:
+    normalized = env_name.upper()
+    if normalized in SECRET_ENV_NAME_EXCEPTIONS:
+        return False
+    parts = {part for part in re.split(r"[^A-Za-z0-9]+", normalized) if part}
+    return bool(parts & SECRET_ENV_NAME_PARTS)
+
+
+def child_env_scrub_allowlist(profile: SlackbotProfile) -> tuple[str, ...]:
+    env_names = tuple(
+        OrderedDict.fromkeys(
+            env_name.strip()
+            for env_name in profile.child_env_scrub_allowlist
+            if env_name.strip()
+        )
+    )
+    for env_name in env_names:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
+            raise SlackbotError(
+                "Unsupported child env scrub allowlist variable: "
+                f"{env_name!r}"
+            )
+    return env_names
+
+
+def merge_child_process_env(
+    config: SlackbotConfig,
+    extra_env: dict[str, str] | None = None,
+    *,
+    scrub_secret_env: bool = False,
+    use_scrub_allowlist: bool = False,
+) -> dict[str, str]:
+    env = child_process_env(config)
+    if scrub_secret_env:
+        scrub_allowlist = (
+            set(child_env_scrub_allowlist(config.profile))
+            if use_scrub_allowlist
+            else set()
+        )
+        for env_name in tuple(env):
+            if env_name not in scrub_allowlist and is_secret_env_name(
+                env_name
+            ):
+                env.pop(env_name, None)
+        for secret_field in user_config_secret_fields(config.profile):
+            for env_name in (
+                *secret_field.env_names,
+                *secret_field.scrub_env_names,
+            ):
+                env.pop(env_name, None)
+    for key, value in (extra_env or {}).items():
+        if key and value:
+            env[key] = value
+    return env
+
+
 def read_json(path: str | Path, default: Any) -> Any:
     target = Path(path).expanduser()
     if not target.exists():
@@ -488,7 +603,9 @@ def resolve_paths(
     root = expand_path(runtime_root or profile.default_runtime_root)
     if root is None:
         raise SlackbotError("runtime root is required")
-    state = expand_path(state_dir) or root / "var"
+    state = (
+        expand_path(state_dir or profile.default_state_dir) or root / "var"
+    )
     service_manager = service_manager_kind()
     resolved_unit_name = unit_name or profile.unit_name
     systemd_dir = root / "systemd"
@@ -499,7 +616,7 @@ def resolve_paths(
     else:
         unit_path = systemd_dir / resolved_unit_name
     prompt_path = (
-        expand_path(system_prompt_path)
+        expand_path(system_prompt_path or profile.default_system_prompt_path)
         or root / "agents" / f"{profile.app_slug}.md"
     )
     env = expand_path(env_path or profile.default_env_path) or root / ".env"
@@ -514,6 +631,7 @@ def resolve_paths(
         schedule_dir=str(state / "schedules"),
         schedule_reports_dir=str(state / "schedule-runs"),
         agents_dir=str(prompt_path.parent),
+        user_config_dir=str(state / "users"),
         systemd_dir=str(systemd_dir),
         launchd_dir=str(launchd_dir),
         system_prompt_path=str(prompt_path),
@@ -765,6 +883,8 @@ def scaffold_runtime(
         mcp_server_url=mcp_server_url,
         team_config_path=team_config_path,
     )
+    env_parent = Path(paths.env_path).parent
+    env_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     write_text(
         paths.env_path,
         render_env_file(values, f"{profile.app_slug} slackbot-init"),
@@ -788,6 +908,7 @@ def scaffold_runtime(
         paths.schedule_dir,
         paths.schedule_reports_dir,
         paths.agents_dir,
+        paths.user_config_dir,
         paths.systemd_dir,
         paths.launchd_dir,
     ):
@@ -801,6 +922,7 @@ def scaffold_runtime(
         "ingress_dir": paths.ingress_dir,
         "schedule_dir": paths.schedule_dir,
         "agents_dir": paths.agents_dir,
+        "user_config_dir": paths.user_config_dir,
         "system_prompt_path": paths.system_prompt_path,
         "unit_path": paths.unit_path,
     }
@@ -988,6 +1110,7 @@ def query_status(
         "worker_count": config.worker_count,
         "mcp_server_url": config.mcp_server_url or "",
         "team_config_path": config.team_config_path or "",
+        "user_config_dir": config.paths.user_config_dir,
         "bot_token": mask_secret(config.bot_token),
         "app_token": mask_secret(config.app_token),
     }
@@ -1047,8 +1170,18 @@ def payload_to_dict(payload: SlackbotIngressPayload) -> dict[str, Any]:
         "execution_mode": payload.execution_mode,
         "project": payload.project,
         "session": payload.session,
+        "slack_user_id": payload.slack_user_id,
+        "system_scoped": payload.system_scoped,
         "created_at": payload.created_at or utcnow_iso(),
     }
+
+
+def parse_ingress_system_scoped(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    raise SlackbotError("Codex ingress system_scoped must be a boolean")
 
 
 def enqueue_ingress(
@@ -1065,6 +1198,8 @@ def enqueue_ingress(
     execution_mode: str = "raw",
     project: str | None = None,
     session: str | None = None,
+    slack_user_id: str | None = None,
+    system_scoped: bool | None = None,
 ) -> str:
     paths = resolve_paths(
         profile,
@@ -1075,6 +1210,39 @@ def enqueue_ingress(
         unit_name=unit_name,
     )
     Path(paths.ingress_dir).mkdir(parents=True, exist_ok=True)
+    if system_scoped is None:
+        if kind == "codex_prompt":
+            system_scoped = not (slack_user_id or route.dm_user_id)
+        else:
+            system_scoped = False
+    system_scoped = parse_ingress_system_scoped(system_scoped)
+    if (
+        kind == "codex_prompt"
+        and not system_scoped
+        and not (slack_user_id or route.dm_user_id)
+    ):
+        raise SlackbotError(
+            "Codex ingress requires slack_user_id when system_scoped=False"
+        )
+    if kind == "codex_prompt" and system_scoped and slack_user_id:
+        raise SlackbotError(
+            "Codex ingress cannot set both slack_user_id and system_scoped"
+        )
+    resolved_slack_user_id = slack_user_id
+    if (
+        kind == "codex_prompt"
+        and not system_scoped
+        and not resolved_slack_user_id
+    ):
+        resolved_slack_user_id = route.dm_user_id
+    if (
+        kind == "codex_prompt"
+        and not resolved_slack_user_id
+        and not system_scoped
+    ):
+        raise SlackbotError(
+            "Codex ingress requires slack_user_id or system_scoped=True"
+        )
     payload = SlackbotIngressPayload(
         kind=kind,
         text=text,
@@ -1082,6 +1250,8 @@ def enqueue_ingress(
         execution_mode=normalize_execution_mode(execution_mode),
         project=project,
         session=session,
+        slack_user_id=resolved_slack_user_id,
+        system_scoped=system_scoped,
         created_at=utcnow_iso(),
     )
     digest = hashlib.sha256(
@@ -1162,8 +1332,13 @@ def slack_api_post(
 def slack_response_url_post(
     response_url: str,
     text: str,
+    *,
+    blocks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    data = json.dumps({"text": text}).encode("utf-8")
+    payload: dict[str, Any] = {"text": text}
+    if blocks:
+        payload["blocks"] = blocks
+    data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         response_url,
         data=data,
@@ -1229,6 +1404,8 @@ def _post_single_slack_message(
     config: SlackbotConfig,
     route: SlackbotRoute,
     text: str,
+    *,
+    blocks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     channel = route.channel_id
     if not channel and route.dm_user_id:
@@ -1239,8 +1416,16 @@ def _post_single_slack_message(
         )
         channel = opened["channel"]["id"]
     if not channel:
+        if route.response_url:
+            return slack_response_url_post(
+                route.response_url,
+                text,
+                blocks=blocks,
+            )
         return None
     payload: dict[str, Any] = {"channel": channel, "text": text}
+    if blocks:
+        payload["blocks"] = blocks
     if route.thread_ts:
         payload["thread_ts"] = route.thread_ts
     try:
@@ -1254,6 +1439,38 @@ def _post_single_slack_message(
             {"channel": channel},
         )
         return slack_api_post(config.bot_token, "chat.postMessage", payload)
+
+
+def post_slack_blocks(
+    config: SlackbotConfig,
+    route: SlackbotRoute,
+    text: str,
+    blocks: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    rendered_text = render_route_text(route, text)
+    if not config.bot_token and route.response_url:
+        return slack_response_url_post(
+            route.response_url,
+            rendered_text,
+            blocks=blocks,
+        )
+    if not config.bot_token:
+        raise SlackbotError("Slack bot token is missing")
+    try:
+        return _post_single_slack_message(
+            config,
+            route,
+            rendered_text,
+            blocks=blocks,
+        )
+    except SlackbotError:
+        if not route.response_url:
+            raise
+        return slack_response_url_post(
+            route.response_url,
+            rendered_text,
+            blocks=blocks,
+        )
 
 
 def update_slack_message(
@@ -1342,6 +1559,649 @@ def render_thread_transcript(messages: list[dict[str, Any]]) -> str:
         text = message.get("text") or ""
         lines.append(f"[{ts}] {user}: {text}")
     return "\n".join(lines)
+
+
+def _block_plain_text(text: str) -> dict[str, Any]:
+    return {"type": "plain_text", "text": text[:3000], "emoji": True}
+
+
+def _block_mrkdwn(text: str) -> dict[str, Any]:
+    return {"type": "mrkdwn", "text": text[:3000]}
+
+
+def _plain_text_input(
+    *,
+    action_id: str,
+    placeholder: str,
+    initial_value: str | None = None,
+    multiline: bool = False,
+) -> dict[str, Any]:
+    element: dict[str, Any] = {
+        "type": "plain_text_input",
+        "action_id": action_id,
+        "placeholder": _block_plain_text(placeholder[:150]),
+        "multiline": multiline,
+    }
+    if initial_value:
+        element["initial_value"] = initial_value[:3000]
+    return element
+
+
+def _input_block(
+    *,
+    block_id: str,
+    label: str,
+    element: dict[str, Any],
+    optional: bool = True,
+    hint: str | None = None,
+) -> dict[str, Any]:
+    block: dict[str, Any] = {
+        "type": "input",
+        "block_id": block_id,
+        "label": _block_plain_text(label[:2000]),
+        "element": element,
+        "optional": optional,
+    }
+    if hint:
+        block["hint"] = _block_plain_text(hint[:2000])
+    return block
+
+
+def _checkbox_option(text: str, value: str) -> dict[str, Any]:
+    return {"text": _block_plain_text(text[:75]), "value": value[:75]}
+
+
+def safe_slack_storage_id(value: str, description: str = "Slack ID") -> str:
+    text = value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{2,100}", text) or set(text) == {"."}:
+        raise SlackbotError(f"Unsupported {description}: {value!r}")
+    return text
+
+
+def _normalize_user_config_secret_field(
+    field: SlackbotUserConfigSecretField,
+) -> SlackbotUserConfigSecretField:
+    service_name = safe_slack_storage_id(
+        field.service_name,
+        "secret service name",
+    ).lower()
+    block_id = safe_slack_storage_id(
+        field.block_id or f"{service_name}_token",
+        "secret block ID",
+    )
+    action_id = safe_slack_storage_id(
+        field.action_id or block_id,
+        "secret action ID",
+    )
+    label = field.label.strip()
+    if not label:
+        raise SlackbotError(
+            f"Secret field {service_name!r} is missing a label"
+        )
+    env_names = tuple(
+        OrderedDict.fromkeys(
+            env_name.strip()
+            for env_name in field.env_names
+            if env_name.strip()
+        )
+    )
+    scrub_env_names = tuple(
+        OrderedDict.fromkeys(
+            env_name.strip()
+            for env_name in field.scrub_env_names
+            if env_name.strip()
+        )
+    )
+    if not env_names:
+        raise SlackbotError(
+            f"Secret field {service_name!r} has no environment names"
+        )
+    for env_name in (*env_names, *scrub_env_names):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
+            raise SlackbotError(
+                f"Unsupported secret environment variable: {env_name!r}"
+            )
+    return replace(
+        field,
+        service_name=service_name,
+        block_id=block_id,
+        action_id=action_id,
+        label=label,
+        env_names=env_names,
+        scrub_env_names=scrub_env_names,
+        required=bool(field.required),
+    )
+
+
+def user_config_secret_fields(
+    profile: SlackbotProfile | None = None,
+) -> tuple[SlackbotUserConfigSecretField, ...]:
+    fields = list(CORE_USER_CONFIG_SECRET_FIELDS)
+    if profile is not None:
+        fields.extend(profile.user_config_secret_fields)
+    merged: OrderedDict[str, SlackbotUserConfigSecretField] = OrderedDict()
+    for secret_field in fields:
+        normalized = _normalize_user_config_secret_field(secret_field)
+        existing = merged.get(normalized.service_name)
+        if existing is not None:
+            env_names = tuple(
+                OrderedDict.fromkeys(
+                    (*existing.env_names, *normalized.env_names)
+                )
+            )
+            scrub_env_names = tuple(
+                OrderedDict.fromkeys(
+                    (
+                        *existing.scrub_env_names,
+                        *normalized.scrub_env_names,
+                    )
+                )
+            )
+            merged[normalized.service_name] = replace(
+                existing,
+                env_names=env_names,
+                scrub_env_names=scrub_env_names,
+                required=existing.required or normalized.required,
+            )
+            continue
+        merged[normalized.service_name] = normalized
+    return tuple(merged.values())
+
+
+def user_config_secret_field(
+    profile: SlackbotProfile | None,
+    service_name: str,
+) -> SlackbotUserConfigSecretField:
+    key = safe_slack_storage_id(
+        service_name.strip().lower(),
+        "secret service name",
+    )
+    for secret_field in user_config_secret_fields(profile):
+        if secret_field.service_name == key:
+            return secret_field
+    raise SlackbotError(f"Unsupported Slack user secret: {service_name}")
+
+
+def user_config_directory(paths: SlackbotPaths, user_id: str) -> Path:
+    safe_user = safe_slack_storage_id(user_id, "Slack user ID")
+    return Path(paths.user_config_dir) / safe_user
+
+
+def _read_user_secret_token(token_path: Path) -> str | None:
+    try:
+        return token_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SlackbotError(
+            f"Could not read Slack user secret file: {token_path}"
+        ) from exc
+
+
+def _user_secret_status(token_path: Path) -> str:
+    try:
+        token = _read_user_secret_token(token_path)
+    except SlackbotError:
+        return "invalid"
+    if token is None:
+        return "missing"
+    if not token:
+        return "empty"
+    return "configured"
+
+
+def read_user_config(
+    paths: SlackbotPaths,
+    user_id: str,
+    profile: SlackbotProfile | None = None,
+) -> dict[str, Any]:
+    directory = user_config_directory(paths, user_id)
+    profile_data = read_json(directory / "profile.json", {})
+    secrets = {}
+    for secret_field in user_config_secret_fields(profile):
+        secrets[secret_field.service_name] = _user_secret_status(
+            directory / "secrets" / f"{secret_field.service_name}.token"
+        )
+    return {"profile": profile_data, "secrets": secrets}
+
+
+def user_codex_sessions_enabled(paths: SlackbotPaths, user_id: str) -> bool:
+    directory = user_config_directory(paths, user_id)
+    profile_path = directory / "profile.json"
+    if profile_path.exists():
+        try:
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise SlackbotError(
+                f"Malformed Slack user profile: {profile_path}"
+            ) from exc
+    else:
+        profile = {}
+    if not isinstance(profile, dict):
+        raise SlackbotError(
+            f"Slack user profile is not an object: {profile_path}"
+        )
+    preferences = profile.get("preferences") or {}
+    return bool(preferences.get("codex_enabled", True))
+
+
+def read_user_secret_env(
+    paths: SlackbotPaths,
+    user_id: str,
+    profile: SlackbotProfile | None = None,
+) -> dict[str, str]:
+    directory = user_config_directory(paths, user_id)
+    secrets_dir = directory / "secrets"
+    env: dict[str, str] = {}
+    for secret_field in user_config_secret_fields(profile):
+        token_path = secrets_dir / f"{secret_field.service_name}.token"
+        try:
+            token = _read_user_secret_token(token_path)
+        except SlackbotError:
+            if secret_field.required:
+                raise
+            continue
+        if token is None:
+            if secret_field.required:
+                raise SlackbotError(
+                    "Missing required Slack user secret: "
+                    f"{secret_field.service_name}"
+                )
+            continue
+        if not token:
+            if secret_field.required:
+                raise SlackbotError(
+                    "Required Slack user secret is empty: "
+                    f"{secret_field.service_name}"
+                )
+            continue
+        for env_name in secret_field.env_names:
+            env[env_name] = token
+    return env
+
+
+def store_user_secret_token(
+    paths: SlackbotPaths,
+    user_id: str,
+    profile: SlackbotProfile,
+    service_name: str,
+    token: str,
+    *,
+    source: str = "cli",
+) -> dict[str, str]:
+    secret_field = user_config_secret_field(profile, service_name)
+    clean_token = token.strip()
+    if not clean_token:
+        raise SlackbotError(
+            f"Refusing to store empty {secret_field.service_name} token"
+        )
+
+    now = utcnow_iso()
+    directory = user_config_directory(paths, user_id)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    secrets_dir = directory / "secrets"
+    secrets_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    secrets_dir.chmod(0o700)
+    token_path = secrets_dir / f"{secret_field.service_name}.token"
+    write_text(token_path, clean_token + "\n", mode=0o600)
+
+    profile_path = directory / "profile.json"
+    with locked_json_path(profile_path):
+        existing = read_json(profile_path, {})
+        preferences = dict(existing.get("preferences") or {})
+        secrets = dict(existing.get("secrets") or {})
+        previous = secrets.get(secret_field.service_name)
+        created_at = None
+        if isinstance(previous, dict):
+            created_at = previous.get("created_at")
+        secrets[secret_field.service_name] = {
+            "created_at": created_at or now,
+            "source": str(source or "cli"),
+            "updated_at": now,
+        }
+        data = {
+            "app_slug": profile.app_slug,
+            "created_at": existing.get("created_at") or now,
+            "preferences": preferences,
+            "secrets": secrets,
+            "slack_team_id": existing.get("slack_team_id") or "",
+            "slack_user_id": safe_slack_storage_id(user_id, "Slack user ID"),
+            "updated_at": now,
+        }
+        if existing.get("last_mode"):
+            data["last_mode"] = existing["last_mode"]
+        write_json_atomic(profile_path, data)
+
+    return {
+        "service_name": secret_field.service_name,
+        "token_path": str(token_path),
+        "profile_path": str(profile_path),
+        "user_id": safe_slack_storage_id(user_id, "Slack user ID"),
+    }
+
+
+def user_config_mode_from_text(text: str) -> str | None:
+    tokens = text.strip().split()
+    if len(tokens) != 1:
+        return None
+    command = tokens[0].lower()
+    if command not in USER_CONFIG_TRIGGER_WORDS:
+        return None
+    if command in {"bootstrap", "onboard", "setup"}:
+        return "bootstrap"
+    return "config"
+
+
+def normalize_user_config_mode(value: Any) -> str:
+    return (
+        "bootstrap" if str(value or "").strip() == "bootstrap" else "config"
+    )
+
+
+def normalize_static_response_name(text: Any) -> str:
+    return " ".join(str(text or "").casefold().strip().split())
+
+
+def static_response_text_from_profile(
+    profile: SlackbotProfile,
+    text: Any,
+) -> str | None:
+    key = normalize_static_response_name(text)
+    if not key:
+        return None
+    for response in profile.static_responses:
+        names = {
+            normalize_static_response_name(name) for name in response.names
+        }
+        if key in names:
+            return response.text
+    return None
+
+
+def _secret_status_block(
+    secret_field: SlackbotUserConfigSecretField,
+    *,
+    status: str,
+) -> dict[str, Any]:
+    secret_field = _normalize_user_config_secret_field(secret_field)
+    labels = {
+        "configured": "configured",
+        "empty": "empty",
+        "invalid": "invalid",
+        "missing": "not configured",
+    }
+    label = labels.get(status, "not configured")
+    if secret_field.required and status != "configured":
+        label = f"required, {label}"
+    return {
+        "type": "section",
+        "block_id": secret_field.block_id,
+        "text": _block_mrkdwn(
+            f"*{secret_field.label}*: {label}. "
+            "Managed outside Slack; this modal never accepts token values."
+        ),
+    }
+
+
+def build_user_config_view(
+    config: SlackbotConfig,
+    *,
+    user_id: str,
+    channel_id: str | None = None,
+    mode: str = "config",
+) -> dict[str, Any]:
+    mode = normalize_user_config_mode(mode)
+    existing = read_user_config(config.paths, user_id, config.profile)
+    profile = existing.get("profile") or {}
+    preferences = profile.get("preferences") or {}
+    secrets = existing.get("secrets") or {}
+    codex_enabled = bool(preferences.get("codex_enabled", True))
+    private_metadata = json.dumps(
+        {
+            "channel_id": channel_id,
+            "mode": mode,
+            "user_id": user_id,
+        },
+        separators=(",", ":"),
+    )
+    title = (
+        f"{config.profile.app_slug} bootstrap"
+        if mode == "bootstrap"
+        else f"{config.profile.app_slug} config"
+    )
+    codex_option = _checkbox_option(
+        "Allow Codex-backed work sessions",
+        USER_CONFIG_CODEX_OPTION_VALUE,
+    )
+    codex_element: dict[str, Any] = {
+        "type": "checkboxes",
+        "action_id": USER_CONFIG_CODEX_ACTION_ID,
+        "options": [codex_option],
+    }
+    if codex_enabled:
+        codex_element["initial_options"] = [codex_option]
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": _block_mrkdwn(
+                "User-scoped settings for this bot. Secret fields are "
+                "managed outside Slack and are shown here only as status."
+            ),
+        },
+        _input_block(
+            block_id="display_name",
+            label="Display name",
+            element=_plain_text_input(
+                action_id="display_name",
+                placeholder="Your preferred name",
+                initial_value=preferences.get("display_name") or "",
+            ),
+        ),
+        _input_block(
+            block_id="default_project",
+            label="Default project",
+            element=_plain_text_input(
+                action_id="default_project",
+                placeholder="docs, tooling, operations, ...",
+                initial_value=preferences.get("default_project") or "",
+            ),
+        ),
+        *[
+            _secret_status_block(
+                secret_field,
+                status=str(secrets.get(secret_field.service_name) or ""),
+            )
+            for secret_field in user_config_secret_fields(config.profile)
+        ],
+        {
+            "type": "input",
+            "block_id": "codex_enabled",
+            "label": _block_plain_text("Work sessions"),
+            "optional": True,
+            "element": codex_element,
+        },
+        _input_block(
+            block_id="notes",
+            label="Notes",
+            element=_plain_text_input(
+                action_id="notes",
+                placeholder=(
+                    "Anything this bot should remember for your setup"
+                ),
+                initial_value=preferences.get("notes") or "",
+                multiline=True,
+            ),
+        ),
+    ]
+    return {
+        "type": "modal",
+        "callback_id": USER_CONFIG_MODAL_CALLBACK_ID,
+        "title": _block_plain_text(title[:24]),
+        "submit": _block_plain_text("Save"),
+        "close": _block_plain_text("Cancel"),
+        "private_metadata": private_metadata,
+        "blocks": blocks,
+    }
+
+
+def _view_private_metadata(view: dict[str, Any]) -> dict[str, Any]:
+    raw = view.get("private_metadata") or ""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _view_state_value(
+    values: dict[str, Any],
+    block_id: str,
+    action_id: str,
+) -> str:
+    block = values.get(block_id) or {}
+    element = block.get(action_id) or {}
+    return str(element.get("value") or "").strip()
+
+
+def _view_state_checked(
+    values: dict[str, Any],
+    block_id: str,
+    action_id: str,
+    value: str,
+) -> bool:
+    block = values.get(block_id) or {}
+    element = block.get(action_id) or {}
+    selected = element.get("selected_options") or []
+    return any(option.get("value") == value for option in selected)
+
+
+def save_user_config_submission(
+    config: SlackbotConfig,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    user_id = str((payload.get("user") or {}).get("id") or "").strip()
+    if not user_id:
+        raise SlackbotError("Slack config submission is missing user ID")
+    view = payload.get("view") or {}
+    metadata = _view_private_metadata(view)
+    metadata_user = str(metadata.get("user_id") or "").strip()
+    if metadata_user and metadata_user != user_id:
+        raise SlackbotError("Slack config submission user mismatch")
+    callback_id = view.get("callback_id")
+    if callback_id != USER_CONFIG_MODAL_CALLBACK_ID:
+        raise SlackbotError(
+            f"Unsupported config modal callback: {callback_id}"
+        )
+    values = (view.get("state") or {}).get("values") or {}
+    now = utcnow_iso()
+    directory = user_config_directory(config.paths, user_id)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    profile_path = directory / "profile.json"
+    updated_fields = []
+    team_id = str((payload.get("team") or {}).get("id") or "").strip()
+    with locked_json_path(profile_path):
+        existing = read_json(profile_path, {})
+        preferences = dict(existing.get("preferences") or {})
+        for name, (block_id, action_id) in USER_CONFIG_FIELDS.items():
+            value = _view_state_value(values, block_id, action_id)
+            previous = preferences.get(name, "")
+            if value:
+                preferences[name] = value
+            else:
+                preferences.pop(name, None)
+            if value != previous:
+                updated_fields.append(name)
+        codex_enabled = _view_state_checked(
+            values,
+            "codex_enabled",
+            USER_CONFIG_CODEX_ACTION_ID,
+            USER_CONFIG_CODEX_OPTION_VALUE,
+        )
+        if preferences.get("codex_enabled", True) != codex_enabled:
+            updated_fields.append("codex_enabled")
+        preferences["codex_enabled"] = codex_enabled
+        data = {
+            "app_slug": config.profile.app_slug,
+            "created_at": existing.get("created_at") or now,
+            "last_mode": normalize_user_config_mode(metadata.get("mode")),
+            "preferences": preferences,
+            "secrets": dict(existing.get("secrets") or {}),
+            "slack_team_id": team_id or existing.get("slack_team_id") or "",
+            "slack_user_id": user_id,
+            "updated_at": now,
+        }
+        write_json_atomic(profile_path, data)
+    return {
+        "profile_path": str(profile_path),
+        "secret_updates": [],
+        "updated_fields": updated_fields,
+        "user_id": user_id,
+    }
+
+
+def user_config_saved_message(summary: dict[str, Any]) -> str:
+    fields = sorted(set(summary.get("updated_fields") or []))
+    secrets = sorted(set(summary.get("secret_updates") or []))
+    parts = ["Config saved."]
+    if fields:
+        parts.append("Updated fields: " + ", ".join(fields) + ".")
+    if secrets:
+        parts.append(
+            "Secret files changed outside Slack: " + ", ".join(secrets) + "."
+        )
+    if not fields and not secrets:
+        parts.append("No fields changed. Extremely tidy.")
+    parts.append(
+        "Use the slash command again whenever you need to adjust it."
+    )
+    return " ".join(parts)
+
+
+def user_config_launcher_blocks(
+    mode: str = "config",
+    *,
+    command_name: str = "/sneeze",
+) -> list[dict[str, Any]]:
+    mode = normalize_user_config_mode(mode)
+    label = "Open bootstrap" if mode == "bootstrap" else "Open config"
+    text = (
+        "Use the button to open the config modal. Slash command shortcut: "
+        f"`{command_name} config`."
+    )
+    return [
+        {"type": "section", "text": _block_mrkdwn(text)},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": USER_CONFIG_OPEN_ACTION_ID,
+                    "text": _block_plain_text(label),
+                    "style": "primary",
+                    "value": mode,
+                }
+            ],
+        },
+    ]
+
+
+def post_user_config_launcher(
+    config: SlackbotConfig,
+    route: SlackbotRoute,
+    *,
+    mode: str = "config",
+) -> dict[str, Any] | None:
+    mode = normalize_user_config_mode(mode)
+    return post_slack_blocks(
+        config,
+        route,
+        f"Open the {config.profile.app_slug} config modal.",
+        user_config_launcher_blocks(mode, command_name=config.command_name),
+    )
 
 
 def render_systemd_service(
@@ -2002,6 +2862,7 @@ def run_schedule(
             execution_mode=schedule.execution_mode,
             project=schedule.project,
             session=schedule.session,
+            system_scoped=True,
         )
     report["report_path"] = str(report_path)
     return report
@@ -2073,6 +2934,10 @@ class CodexRunner:
         self,
         prompt: str,
         session_id: str | None = None,
+        *,
+        extra_env: dict[str, str] | None = None,
+        scrub_secret_env: bool = False,
+        use_scrub_allowlist: bool = False,
     ) -> dict[str, Any]:
         output = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
         output.close()
@@ -2085,7 +2950,12 @@ class CodexRunner:
             proc = subprocess.run(
                 args,
                 input=prompt,
-                env=child_process_env(self.config),
+                env=merge_child_process_env(
+                    self.config,
+                    extra_env,
+                    scrub_secret_env=scrub_secret_env,
+                    use_scrub_allowlist=use_scrub_allowlist,
+                ),
                 text=True,
                 check=False,
                 capture_output=True,
@@ -2302,22 +3172,167 @@ class SlackSocketBot:
 
     def _handle_request(self, client: Any, request: Any) -> None:
         _, _, SocketModeResponse = self._import_slack_sdk()
-        try:
-            client.send_socket_mode_response(
-                SocketModeResponse(envelope_id=request.envelope_id)
+        request_type = getattr(request, "type", None)
+        payload = getattr(request, "payload", {}) or {}
+        user_config_submission = self._user_config_view_submission_payload(
+            request_type,
+            payload,
+        )
+        is_view_submission = (
+            self._view_submission_payload(
+                request_type,
+                payload,
             )
-        except Exception:
-            pass
-        if not self.work_semaphore.acquire(blocking=False):
-            emit(self.out, "Dropping Slack request: worker queue is full")
-            return
-        self.executor.submit(
-            self._dispatch_payload_safe,
-            getattr(request, "type", None),
-            getattr(request, "payload", {}),
+            is not None
+        )
+        work_acquired = False
+        ack_payload = self._socket_ack_payload(
+            request_type,
+            payload,
+            user_config_submission=user_config_submission,
         )
 
-    def _dispatch_payload_safe(
+        def send_response(response_payload: dict[str, Any] | None) -> None:
+            try:
+                response_kwargs = {"envelope_id": request.envelope_id}
+                if response_payload is not None:
+                    response_kwargs["payload"] = response_payload
+                client.send_socket_mode_response(
+                    SocketModeResponse(**response_kwargs)
+                )
+            except Exception:
+                pass
+
+        if user_config_submission is not None and ack_payload is not None:
+            send_response(ack_payload)
+            return
+        if user_config_submission is not None:
+            work_acquired = self.work_semaphore.acquire(blocking=False)
+            if not work_acquired:
+                ack_payload = self._view_submission_error_payload(
+                    "The bot is busy. Please submit the modal again."
+                )
+                emit(
+                    self.out,
+                    "Dropping Slack view submission: worker queue is full",
+                )
+                send_response(ack_payload)
+                return
+            send_response(ack_payload)
+        else:
+            work_acquired = self.work_semaphore.acquire(blocking=False)
+            if not work_acquired:
+                if is_view_submission:
+                    ack_payload = self._view_submission_error_payload(
+                        "The bot is busy. Please submit the modal again.",
+                        block_id=self._view_submission_error_block_id(
+                            request_type,
+                            payload,
+                        ),
+                    )
+                send_response(ack_payload)
+                emit(self.out, "Dropping Slack request: worker queue is full")
+                return
+            send_response(ack_payload)
+        try:
+            self.executor.submit(
+                self._dispatch_payload_with_semaphore_release,
+                request_type,
+                payload,
+            )
+        except Exception:
+            self.work_semaphore.release()
+            raise
+
+    def _socket_ack_payload(
+        self,
+        request_type: str | None,
+        payload: dict[str, Any],
+        *,
+        user_config_submission: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        interactive_payload = user_config_submission
+        if interactive_payload is None:
+            interactive_payload = self._user_config_view_submission_payload(
+                request_type,
+                payload,
+            )
+        if interactive_payload is None:
+            return None
+        view = interactive_payload.get("view") or {}
+        metadata = _view_private_metadata(view)
+        user_id = str((interactive_payload.get("user") or {}).get("id") or "")
+        channel_id = metadata.get("channel_id") or None
+        channel_type = "im" if str(channel_id or "").startswith("D") else None
+        if self._is_user_config_authorized(
+            user_id,
+            channel_id,
+            channel_type=channel_type,
+        ):
+            return None
+        return self._view_submission_error_payload(
+            "This Slackbot is not configured to accept that request."
+        )
+
+    def _user_config_view_submission_payload(
+        self,
+        request_type: str | None,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        interactive_payload = self._view_submission_payload(
+            request_type,
+            payload,
+        )
+        if interactive_payload is None:
+            return None
+        view = interactive_payload.get("view") or {}
+        if view.get("callback_id") != USER_CONFIG_MODAL_CALLBACK_ID:
+            return None
+        return interactive_payload
+
+    def _view_submission_payload(
+        self,
+        request_type: str | None,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        payload_type = request_type or payload.get("type")
+        if payload_type not in {"interactive", "view_submission"}:
+            return None
+        interactive_payload = self._normalize_interactive_payload(payload)
+        if interactive_payload.get("type") != "view_submission":
+            return None
+        return interactive_payload
+
+    def _view_submission_error_block_id(
+        self,
+        request_type: str | None,
+        payload: dict[str, Any],
+    ) -> str:
+        interactive_payload = self._view_submission_payload(
+            request_type,
+            payload,
+        )
+        view = (interactive_payload or {}).get("view") or {}
+        for block in view.get("blocks") or []:
+            block_id = block.get("block_id")
+            if block_id:
+                return str(block_id)
+        return "codex_enabled"
+
+    def _view_submission_error_payload(
+        self,
+        message: str,
+        *,
+        block_id: str = "codex_enabled",
+    ) -> dict[str, Any]:
+        return {
+            "response_action": "errors",
+            "errors": {
+                block_id: message,
+            },
+        }
+
+    def _dispatch_payload_with_semaphore_release(
         self,
         request_type: str | None,
         payload: dict[str, Any],
@@ -2350,6 +3365,16 @@ class SlackSocketBot:
             if self._seen_recently(f"slash:{dedupe_key}"):
                 return
             self._handle_slash(payload)
+        elif payload_type in (
+            "interactive",
+            "block_actions",
+            "view_submission",
+        ):
+            interactive_payload = self._normalize_interactive_payload(payload)
+            dedupe_key = self._interactive_dedupe_key(interactive_payload)
+            if self._seen_recently(f"interactive:{dedupe_key}"):
+                return
+            self._handle_interactive(interactive_payload)
 
     def _event_dedupe_key(self, event: dict[str, Any]) -> str:
         digest = hashlib.sha256(
@@ -2368,6 +3393,48 @@ class SlackSocketBot:
             json.dumps(parts, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
         return f"fallback:{digest}"
+
+    def _interactive_dedupe_key(self, payload: dict[str, Any]) -> str:
+        view = payload.get("view") or {}
+        view_state = (view.get("state") or {}).get("values")
+        parts = {
+            "actions": [
+                {
+                    "action_id": action.get("action_id"),
+                    "action_ts": action.get("action_ts"),
+                    "value": action.get("value"),
+                }
+                for action in payload.get("actions") or []
+            ],
+            "callback_id": view.get("callback_id"),
+            "trigger_id": payload.get("trigger_id"),
+            "user_id": (payload.get("user") or {}).get("id"),
+            "view_hash": view.get("hash"),
+            "view_id": view.get("id"),
+            "view_state": view_state,
+        }
+        digest = hashlib.sha256(
+            json.dumps(parts, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        return f"fallback:{digest}"
+
+    def _normalize_interactive_payload(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if payload.get("type") != "interactive":
+            return payload
+        nested = payload.get("payload")
+        if isinstance(nested, dict):
+            return nested
+        if isinstance(nested, str):
+            try:
+                parsed = json.loads(nested)
+            except json.JSONDecodeError:
+                return payload
+            if isinstance(parsed, dict):
+                return parsed
+        return payload
 
     def _seen_recently(self, key: str | None) -> bool:
         if not key:
@@ -2395,10 +3462,10 @@ class SlackSocketBot:
             return
         if event.get("bot_id"):
             return
-        user_id = str(event.get("user") or "").strip()
-        if not user_id:
+        slack_user_id = str(event.get("user") or "").strip() or None
+        if not slack_user_id:
             return
-        if self.bot_user_id and user_id == self.bot_user_id:
+        if self.bot_user_id and slack_user_id == self.bot_user_id:
             return
         text = strip_bot_mentions(event.get("text") or "", self.bot_user_id)
         if not text:
@@ -2410,19 +3477,34 @@ class SlackSocketBot:
             thread_ts = event.get("thread_ts") or event.get("ts")
         route = SlackbotRoute(
             channel_id=channel,
-            dm_user_id=user_id if channel_type == "im" else None,
+            dm_user_id=slack_user_id if channel_type == "im" else None,
             thread_ts=thread_ts,
         )
+        if channel_type == "im" and self._maybe_handle_user_config(
+            text,
+            route,
+        ):
+            return
+        if channel_type == "im" and self._maybe_handle_static_response(
+            text,
+            route,
+        ):
+            return
         if not self._is_authorized(
-            user_id,
+            slack_user_id,
             channel,
             channel_type=channel_type,
         ):
             self._post_unauthorized(route)
             return
+        if channel_type != "im" and self._maybe_handle_static_response(
+            text,
+            route,
+        ):
+            return
         if self._maybe_handle_agent_tmux(text, route):
             return
-        self._run_codex_for_route(text, route)
+        self._run_codex_for_route(text, route, slack_user_id=slack_user_id)
 
     def _handle_slash(self, payload: dict[str, Any]) -> None:
         raw_command = str(payload.get("command") or "").strip()
@@ -2435,17 +3517,206 @@ class SlackSocketBot:
         if command_name != self.config.command_name:
             return
         text = (payload.get("text") or "").strip()
-        if not text:
-            return
         route = SlackbotRoute(
             channel_id=payload.get("channel_id"),
             thread_ts=payload.get("thread_ts") or None,
             response_url=payload.get("response_url") or None,
         )
-        if not self._is_authorized(payload.get("user_id"), route.channel_id):
+        channel_type = (
+            "im"
+            if str(route.channel_id or "").startswith("D")
+            or payload.get("channel_name") == "directmessage"
+            else None
+        )
+        if not self._is_authorized(
+            payload.get("user_id"),
+            route.channel_id,
+            channel_type=channel_type,
+        ):
             self._post_unauthorized(route)
             return
-        self._run_codex_for_route(text, route)
+        mode = user_config_mode_from_text(text)
+        if mode:
+            self._open_user_config_modal(payload, mode=mode)
+            return
+        if self._maybe_handle_static_response(text, route):
+            return
+        if not text:
+            return
+        self._run_codex_for_route(
+            text,
+            route,
+            slack_user_id=str(payload.get("user_id") or "").strip() or None,
+        )
+
+    def _handle_interactive(self, payload: dict[str, Any]) -> None:
+        payload_type = payload.get("type")
+        if payload_type == "block_actions":
+            for action in payload.get("actions") or []:
+                if action.get("action_id") != USER_CONFIG_OPEN_ACTION_ID:
+                    continue
+                user_id = str((payload.get("user") or {}).get("id") or "")
+                channel_id = (payload.get("channel") or {}).get("id") or None
+                channel_type = (
+                    "im" if str(channel_id or "").startswith("D") else None
+                )
+                if not self._is_user_config_authorized(
+                    user_id,
+                    channel_id,
+                    channel_type=channel_type,
+                ):
+                    self._post_unauthorized(
+                        SlackbotRoute(
+                            channel_id=channel_id,
+                            dm_user_id=user_id,
+                        )
+                    )
+                    return
+                mode = normalize_user_config_mode(action.get("value"))
+                self._open_user_config_modal(payload, mode=mode)
+                return
+        if payload_type == "view_submission":
+            view = payload.get("view") or {}
+            if view.get("callback_id") != USER_CONFIG_MODAL_CALLBACK_ID:
+                return
+            metadata = _view_private_metadata(view)
+            user_id = str((payload.get("user") or {}).get("id") or "")
+            channel_id = metadata.get("channel_id") or None
+            channel_type = (
+                "im" if str(channel_id or "").startswith("D") else None
+            )
+            if not self._is_user_config_authorized(
+                user_id,
+                channel_id,
+                channel_type=channel_type,
+            ):
+                self._post_unauthorized(SlackbotRoute(dm_user_id=user_id))
+                return
+            try:
+                summary = save_user_config_submission(self.config, payload)
+            except Exception as exc:
+                emit(self.out, f"Failed to save Slack config modal: {exc}")
+                self._post_user_config_feedback(
+                    user_id,
+                    channel_id,
+                    private_text=f"I could not save your config: {exc}",
+                    fallback_text=(
+                        "I could not save your config. Please try again."
+                    ),
+                )
+                return
+            self._post_user_config_feedback(
+                user_id,
+                channel_id,
+                private_text=user_config_saved_message(summary),
+                fallback_text="Config saved.",
+            )
+
+    def _post_user_config_feedback(
+        self,
+        user_id: str,
+        channel_id: str | None,
+        *,
+        private_text: str,
+        fallback_text: str,
+    ) -> None:
+        try:
+            post_slack_message(
+                self.config,
+                SlackbotRoute(dm_user_id=user_id),
+                private_text,
+            )
+            return
+        except Exception as exc:
+            emit(self.out, f"Failed to post Slack config DM feedback: {exc}")
+        if not channel_id:
+            return
+        try:
+            post_slack_message(
+                self.config,
+                SlackbotRoute(channel_id=channel_id),
+                fallback_text,
+            )
+        except Exception as exc:
+            emit(
+                self.out,
+                f"Failed to post Slack config channel feedback: {exc}",
+            )
+
+    def _is_user_config_authorized(
+        self,
+        user_id: str | None,
+        channel_id: str | None,
+        *,
+        channel_type: str | None = None,
+    ) -> bool:
+        if channel_type == "im":
+            return True
+        return self._is_authorized(
+            user_id,
+            channel_id,
+            channel_type=channel_type,
+        )
+
+    def _maybe_handle_static_response(
+        self,
+        text: str,
+        route: SlackbotRoute,
+    ) -> bool:
+        response = static_response_text_from_profile(
+            self.config.profile,
+            text,
+        )
+        if response is None:
+            return False
+        post_slack_message(self.config, route, response)
+        return True
+
+    def _open_user_config_modal(
+        self,
+        payload: dict[str, Any],
+        *,
+        mode: str = "config",
+    ) -> None:
+        trigger_id = str(payload.get("trigger_id") or "").strip()
+        user_id = str((payload.get("user") or {}).get("id") or "").strip()
+        if not user_id:
+            user_id = str(payload.get("user_id") or "").strip()
+        channel_id = (
+            payload.get("channel_id")
+            or (payload.get("channel") or {}).get("id")
+            or (payload.get("container") or {}).get("channel_id")
+            or None
+        )
+        response_url = payload.get("response_url") or None
+        route = SlackbotRoute(
+            channel_id=channel_id,
+            dm_user_id=user_id,
+            response_url=response_url,
+        )
+        if not trigger_id or not self.config.bot_token:
+            post_user_config_launcher(self.config, route, mode=mode)
+            return
+        try:
+            slack_api_post(
+                self.config.bot_token,
+                "views.open",
+                {
+                    "trigger_id": trigger_id,
+                    "view": build_user_config_view(
+                        self.config,
+                        user_id=user_id,
+                        channel_id=channel_id,
+                        mode=mode,
+                    ),
+                },
+            )
+        except Exception as exc:
+            post_slack_message(
+                self.config,
+                route,
+                f"I could not open the config modal: {exc}",
+            )
 
     def _is_authorized(
         self,
@@ -2530,8 +3801,13 @@ class SlackSocketBot:
         *,
         project: str | None = None,
         session: str | None = None,
+        slack_user_id: str | None = None,
     ) -> str | None:
-        prefix = f"project:{project}:" if project else ""
+        prefix = ""
+        if project:
+            prefix += f"project:{project}:"
+        if slack_user_id and not route.dm_user_id:
+            prefix += f"user:{slack_user_id}:"
         if session:
             return f"{prefix}session:{session}"
         if route.dm_user_id and route.channel_id:
@@ -2550,18 +3826,104 @@ class SlackSocketBot:
         execution_mode: str = "raw",
         project: str | None = None,
         session: str | None = None,
+        slack_user_id: str | None = None,
+        scrub_secret_env: bool = False,
+        raise_user_config_errors: bool = False,
     ) -> None:
         normalize_execution_mode(execution_mode)
+        user_config_error: Exception | None = None
+        text = None
+        user_secret_env: dict[str, str] = {}
+        if slack_user_id:
+            try:
+                slack_user_id = safe_slack_storage_id(
+                    slack_user_id,
+                    "Slack user ID",
+                )
+            except Exception as exc:
+                emit(
+                    self.out,
+                    f"Failed to normalize user-scoped Slack ID: {exc}",
+                )
+                text = (
+                    "I could not verify your Codex-backed work session "
+                    "settings, so I did not start a session."
+                )
+                user_config_error = exc
+                slack_user_id = None
+            if text is None:
+                try:
+                    codex_enabled = user_codex_sessions_enabled(
+                        self.config.paths, slack_user_id
+                    )
+                except Exception as exc:
+                    emit(
+                        self.out,
+                        "Failed to verify user-scoped Slack config: "
+                        f"{exc}",
+                    )
+                    text = (
+                        "I could not verify your Codex-backed work "
+                        "session settings, so I did not start a session."
+                    )
+                    user_config_error = exc
+                else:
+                    if not codex_enabled:
+                        text = (
+                            "Codex-backed work sessions are disabled for "
+                            "your profile. Use the config modal to "
+                            "re-enable them."
+                        )
+            if text is None:
+                try:
+                    user_secret_env = read_user_secret_env(
+                        self.config.paths,
+                        slack_user_id,
+                        self.config.profile,
+                    )
+                except Exception as exc:
+                    emit(
+                        self.out,
+                        f"Failed to load user-scoped Slack secrets: {exc}",
+                    )
+                    text = (
+                        "I could not load your user-scoped Slackbot "
+                        "secrets, so I did not start a Codex session."
+                    )
+                    user_config_error = exc
+        if route.dm_user_id and text is None:
+            try:
+                dm_user_id = safe_slack_storage_id(
+                    route.dm_user_id,
+                    "Slack user ID",
+                )
+            except Exception as exc:
+                emit(
+                    self.out,
+                    f"Failed to normalize Slack DM user ID: {exc}",
+                )
+                text = (
+                    "I could not verify your Codex-backed work session "
+                    "settings, so I did not start a session."
+                )
+                user_config_error = exc
+                dm_user_id = None
+            if dm_user_id != route.dm_user_id:
+                route = replace(route, dm_user_id=dm_user_id)
         conversation_key = self._conversation_key(
             route,
             project=project,
             session=session,
+            slack_user_id=slack_user_id,
         )
         placeholder = None
-        try:
-            placeholder = post_slack_message(self.config, route, "Working...")
-        except Exception as exc:
-            emit(self.out, f"Failed to post Slack placeholder: {exc}")
+        if text is None:
+            try:
+                placeholder = post_slack_message(
+                    self.config, route, "Working..."
+                )
+            except Exception as exc:
+                emit(self.out, f"Failed to post Slack placeholder: {exc}")
         placeholder_ts = placeholder.get("ts") if placeholder else None
         placeholder_channel = (
             placeholder.get("channel") if placeholder else None
@@ -2579,6 +3941,7 @@ class SlackSocketBot:
                 route,
                 project=project,
                 session=session,
+                slack_user_id=slack_user_id,
             )
         try:
             lock_context = (
@@ -2592,27 +3955,44 @@ class SlackSocketBot:
                     if conversation_key
                     else None
                 )
-                result = self.runner.run(
-                    self._build_prompt(prompt, route, project=project),
-                    session_id=(record or {}).get("session_id"),
-                )
-                if conversation_key and result.get("session_id"):
-                    self.conversations.set(
-                        conversation_key,
-                        {
-                            "session_id": result["session_id"],
-                            "project": project,
-                            "route": route_to_dict(route),
-                            "updated_at": utcnow_iso(),
-                        },
+                if text is None:
+                    run_kwargs = {}
+                    if slack_user_id or scrub_secret_env:
+                        run_kwargs["scrub_secret_env"] = True
+                    if scrub_secret_env and not slack_user_id:
+                        run_kwargs["use_scrub_allowlist"] = True
+                    if user_secret_env:
+                        run_kwargs["extra_env"] = user_secret_env
+                    result = self.runner.run(
+                        self._build_prompt(prompt, route, project=project),
+                        session_id=(record or {}).get("session_id"),
+                        **run_kwargs,
                     )
-            text = (
-                result["last_message"] or result["stderr"] or result["stdout"]
-            )
-            if result["returncode"]:
-                text = f"Codex exited with {result['returncode']}.\n\n{text}"
+                    if conversation_key and result.get("session_id"):
+                        self.conversations.set(
+                            conversation_key,
+                            {
+                                "session_id": result["session_id"],
+                                "project": project,
+                                "route": route_to_dict(route),
+                                "updated_at": utcnow_iso(),
+                            },
+                        )
+                    text = (
+                        result["last_message"]
+                        or result["stderr"]
+                        or result["stdout"]
+                    )
+                    if result["returncode"]:
+                        text = (
+                            f"Codex exited with {result['returncode']}.\n\n"
+                            f"{text}"
+                        )
         except Exception as exc:
-            text = f"I hit an internal error while talking to Codex: {exc}"
+            if text is None:
+                text = (
+                    f"I hit an internal error while talking to Codex: {exc}"
+                )
         reply_text = render_route_text(route, text or "(no response)")
         chunks = chunk_text(reply_text)
         followup_route = SlackbotRoute(
@@ -2667,6 +4047,19 @@ class SlackSocketBot:
                 post_slack_message(self.config, followup_route, chunk)
             except Exception as exc:
                 emit(self.out, f"Failed to post Slack response chunk: {exc}")
+        if raise_user_config_errors and user_config_error is not None:
+            raise user_config_error
+
+    def _maybe_handle_user_config(
+        self,
+        text: str,
+        route: SlackbotRoute,
+    ) -> bool:
+        mode = user_config_mode_from_text(text)
+        if not mode:
+            return False
+        post_user_config_launcher(self.config, route, mode=mode)
+        return True
 
     def _maybe_handle_agent_tmux(
         self,
@@ -2817,6 +4210,29 @@ class SlackSocketBot:
                             raise
                         continue
                 elif kind == "codex_prompt":
+                    if "system_scoped" not in payload:
+                        system_scoped = not (
+                            payload.get("slack_user_id") or route.dm_user_id
+                        )
+                    else:
+                        system_scoped = parse_ingress_system_scoped(
+                            payload.get("system_scoped")
+                        )
+                    slack_user_id = None
+                    if not system_scoped:
+                        slack_user_id = (
+                            payload.get("slack_user_id")
+                            or route.dm_user_id
+                            or None
+                        )
+                    if not slack_user_id and not system_scoped:
+                        raise SlackbotError(
+                            "Codex ingress is missing Slack user ID; "
+                            "set system_scoped for non-user jobs"
+                        )
+                    dispatch_route = route
+                    if system_scoped and route.dm_user_id:
+                        dispatch_route = replace(route, dm_user_id=None)
                     if not self.work_semaphore.acquire(blocking=False):
                         claimed.replace(ingress / claimed.name)
                         emit(
@@ -2832,10 +4248,11 @@ class SlackSocketBot:
                             self._run_ingress_codex_safe,
                             claimed,
                             text,
-                            route,
+                            dispatch_route,
                             payload.get("execution_mode") or "raw",
                             payload.get("project") or None,
                             payload.get("session") or None,
+                            slack_user_id,
                         )
                     except Exception:
                         with self.active_ingress_lock:
@@ -2898,6 +4315,7 @@ class SlackSocketBot:
         execution_mode: str,
         project: str | None,
         session: str | None,
+        slack_user_id: str | None,
     ) -> None:
         try:
             self._run_codex_for_route(
@@ -2906,6 +4324,9 @@ class SlackSocketBot:
                 execution_mode=execution_mode,
                 project=project,
                 session=session,
+                slack_user_id=slack_user_id,
+                scrub_secret_env=True,
+                raise_user_config_errors=True,
             )
         except Exception as exc:
             target = Path(self.config.paths.ingress_error_dir) / claimed.name
@@ -2936,7 +4357,20 @@ def run_slackbot(
     state_dir: str | None = None,
     system_prompt_path: str | None = None,
     unit_name: str | None = None,
+    slack_domain: str | None = None,
+    app_id: str | None = None,
+    client_id: str | None = None,
+    bot_name: str | None = None,
+    command_name: str | None = None,
+    codex_bin: str | None = None,
+    codex_mode: str | None = None,
+    codex_model: str | None = None,
+    codex_profile: str | None = None,
+    codex_workdir: str | None = None,
+    codex_extra_args: str | None = None,
     worker_count: int | None = None,
+    mcp_server_url: str | None = None,
+    team_config_path: str | None = None,
     max_runtime_seconds: int | None = None,
     out: Callable[[str], None] | None = None,
 ) -> None:
@@ -2948,8 +4382,38 @@ def run_slackbot(
         system_prompt_path=system_prompt_path,
         unit_name=unit_name,
     )
+    overrides: dict[str, Any] = {}
+    for key, value in (
+        ("slack_domain", slack_domain),
+        ("app_id", app_id),
+        ("client_id", client_id),
+        ("bot_name", bot_name),
+        ("codex_bin", codex_bin),
+        ("codex_model", codex_model),
+        ("codex_profile", codex_profile),
+        ("mcp_server_url", mcp_server_url),
+        ("team_config_path", team_config_path),
+    ):
+        if value is not None:
+            overrides[key] = value.strip() or None
+    if command_name is not None:
+        overrides["command_name"] = normalize_command_name(
+            command_name,
+            profile.default_command_name,
+        )
+    if codex_mode is not None:
+        overrides["codex_mode"] = normalize_codex_mode(codex_mode)
+    if codex_workdir is not None:
+        overrides["codex_workdir"] = require_expanded_path(
+            codex_workdir,
+            "Codex workdir",
+        )
+    if codex_extra_args is not None:
+        overrides["codex_extra_args"] = parse_extra_args(codex_extra_args)
     if worker_count:
-        config = replace(config, worker_count=worker_count)
+        overrides["worker_count"] = worker_count
+    if overrides:
+        config = replace(config, **overrides)
     SlackSocketBot(config, out=out).run(
         max_runtime_seconds=max_runtime_seconds
     )

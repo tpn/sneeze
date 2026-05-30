@@ -1,5 +1,6 @@
 import logging
 import sys
+from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import pytest
 from sneeze import cli as sneeze_cli
 from sneeze.command import Command, resolve_log_level
 from sneeze.plugin import PluginSpec
+from sneeze.tmux_dev import TmuxDevController
 from sneeze.util import Options
 
 
@@ -325,6 +327,52 @@ def test_direct_commandline_logs_unexpected_command_exception(
     assert instances[0].exit_code == 1
     assert instances[0].error_type == "ValueError"
     assert instances[0].error_message == "boom"
+
+
+def test_tmux_dev_controller_logs_tails_from_end(tmp_path):
+    log_path = Path(tmp_path) / "dev.log"
+    log_path.write_text(
+        "".join(f"line {index}\n" for index in range(99))
+        + "progress\rline 99\n",
+        encoding="utf-8",
+    )
+    output = []
+
+    TmuxDevController(
+        tmux_bin="/tmp/tmux",
+        socket="sample",
+        session="sample",
+        root=str(tmp_path),
+        log_path=str(log_path),
+    ).logs(lines=3, out=output.append)
+
+    assert output == ["line 97\nline 98\nprogress\rline 99"]
+
+
+def test_tmux_dev_start_precreates_private_log(tmp_path, monkeypatch):
+    log_path = Path(tmp_path) / "dev.log"
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(
+            returncode=1 if "has-session" in args else 0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr("sneeze.tmux_dev.subprocess.run", fake_run)
+
+    TmuxDevController(
+        tmux_bin="/tmp/tmux",
+        socket="sample",
+        session="sample",
+        root=str(tmp_path),
+        log_path=str(log_path),
+    ).start(["echo", "ok"], out=lambda message: None)
+
+    assert log_path.stat().st_mode & 0o777 == 0o600
+    assert any("new-session" in call for call in calls)
 
 
 def test_reused_command_instances_do_not_replay_exit_functions():
