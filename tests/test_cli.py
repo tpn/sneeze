@@ -1,3 +1,4 @@
+import io
 import logging
 import sys
 from pathlib import Path
@@ -243,6 +244,40 @@ def test_queue_unknown_command_fails_without_attribute_error(
     assert "Unknown subcommand 'nope'" in captured.err
 
 
+def test_queue_unknown_command_logs_its_own_exit_code(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from sneeze import runlog
+    from sneeze.runlog import load_run_instances
+
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+    queue = Queue()
+    queue.put(["missing-command"])
+    cli = sneeze_cli.CLI(
+        program_name="sne",
+        module_names=["sneeze"],
+        args_queue=queue,
+        auto_plugins=False,
+    )
+    cli.returncode = 7
+
+    cli.run()
+    capsys.readouterr()
+
+    instances = load_run_instances(
+        [runlog.get_run_log_path(run_dir=str(tmp_path / "run"))]
+    )
+    assert queue.unfinished_tasks == 0
+    assert cli.returncode == 1
+    assert instances[0].exit_code == 1
+    assert instances[0].error_type == "CommandError"
+    assert "Unknown subcommand 'missing-command'" in (
+        instances[0].error_message
+    )
+
+
 def test_queue_marks_task_done_when_command_raises(monkeypatch, tmp_path):
     _use_tmp_run_dir(tmp_path, monkeypatch)
     queue = Queue()
@@ -295,6 +330,72 @@ def test_queue_marks_pending_tasks_done_when_command_raises(
         cli.run()
 
     assert queue.unfinished_tasks == 0
+
+
+def test_queue_system_exit_string_logs_exit_code_one(monkeypatch, tmp_path):
+    from sneeze import runlog
+    from sneeze.runlog import load_run_instances
+
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+
+    def fail(self, args):
+        raise SystemExit("boom")
+
+    monkeypatch.setattr(sneeze_cli.CommandLine, "run", fail)
+    queue = Queue()
+    queue.put(["run-history"])
+    cli = sneeze_cli.CLI(
+        program_name="sne",
+        module_names=["sneeze"],
+        args_queue=queue,
+        auto_plugins=False,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.run()
+
+    instances = load_run_instances(
+        [runlog.get_run_log_path(run_dir=str(tmp_path / "run"))]
+    )
+    assert exc_info.value.code == "boom"
+    assert queue.unfinished_tasks == 0
+    assert instances[0].exit_code == 1
+    assert instances[0].error_type == "SystemExit"
+    assert instances[0].error_message == "boom"
+
+
+def test_queue_system_exit_none_logs_exit_code_zero(monkeypatch, tmp_path):
+    from sneeze import runlog
+    from sneeze.runlog import load_run_instances
+
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+
+    def exit_cleanly(self, args):
+        raise SystemExit()
+
+    monkeypatch.setattr(sneeze_cli.CommandLine, "run", exit_cleanly)
+    queue = Queue()
+    queue.put(["run-history"])
+    queue.put(["run-history"])
+    cli = sneeze_cli.CLI(
+        program_name="sne",
+        module_names=["sneeze"],
+        args_queue=queue,
+        auto_plugins=False,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.run()
+
+    instances = load_run_instances(
+        [runlog.get_run_log_path(run_dir=str(tmp_path / "run"))]
+    )
+    assert exc_info.value.code is None
+    assert queue.unfinished_tasks == 0
+    assert len(instances) == 1
+    assert instances[0].exit_code == 0
+    assert instances[0].error_type == "SystemExit"
+    assert instances[0].error_message == ""
 
 
 def test_direct_commandline_logs_unexpected_command_exception(
@@ -372,7 +473,11 @@ def test_tmux_dev_start_precreates_private_log(tmp_path, monkeypatch):
     ).start(["echo", "ok"], out=lambda message: None)
 
     assert log_path.stat().st_mode & 0o777 == 0o600
-    assert any("new-session" in call for call in calls)
+    new_session = next(call for call in calls if "new-session" in call)
+    tmux_command = new_session[-1]
+    assert "bash -c" in tmux_command
+    assert "bash -lc" not in tmux_command
+    assert "PIPESTATUS[0]" in tmux_command
 
 
 def test_reused_command_instances_do_not_replay_exit_functions():
@@ -430,6 +535,53 @@ def test_command_exit_runs_exit_functions_after_deallocate_error():
     assert Command.get_first_command() is None
 
 
+def test_command_exit_runs_all_exit_functions_after_hook_error():
+    calls = []
+
+    def fail():
+        calls.append("first")
+        raise RuntimeError("exit hook failed")
+
+    class ExitCommand(Command):
+        def run(self):
+            self.on_exit(fail)
+            self.on_exit(calls.append, "second")
+
+    command = ExitCommand()
+    command.options = Options()
+
+    with pytest.raises(RuntimeError, match="exit hook failed"):
+        command.start()
+
+    assert calls == ["first", "second"]
+    assert Command.get_active_command() is None
+    assert Command.get_first_command() is None
+
+
+def test_command_exit_reports_hook_errors_during_command_error():
+    estream = io.StringIO()
+
+    def fail():
+        raise RuntimeError("exit hook failed")
+
+    class ExitCommand(Command):
+        def run(self):
+            self.on_exit(fail)
+            raise ValueError("run failed")
+
+    command = ExitCommand(estream=estream)
+    command.options = Options()
+
+    with pytest.raises(ValueError, match="run failed"):
+        command.start()
+
+    assert "warning: exit function failed: exit hook failed" in (
+        estream.getvalue()
+    )
+    assert Command.get_active_command() is None
+    assert Command.get_first_command() is None
+
+
 def test_cli_prefixes_duplicate_plugin_command_names(
     tmp_path,
     monkeypatch,
@@ -477,6 +629,37 @@ def test_cli_keeps_core_name_and_prefixes_plugin_collision(
 
     assert "run-history" in cli._commands_by_name
     assert "alpha-run-history" in cli._commands_by_name
+
+
+def test_cli_skips_broken_auto_plugin(tmp_path, monkeypatch, capsys):
+    _write_plugin(tmp_path, "alpha_plugin", "alpha")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(
+        sneeze_cli,
+        "discover_plugins",
+        lambda: [
+            PluginSpec("broken", "missing_plugin", "test"),
+            PluginSpec("alpha", "alpha_plugin", "test"),
+        ],
+    )
+
+    cli = sneeze_cli.CLI(
+        program_name="sne",
+        module_names=["sneeze"],
+        introspect=True,
+    )
+    captured = capsys.readouterr()
+
+    assert "foo" in cli._commands_by_name
+    assert "warning: skipping Sneeze plugin broken" in captured.err
+    assert "ModuleNotFoundError" in captured.err
+    assert "missing_plugin" in captured.err
+    assert len(cli.plugin_load_errors) == 1
+    assert cli.plugin_load_errors[0].username == "broken"
+    assert cli.plugin_load_errors[0].package == "missing_plugin"
+    assert cli.plugin_load_errors[0].source == "test"
+    assert cli.plugin_load_errors[0].error_type == "ModuleNotFoundError"
+    assert "missing_plugin" in cli.plugin_load_errors[0].error_message
 
 
 def test_init_plugin_cli_happy_path(tmp_path, monkeypatch, capsys):

@@ -79,8 +79,11 @@ CHILD_ENV_PASSTHROUGH = {
     "USER",
 }
 CODEX_SESSION_EVENT_TYPES = ("session_meta", "session_created")
+WORK_QUEUE_DEPTH_PER_WORKER = 4
+USER_CONFIG_DISPATCH_LIMIT = 4
 USER_CONFIG_MODAL_CALLBACK_ID = "sneeze_user_config"
 USER_CONFIG_OPEN_ACTION_ID = "sneeze_open_user_config"
+USER_CONFIG_CODEX_BLOCK_ID = "codex_enabled"
 USER_CONFIG_CODEX_ACTION_ID = "codex_enabled"
 USER_CONFIG_CODEX_OPTION_VALUE = "enabled"
 USER_CONFIG_TRIGGER_WORDS = {
@@ -91,18 +94,54 @@ USER_CONFIG_TRIGGER_WORDS = {
     "setup",
 }
 SECRET_ENV_NAME_PARTS = {
+    "APIKEY",
+    "AUTHORIZATION",
     "CREDENTIAL",
     "CREDENTIALS",
     "KEY",
     "KEYS",
+    "OAUTH",
     "PASS",
     "PASSWORD",
+    "PRIVATE",
     "SECRET",
+    "SIGNATURE",
+    "SIGNING",
     "TOKEN",
     "TOKENS",
 }
+SECRET_ENV_AUTH_PARTS = {
+    "AUTH",
+    "AUTHENTICATE",
+    "BEARER",
+    "OAUTH",
+}
+SECRET_ENV_AUTH_CONTEXT_PARTS = {
+    "API",
+    "BASIC",
+    "CONFIG",
+    "CREDENTIAL",
+    "CREDENTIALS",
+    "DIGEST",
+    "FILE",
+    "HEADER",
+    "JSON",
+    "KEY",
+    "KEYS",
+    "PRIVATE",
+    "PROXY",
+    "SECRET",
+    "TOKEN",
+    "TOKENS",
+    "WWW",
+}
 SECRET_ENV_NAME_EXCEPTIONS = {
     "SSH_AUTH_SOCK",
+}
+SECRET_ENV_NAME_SUBSTRINGS = {
+    "PASSWORD",
+    "SECRET",
+    "TOKEN",
 }
 USER_CONFIG_FIELDS = {
     "display_name": ("display_name", "display_name"),
@@ -247,7 +286,7 @@ class SlackbotIngressPayload:
     project: str | None = None
     session: str | None = None
     slack_user_id: str | None = None
-    system_scoped: bool = False
+    system_scoped: bool | None = None
     created_at: str = ""
 
 
@@ -491,11 +530,23 @@ def child_process_env(config: SlackbotConfig) -> dict[str, str]:
 
 
 def is_secret_env_name(env_name: str) -> bool:
-    normalized = env_name.upper()
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", env_name).upper()
     if normalized in SECRET_ENV_NAME_EXCEPTIONS:
         return False
     parts = {part for part in re.split(r"[^A-Za-z0-9]+", normalized) if part}
-    return bool(parts & SECRET_ENV_NAME_PARTS)
+    if normalized == "AUTH":
+        return True
+    if len(parts) == 1 and any(
+        normalized.endswith(marker) for marker in SECRET_ENV_NAME_SUBSTRINGS
+    ):
+        return True
+    if parts & SECRET_ENV_NAME_PARTS:
+        return True
+    auth_parts = parts & SECRET_ENV_AUTH_PARTS
+    return bool(
+        len(auth_parts) > 1
+        or (auth_parts and (parts & SECRET_ENV_AUTH_CONTEXT_PARTS))
+    )
 
 
 def child_env_scrub_allowlist(profile: SlackbotProfile) -> tuple[str, ...]:
@@ -1216,7 +1267,7 @@ def route_from_dict(data: dict[str, Any]) -> SlackbotRoute:
 
 
 def payload_to_dict(payload: SlackbotIngressPayload) -> dict[str, Any]:
-    return {
+    data = {
         "kind": payload.kind,
         "text": payload.text,
         "route": route_to_dict(payload.route, include_response_url=True),
@@ -1224,9 +1275,11 @@ def payload_to_dict(payload: SlackbotIngressPayload) -> dict[str, Any]:
         "project": payload.project,
         "session": payload.session,
         "slack_user_id": payload.slack_user_id,
-        "system_scoped": payload.system_scoped,
         "created_at": payload.created_at or utcnow_iso(),
     }
+    if payload.system_scoped is not None:
+        data["system_scoped"] = payload.system_scoped
+    return data
 
 
 def parse_ingress_system_scoped(value: Any) -> bool:
@@ -1263,39 +1316,34 @@ def enqueue_ingress(
         unit_name=unit_name,
     )
     Path(paths.ingress_dir).mkdir(parents=True, exist_ok=True)
-    if system_scoped is None:
-        if kind == "codex_prompt":
-            system_scoped = not (slack_user_id or route.dm_user_id)
-        else:
-            system_scoped = False
-    system_scoped = parse_ingress_system_scoped(system_scoped)
-    if (
-        kind == "codex_prompt"
-        and not system_scoped
-        and not (slack_user_id or route.dm_user_id)
-    ):
-        raise SlackbotError(
-            "Codex ingress requires slack_user_id when system_scoped=False"
-        )
-    if kind == "codex_prompt" and system_scoped and slack_user_id:
-        raise SlackbotError(
-            "Codex ingress cannot set both slack_user_id and system_scoped"
-        )
-    resolved_slack_user_id = slack_user_id
-    if (
-        kind == "codex_prompt"
-        and not system_scoped
-        and not resolved_slack_user_id
-    ):
-        resolved_slack_user_id = route.dm_user_id
-    if (
-        kind == "codex_prompt"
-        and not resolved_slack_user_id
-        and not system_scoped
-    ):
-        raise SlackbotError(
-            "Codex ingress requires slack_user_id or system_scoped=True"
-        )
+    if kind == "codex_prompt":
+        if system_scoped is None:
+            if slack_user_id or route.dm_user_id:
+                system_scoped = False
+            else:
+                raise SlackbotError(
+                    "Codex ingress requires slack_user_id or "
+                    "system_scoped=True"
+                )
+        system_scoped = parse_ingress_system_scoped(system_scoped)
+        if system_scoped and slack_user_id:
+            raise SlackbotError(
+                "Codex ingress cannot set both slack_user_id "
+                "and system_scoped"
+            )
+        resolved_slack_user_id = None
+        if not system_scoped:
+            resolved_slack_user_id = slack_user_id or route.dm_user_id
+            if not resolved_slack_user_id:
+                raise SlackbotError(
+                    "Codex ingress requires slack_user_id when "
+                    "system_scoped=False"
+                )
+    else:
+        if system_scoped is not None:
+            parse_ingress_system_scoped(system_scoped)
+        system_scoped = None
+        resolved_slack_user_id = slack_user_id
     payload = SlackbotIngressPayload(
         kind=kind,
         text=text,
@@ -1614,12 +1662,16 @@ def render_thread_transcript(messages: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _block_plain_text(text: str) -> dict[str, Any]:
-    return {"type": "plain_text", "text": text[:3000], "emoji": True}
+def _block_plain_text(
+    text: str,
+    *,
+    max_length: int = 3000,
+) -> dict[str, Any]:
+    return {"type": "plain_text", "text": text[:max_length], "emoji": True}
 
 
-def _block_mrkdwn(text: str) -> dict[str, Any]:
-    return {"type": "mrkdwn", "text": text[:3000]}
+def _block_mrkdwn(text: str, *, max_length: int = 3000) -> dict[str, Any]:
+    return {"type": "mrkdwn", "text": text[:max_length]}
 
 
 def _plain_text_input(
@@ -1632,7 +1684,7 @@ def _plain_text_input(
     element: dict[str, Any] = {
         "type": "plain_text_input",
         "action_id": action_id,
-        "placeholder": _block_plain_text(placeholder[:150]),
+        "placeholder": _block_plain_text(placeholder, max_length=150),
         "multiline": multiline,
     }
     if initial_value:
@@ -1651,17 +1703,20 @@ def _input_block(
     block: dict[str, Any] = {
         "type": "input",
         "block_id": block_id,
-        "label": _block_plain_text(label[:2000]),
+        "label": _block_plain_text(label, max_length=2000),
         "element": element,
         "optional": optional,
     }
     if hint:
-        block["hint"] = _block_plain_text(hint[:2000])
+        block["hint"] = _block_plain_text(hint, max_length=2000)
     return block
 
 
 def _checkbox_option(text: str, value: str) -> dict[str, Any]:
-    return {"text": _block_plain_text(text[:75]), "value": value[:75]}
+    return {
+        "text": _block_plain_text(text, max_length=75),
+        "value": value[:75],
+    }
 
 
 def safe_slack_storage_id(value: str, description: str = "Slack ID") -> str:
@@ -2069,7 +2124,7 @@ def build_user_config_view(
         ],
         {
             "type": "input",
-            "block_id": "codex_enabled",
+            "block_id": USER_CONFIG_CODEX_BLOCK_ID,
             "label": _block_plain_text("Work sessions"),
             "optional": True,
             "element": codex_element,
@@ -2090,7 +2145,7 @@ def build_user_config_view(
     return {
         "type": "modal",
         "callback_id": USER_CONFIG_MODAL_CALLBACK_ID,
-        "title": _block_plain_text(title[:24]),
+        "title": _block_plain_text(title, max_length=24),
         "submit": _block_plain_text("Save"),
         "close": _block_plain_text("Cancel"),
         "private_metadata": private_metadata,
@@ -2170,11 +2225,11 @@ def save_user_config_submission(
                 updated_fields.append(name)
         codex_enabled = _view_state_checked(
             values,
-            "codex_enabled",
+            USER_CONFIG_CODEX_BLOCK_ID,
             USER_CONFIG_CODEX_ACTION_ID,
             USER_CONFIG_CODEX_OPTION_VALUE,
         )
-        if preferences.get("codex_enabled", True) != codex_enabled:
+        if preferences.get("codex_enabled") != codex_enabled:
             updated_fields.append("codex_enabled")
         preferences["codex_enabled"] = codex_enabled
         data = {
@@ -2860,7 +2915,11 @@ def run_schedule(
             proc = subprocess.run(
                 command,
                 cwd=schedule.workdir,
-                env=child_process_env(config),
+                env=merge_child_process_env(
+                    config,
+                    scrub_secret_env=True,
+                    use_scrub_allowlist=True,
+                ),
                 text=True,
                 check=False,
                 capture_output=True,
@@ -3116,7 +3175,12 @@ class SlackSocketBot:
         self.config = config
         self.out = out
         self.executor = ThreadPoolExecutor(max_workers=config.worker_count)
-        self.work_semaphore = threading.Semaphore(config.worker_count * 4)
+        self.work_semaphore = threading.Semaphore(
+            config.worker_count * WORK_QUEUE_DEPTH_PER_WORKER
+        )
+        self.user_config_semaphore = threading.Semaphore(
+            min(USER_CONFIG_DISPATCH_LIMIT, max(1, config.worker_count))
+        )
         self.recent_events: dict[str, float] = {}
         self.recent_events_lock = threading.Lock()
         self.conversation_locks: OrderedDict[str, ConversationLockEntry] = (
@@ -3130,6 +3194,17 @@ class SlackSocketBot:
         self.bot_user_id: str | None = None
         self.team_name: str | None = None
         self.team_domain: str | None = config.slack_domain
+        if (
+            config.allowed_channel_ids
+            and not config.allowed_dm_user_ids
+            and not config.allowed_user_ids
+        ):
+            emit(
+                self.out,
+                "warning: SLACKBOT_ALLOWED_CHANNEL_IDS does not authorize "
+                "DMs; set SLACKBOT_ALLOWED_DM_USER_IDS or "
+                "SLACKBOT_ALLOWED_USER_IDS for DM access.",
+            )
 
     def _import_slack_sdk(self):
         try:
@@ -3259,11 +3334,20 @@ class SlackSocketBot:
         if user_config_submission is not None and ack_payload is not None:
             send_response(ack_payload)
             return
+        if self._immediate_user_config_request(request_type, payload):
+            send_response(None)
+            self._start_immediate_user_config_dispatch(request_type, payload)
+            return
         if user_config_submission is not None:
             work_acquired = self.work_semaphore.acquire(blocking=False)
             if not work_acquired:
                 ack_payload = self._view_submission_error_payload(
-                    "The bot is busy. Please submit the modal again."
+                    "The bot is busy. Please submit the modal again.",
+                    block_id=self._view_submission_error_block_id(
+                        request_type,
+                        payload,
+                        preferred_block_id=USER_CONFIG_CODEX_BLOCK_ID,
+                    ),
                 )
                 emit(
                     self.out,
@@ -3296,6 +3380,78 @@ class SlackSocketBot:
         except Exception:
             self.work_semaphore.release()
             raise
+
+    def _immediate_user_config_request(
+        self,
+        request_type: str | None,
+        payload: dict[str, Any],
+    ) -> bool:
+        payload_type = request_type or payload.get("type")
+        if payload_type == "slash_commands":
+            command_name = normalize_command_name(
+                str(payload.get("command") or "").strip(),
+                self.config.command_name,
+            )
+            return (
+                command_name == self.config.command_name
+                and user_config_mode_from_text(payload.get("text") or "")
+                is not None
+            )
+        if payload_type not in {"interactive", "block_actions"}:
+            return False
+        interactive_payload = self._normalize_interactive_payload(payload)
+        if interactive_payload.get("type") != "block_actions":
+            return False
+        return any(
+            action.get("action_id") == USER_CONFIG_OPEN_ACTION_ID
+            for action in interactive_payload.get("actions") or []
+        )
+
+    def _start_immediate_user_config_dispatch(
+        self,
+        request_type: str | None,
+        payload: dict[str, Any],
+    ) -> None:
+        if not self.user_config_semaphore.acquire(blocking=False):
+            emit(
+                self.out,
+                "Dropping Slack user-config open: dispatch queue is full",
+            )
+            return
+        thread = threading.Thread(
+            target=self._dispatch_user_config_with_semaphore_release,
+            args=(request_type, payload),
+            name=f"{self.config.profile.app_slug}-user-config-open",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except Exception as exc:
+            self.user_config_semaphore.release()
+            emit(
+                self.out,
+                f"Slack user-config dispatch thread failed to start: {exc}",
+            )
+
+    def _dispatch_user_config_with_semaphore_release(
+        self,
+        request_type: str | None,
+        payload: dict[str, Any],
+    ) -> None:
+        try:
+            self._dispatch_payload_safely(request_type, payload)
+        finally:
+            self.user_config_semaphore.release()
+
+    def _dispatch_payload_safely(
+        self,
+        request_type: str | None,
+        payload: dict[str, Any],
+    ) -> None:
+        try:
+            self._dispatch_payload(request_type, payload)
+        except Exception as exc:
+            emit(self.out, f"Slack request dispatch failed: {exc}")
 
     def _socket_ack_payload(
         self,
@@ -3360,23 +3516,30 @@ class SlackSocketBot:
         self,
         request_type: str | None,
         payload: dict[str, Any],
+        *,
+        preferred_block_id: str | None = None,
     ) -> str:
         interactive_payload = self._view_submission_payload(
             request_type,
             payload,
         )
         view = (interactive_payload or {}).get("view") or {}
+        block_ids = []
         for block in view.get("blocks") or []:
             block_id = block.get("block_id")
             if block_id:
-                return str(block_id)
-        return "codex_enabled"
+                block_ids.append(str(block_id))
+        if preferred_block_id and preferred_block_id in block_ids:
+            return preferred_block_id
+        if block_ids:
+            return block_ids[0]
+        return preferred_block_id or USER_CONFIG_CODEX_BLOCK_ID
 
     def _view_submission_error_payload(
         self,
         message: str,
         *,
-        block_id: str = "codex_enabled",
+        block_id: str = USER_CONFIG_CODEX_BLOCK_ID,
     ) -> dict[str, Any]:
         return {
             "response_action": "errors",
@@ -3390,10 +3553,9 @@ class SlackSocketBot:
         request_type: str | None,
         payload: dict[str, Any],
     ) -> None:
+        # _handle_request acquires this slot before submitting the worker.
         try:
-            self._dispatch_payload(request_type, payload)
-        except Exception as exc:
-            emit(self.out, f"Slack request dispatch failed: {exc}")
+            self._dispatch_payload_safely(request_type, payload)
         finally:
             self.work_semaphore.release()
 
@@ -3533,6 +3695,11 @@ class SlackSocketBot:
             dm_user_id=slack_user_id if channel_type == "im" else None,
             thread_ts=thread_ts,
         )
+        if channel_type == "im" and not self._allows_early_dm_response(
+            slack_user_id
+        ):
+            self._post_unauthorized(route)
+            return
         if channel_type == "im" and self._maybe_handle_user_config(
             text,
             route,
@@ -3581,16 +3748,23 @@ class SlackSocketBot:
             or payload.get("channel_name") == "directmessage"
             else None
         )
+        mode = user_config_mode_from_text(text)
+        if mode:
+            if not self._is_user_config_authorized(
+                payload.get("user_id"),
+                route.channel_id,
+                channel_type=channel_type,
+            ):
+                self._post_unauthorized(route)
+                return
+            self._open_user_config_modal(payload, mode=mode)
+            return
         if not self._is_authorized(
             payload.get("user_id"),
             route.channel_id,
             channel_type=channel_type,
         ):
             self._post_unauthorized(route)
-            return
-        mode = user_config_mode_from_text(text)
-        if mode:
-            self._open_user_config_modal(payload, mode=mode)
             return
         if self._maybe_handle_static_response(text, route):
             return
@@ -3635,8 +3809,9 @@ class SlackSocketBot:
             metadata = _view_private_metadata(view)
             user_id = str((payload.get("user") or {}).get("id") or "")
             channel_id = metadata.get("channel_id") or None
-            channel_type = (
-                "im" if str(channel_id or "").startswith("D") else None
+            channel_type = self._trusted_user_config_channel_type(
+                user_id,
+                channel_id,
             )
             if not self._is_user_config_authorized(
                 user_id,
@@ -3703,13 +3878,34 @@ class SlackSocketBot:
         *,
         channel_type: str | None = None,
     ) -> bool:
-        if channel_type == "im":
-            return True
         return self._is_authorized(
             user_id,
             channel_id,
             channel_type=channel_type,
         )
+
+    def _allows_early_dm_response(self, user_id: str | None) -> bool:
+        return self._is_authorized(user_id, None, channel_type="im")
+
+    def _trusted_user_config_channel_type(
+        self,
+        user_id: str | None,
+        channel_id: str | None,
+    ) -> str | None:
+        if not str(channel_id or "").startswith("D"):
+            return None
+        if not (
+            self.config.allowed_dm_user_ids
+            or self.config.allowed_user_ids
+            or self.config.allowed_channel_ids
+        ):
+            return "im"
+        if user_id and (
+            user_id in self.config.allowed_dm_user_ids
+            or user_id in self.config.allowed_user_ids
+        ):
+            return "im"
+        return None
 
     def _maybe_handle_static_response(
         self,
@@ -3782,9 +3978,12 @@ class SlackSocketBot:
         allowed_users = self.config.allowed_user_ids
         allowed_channels = self.config.allowed_channel_ids
         if channel_type == "im":
-            if allowed_dm_users:
-                return bool(user_id in allowed_dm_users)
-            return not allowed_users or bool(user_id in allowed_users)
+            if allowed_dm_users or allowed_users:
+                return bool(
+                    (allowed_dm_users and user_id in allowed_dm_users)
+                    or (allowed_users and user_id in allowed_users)
+                )
+            return not allowed_channels
         if not allowed_users and not allowed_channels:
             return False
         return bool(
@@ -3859,10 +4058,12 @@ class SlackSocketBot:
         prefix = ""
         if project:
             prefix += f"project:{project}:"
+        if session:
+            if slack_user_id:
+                prefix += f"user:{slack_user_id}:"
+            return f"{prefix}session:{session}"
         if slack_user_id and not route.dm_user_id:
             prefix += f"user:{slack_user_id}:"
-        if session:
-            return f"{prefix}session:{session}"
         if route.dm_user_id and route.channel_id:
             return f"{prefix}dm:{route.channel_id}:{route.dm_user_id}"
         if route.dm_user_id and not route.thread_ts:
@@ -3881,12 +4082,23 @@ class SlackSocketBot:
         session: str | None = None,
         slack_user_id: str | None = None,
         scrub_secret_env: bool = False,
+        conversation_route: SlackbotRoute | None = None,
+        user_config_error_callback: Callable[[Exception], None] | None = None,
         raise_user_config_errors: bool = False,
     ) -> None:
         normalize_execution_mode(execution_mode)
         user_config_error: Exception | None = None
-        text = None
+        reply_body = None
         user_secret_env: dict[str, str] = {}
+        route_for_conversation = conversation_route or route
+
+        def record_user_config_error(exc: Exception) -> None:
+            nonlocal user_config_error
+            if user_config_error is None:
+                user_config_error = exc
+            if user_config_error_callback:
+                user_config_error_callback(exc)
+
         if slack_user_id:
             try:
                 slack_user_id = safe_slack_storage_id(
@@ -3898,13 +4110,13 @@ class SlackSocketBot:
                     self.out,
                     f"Failed to normalize user-scoped Slack ID: {exc}",
                 )
-                text = (
+                reply_body = (
                     "I could not verify your Codex-backed work session "
                     "settings, so I did not start a session."
                 )
-                user_config_error = exc
+                record_user_config_error(exc)
                 slack_user_id = None
-            if text is None:
+            if reply_body is None:
                 try:
                     codex_enabled = user_codex_sessions_enabled(
                         self.config.paths, slack_user_id
@@ -3915,19 +4127,19 @@ class SlackSocketBot:
                         "Failed to verify user-scoped Slack config: "
                         f"{exc}",
                     )
-                    text = (
+                    reply_body = (
                         "I could not verify your Codex-backed work "
                         "session settings, so I did not start a session."
                     )
-                    user_config_error = exc
+                    record_user_config_error(exc)
                 else:
                     if not codex_enabled:
-                        text = (
+                        reply_body = (
                             "Codex-backed work sessions are disabled for "
                             "your profile. Use the config modal to "
                             "re-enable them."
                         )
-            if text is None:
+            if reply_body is None:
                 try:
                     user_secret_env = read_user_secret_env(
                         self.config.paths,
@@ -3939,12 +4151,12 @@ class SlackSocketBot:
                         self.out,
                         f"Failed to load user-scoped Slack secrets: {exc}",
                     )
-                    text = (
+                    reply_body = (
                         "I could not load your user-scoped Slackbot "
                         "secrets, so I did not start a Codex session."
                     )
-                    user_config_error = exc
-        if route.dm_user_id and text is None:
+                    record_user_config_error(exc)
+        if route.dm_user_id and reply_body is None:
             try:
                 dm_user_id = safe_slack_storage_id(
                     route.dm_user_id,
@@ -3955,32 +4167,32 @@ class SlackSocketBot:
                     self.out,
                     f"Failed to normalize Slack DM user ID: {exc}",
                 )
-                text = (
+                reply_body = (
                     "I could not verify your Codex-backed work session "
                     "settings, so I did not start a session."
                 )
-                user_config_error = exc
+                record_user_config_error(exc)
                 dm_user_id = None
             if dm_user_id != route.dm_user_id:
                 route = replace(route, dm_user_id=dm_user_id)
-        conversation_key = self._conversation_key(
-            route,
-            project=project,
-            session=session,
-            slack_user_id=slack_user_id,
-        )
+        should_run_codex = reply_body is None
         placeholder = None
-        if text is None:
+        placeholder_ts = None
+        placeholder_channel = None
+        if should_run_codex:
             try:
                 placeholder = post_slack_message(
                     self.config, route, "Working..."
                 )
             except Exception as exc:
                 emit(self.out, f"Failed to post Slack placeholder: {exc}")
-        placeholder_ts = placeholder.get("ts") if placeholder else None
-        placeholder_channel = (
-            placeholder.get("channel") if placeholder else None
-        )
+            else:
+                placeholder_ts = (
+                    placeholder.get("ts") if placeholder else None
+                )
+                placeholder_channel = (
+                    placeholder.get("channel") if placeholder else None
+                )
         if placeholder_ts and not route.thread_ts:
             route = SlackbotRoute(
                 channel_id=route.channel_id or placeholder_channel,
@@ -3989,13 +4201,28 @@ class SlackSocketBot:
                 thread_ts=placeholder_ts,
                 response_url=route.response_url,
             )
-        if conversation_key is None:
-            conversation_key = self._conversation_key(
-                route,
+            if conversation_route is None:
+                route_for_conversation = route
+            elif not conversation_route.thread_ts:
+                route_for_conversation = replace(
+                    conversation_route,
+                    channel_id=(
+                        conversation_route.channel_id
+                        or route.channel_id
+                        or placeholder_channel
+                    ),
+                    thread_ts=placeholder_ts,
+                )
+        conversation_key = (
+            self._conversation_key(
+                route_for_conversation,
                 project=project,
                 session=session,
                 slack_user_id=slack_user_id,
             )
+            if should_run_codex
+            else None
+        )
         try:
             lock_context = (
                 self._conversation_lock(conversation_key)
@@ -4005,14 +4232,14 @@ class SlackSocketBot:
             with lock_context:
                 record = (
                     self.conversations.get(conversation_key)
-                    if conversation_key
+                    if should_run_codex and conversation_key
                     else None
                 )
-                if text is None:
+                if should_run_codex:
                     run_kwargs = {}
                     if slack_user_id or scrub_secret_env:
                         run_kwargs["scrub_secret_env"] = True
-                    if scrub_secret_env and not slack_user_id:
+                    if scrub_secret_env or slack_user_id:
                         run_kwargs["use_scrub_allowlist"] = True
                     if user_secret_env:
                         run_kwargs["extra_env"] = user_secret_env
@@ -4031,22 +4258,22 @@ class SlackSocketBot:
                                 "updated_at": utcnow_iso(),
                             },
                         )
-                    text = (
+                    reply_body = (
                         result["last_message"]
                         or result["stderr"]
                         or result["stdout"]
                     )
                     if result["returncode"]:
-                        text = (
+                        reply_body = (
                             f"Codex exited with {result['returncode']}.\n\n"
-                            f"{text}"
+                            f"{reply_body}"
                         )
         except Exception as exc:
-            if text is None:
-                text = (
+            if reply_body is None:
+                reply_body = (
                     f"I hit an internal error while talking to Codex: {exc}"
                 )
-        reply_text = render_route_text(route, text or "(no response)")
+        reply_text = render_route_text(route, reply_body or "(no response)")
         chunks = chunk_text(reply_text)
         followup_route = SlackbotRoute(
             channel_id=route.channel_id,
@@ -4264,28 +4491,27 @@ class SlackSocketBot:
                         continue
                 elif kind == "codex_prompt":
                     if "system_scoped" not in payload:
-                        system_scoped = not (
-                            payload.get("slack_user_id") or route.dm_user_id
-                        )
+                        system_scoped = payload.get("slack_user_id") is None
                     else:
                         system_scoped = parse_ingress_system_scoped(
                             payload.get("system_scoped")
                         )
                     slack_user_id = None
                     if not system_scoped:
-                        slack_user_id = (
-                            payload.get("slack_user_id")
-                            or route.dm_user_id
-                            or None
-                        )
+                        slack_user_id = payload.get("slack_user_id") or None
+                        if not slack_user_id and route.dm_user_id:
+                            # Older DM ingress files implied user scope from
+                            # the delivery route. Treat them as system-scoped
+                            # instead of loading the recipient's secrets.
+                            system_scoped = True
                     if not slack_user_id and not system_scoped:
                         raise SlackbotError(
                             "Codex ingress is missing Slack user ID; "
                             "set system_scoped for non-user jobs"
                         )
-                    dispatch_route = route
+                    conversation_route = None
                     if system_scoped and route.dm_user_id:
-                        dispatch_route = replace(route, dm_user_id=None)
+                        conversation_route = replace(route, dm_user_id=None)
                     if not self.work_semaphore.acquire(blocking=False):
                         claimed.replace(ingress / claimed.name)
                         emit(
@@ -4301,11 +4527,12 @@ class SlackSocketBot:
                             self._run_ingress_codex_safe,
                             claimed,
                             text,
-                            dispatch_route,
+                            route,
                             payload.get("execution_mode") or "raw",
                             payload.get("project") or None,
                             payload.get("session") or None,
                             slack_user_id,
+                            conversation_route,
                         )
                     except Exception:
                         with self.active_ingress_lock:
@@ -4369,7 +4596,17 @@ class SlackSocketBot:
         project: str | None,
         session: str | None,
         slack_user_id: str | None,
+        conversation_route: SlackbotRoute | None,
     ) -> None:
+        user_config_errors: list[str] = []
+
+        def write_user_config_error_sidecar(target: Path) -> None:
+            if user_config_errors:
+                write_text(
+                    str(target) + ".user-config-error",
+                    "\n".join(user_config_errors) + "\n",
+                )
+
         try:
             self._run_codex_for_route(
                 text,
@@ -4379,6 +4616,10 @@ class SlackSocketBot:
                 session=session,
                 slack_user_id=slack_user_id,
                 scrub_secret_env=True,
+                conversation_route=conversation_route,
+                user_config_error_callback=(
+                    lambda exc: user_config_errors.append(str(exc))
+                ),
                 raise_user_config_errors=True,
             )
         except Exception as exc:
@@ -4389,6 +4630,7 @@ class SlackSocketBot:
             except FileNotFoundError:
                 pass
             write_text(str(target) + ".error", str(exc) + "\n")
+            write_user_config_error_sidecar(target)
         else:
             target = Path(self.config.paths.ingress_done_dir) / claimed.name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -4396,6 +4638,7 @@ class SlackSocketBot:
                 claimed.replace(target)
             except FileNotFoundError:
                 pass
+            write_user_config_error_sidecar(target)
         finally:
             with self.active_ingress_lock:
                 self.active_ingress.discard(str(claimed))

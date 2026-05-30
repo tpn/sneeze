@@ -117,10 +117,13 @@ class TmuxDevController:
                 f"tmux -L {self.socket} attach -t {self.session}"
             )
             return
-        tmux_command = (
-            f"cd {shlex.quote(self.root)} && exec {shell_join(command)} "
-            f"2>&1 | tee -a {shlex.quote(self.log_path)}"
+        shell_script = (
+            f"cd {shlex.quote(self.root)} || exit; "
+            f"{shell_join(command)} 2>&1 | "
+            f"tee -a {shlex.quote(self.log_path)}; "
+            "status=${PIPESTATUS[0]}; exit ${status}"
         )
+        tmux_command = f"exec bash -c {shlex.quote(shell_script)}"
         self._tmux(
             "new-session",
             "-d",

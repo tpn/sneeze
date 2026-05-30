@@ -2,6 +2,7 @@ import datetime as dt
 import getpass
 import json
 import os
+import shutil
 import tempfile
 import time
 import uuid
@@ -278,6 +279,34 @@ def _write_json_array_atomic(path, entry_jsons):
         raise
 
 
+def _backup_corrupted_run_log(path):
+    index = 0
+    while True:
+        suffix = ".corrupt" if index == 0 else f".corrupt.{index}"
+        backup_path = f"{path}{suffix}"
+        try:
+            fd = os.open(
+                backup_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            index += 1
+            continue
+        break
+    try:
+        with os.fdopen(fd, "wb") as target:
+            with open(path, "rb") as source:
+                shutil.copyfileobj(source, target)
+    except Exception:
+        try:
+            os.unlink(backup_path)
+        except OSError:
+            pass
+        raise
+    return backup_path
+
+
 def _append_json_list(path, entry_json):
     entry = entry_json.strip()
     if not entry:
@@ -286,10 +315,12 @@ def _append_json_list(path, entry_json):
     try:
         existing_entries = []
         if os.path.exists(path) and os.path.getsize(path) > 0:
-            existing_entries = [
-                inst.dump_json()
-                for inst in load_run_instances([path], strict=True)
-            ]
+            try:
+                instances = load_run_instances([path], strict=True)
+            except RunLogCorruptionError:
+                _backup_corrupted_run_log(path)
+                instances = load_run_instances([path], strict=False)
+            existing_entries = [inst.dump_json() for inst in instances]
         existing_entries.append(entry)
         _write_json_array_atomic(path, existing_entries)
     finally:

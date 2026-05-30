@@ -28,6 +28,7 @@ from .util import (
     Options,
     add_linesep_if_missing,
     prepend_error_if_missing,
+    prepend_warning_if_missing,
 )
 
 INTERACTIVE = False
@@ -43,6 +44,23 @@ class ModuleRecord:
     config: object
     plugin_name: str | None = None
     is_core: bool = False
+
+
+@dataclass
+class PluginLoadError:
+    username: str
+    package: str
+    source: str
+    error_type: str
+    error_message: str
+
+
+def _system_exit_code(err: SystemExit):
+    if err.code is None:
+        return 0
+    if isinstance(err.code, int):
+        return err.code
+    return 1
 
 
 class CommandLine:
@@ -213,6 +231,7 @@ class CLI:
         self.returncode = 0
         self.commandline = None
         self.modules = []
+        self.plugin_load_errors = []
         self._skip_run_log_once = False
         self._help = self.__help__
         self._commands_by_name = {}
@@ -268,12 +287,16 @@ class CLI:
                             )
                         )
                     )
-                    exit_code = self.returncode or 1
+                    exit_code = 1
                     continue
                 cl.run(args)
             except BaseException as err:
+                exit_code = (
+                    _system_exit_code(err)
+                    if isinstance(err, SystemExit)
+                    else 1
+                )
                 error = err
-                exit_code = err.code if isinstance(err, SystemExit) else 1
                 self._drain_queue_after_error()
                 raise
             finally:
@@ -318,7 +341,25 @@ class CLI:
             for spec in discover_plugins():
                 if spec.package == "sneeze":
                     continue
-                commands, config = import_plugin_modules(spec)
+                try:
+                    commands, config = import_plugin_modules(spec)
+                except Exception as exc:
+                    error = PluginLoadError(
+                        username=spec.username,
+                        package=spec.package,
+                        source=spec.source,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                    self.plugin_load_errors.append(error)
+                    sys.stderr.write(
+                        prepend_warning_if_missing(
+                            "skipping Sneeze plugin "
+                            f"{spec.username} ({spec.package}): "
+                            f"{error.error_type}: {error.error_message}"
+                        )
+                    )
+                    continue
                 self.modules.append(
                     ModuleRecord(
                         namespace=spec.package,
@@ -468,9 +509,8 @@ class CLI:
                             exit_code = self.returncode or 1
                         except BaseException as err:
                             exit_code = (
-                                err.code
+                                _system_exit_code(err)
                                 if isinstance(err, SystemExit)
-                                and isinstance(err.code, int)
                                 else 1
                             )
                             if exit_code != 0:
@@ -491,7 +531,7 @@ class CLI:
                 )
                 exit_code = self.returncode or 1
         except SystemExit as err:
-            exit_code = err.code if isinstance(err.code, int) else 1
+            exit_code = _system_exit_code(err)
             if exit_code != 0:
                 error = err
             self._exit(exit_code)

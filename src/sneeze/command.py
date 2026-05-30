@@ -246,8 +246,22 @@ class Command(metaclass=ABCMeta):
         finally:
             exit_functions = self._exit_functions
             self._exit_functions = []
+            exit_errors = []
             for fn, args, kwds in exit_functions:
-                fn(*args, **kwds)
+                try:
+                    fn(*args, **kwds)
+                except Exception as exc:
+                    exit_errors.append(exc)
+            for err in exit_errors:
+                try:
+                    self.estream.write(
+                        self.formatter.warn(f"exit function failed: {err}")
+                    )
+                    self._flush()
+                except Exception:
+                    pass
+            if exit_errors and exc_info[0] is None:
+                raise exit_errors[0]
         return suppress
 
     @property

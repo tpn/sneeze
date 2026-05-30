@@ -63,22 +63,29 @@ optional by default; set `required=True` only when every user-scoped Codex run
 for that profile must fail fast until the user stores that token. Slack modals
 show secret status only; they must not collect token material.
 
-Slackbot Codex runs scrub ambient secret-looking environment variables.
+Slackbot Codex runs scrub ambient secret-looking environment variables as a
+best-effort safety boundary. The scrubber treats common credential words such
+as `AUTH`, `KEY`, `PRIVATE`, `SECRET`, `SIGNING`, and `TOKEN` as sensitive.
 User-scoped runs do not preserve ambient secret-named variables; credentials
 needed by a requesting user must be represented as `user_config_secret_fields`,
 or loaded from non-env file-based config such as the tool's home directory.
 Names declared by `user_config_secret_fields` and `scrub_env_names` are always
 scrubbed from the ambient child environment.
 
-For non-user, system-scoped jobs only, plugins that deliberately add a
-secret-named variable to child-process passthrough can add that variable to
+Plugins that deliberately add a secret-named variable to child-process
+passthrough can add that variable to
 `SlackbotProfile.child_env_scrub_allowlist`. Do not use the allowlist for
 variables that are also user-scoped secret fields. User-scoped channel and DM
-Codex runs ignore this allowlist and require credentials to be declared as
-`user_config_secret_fields` or loaded from non-env file-based config.
+Codex runs honor this allowlist for ambient tool credentials, while names
+declared by `user_config_secret_fields` are still replaced by per-user values.
 
 Migration note: channel and DM Codex runs are user-scoped. Existing ambient
 credentials such as process-wide `*_TOKEN` variables will be scrubbed from
 those runs; move them to `user_config_secret_fields` or file-based tool config.
 Conversation continuity for existing channel sessions can reset once per-user
 conversation keys are introduced.
+
+Scheduled Codex jobs are system-scoped. Ambient secret-named variables are
+scrubbed from scheduled runs too unless the plugin deliberately includes that
+variable in `child_env_scrub_allowlist`; prefer file-based tool config whenever
+possible.

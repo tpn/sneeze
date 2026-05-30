@@ -75,20 +75,46 @@ def test_load_run_instances_can_recover_fragmented_json_log(tmp_path):
     ]
 
 
-def test_append_run_instance_refuses_corrupted_log(tmp_path):
+def test_append_run_instance_recovers_corrupted_log(tmp_path):
     path = tmp_path / "sne-air.json"
-    path.write_text('[{"argv":["sne","run-history"]}] garbage')
+    first = _make_instance("run-history").dump_json()
+    path.write_text(f"[\n{first}\n] garbage", encoding="utf-8")
 
-    with pytest.raises(RunLogCorruptionError):
-        append_run_instance(
-            _make_instance("install-plugin"),
-            hostname="air",
-            run_dir=str(tmp_path),
-        )
-
-    assert path.read_text(encoding="utf-8") == (
-        '[{"argv":["sne","run-history"]}] garbage'
+    append_run_instance(
+        _make_instance("install-plugin"),
+        hostname="air",
+        run_dir=str(tmp_path),
     )
+
+    loaded = load_run_instances([str(path)])
+    assert [item.command for item in loaded] == [
+        "run-history",
+        "install-plugin",
+    ]
+    assert (tmp_path / "sne-air.json.corrupt").read_text(
+        encoding="utf-8"
+    ) == f"[\n{first}\n] garbage"
+    assert (tmp_path / "sne-air.json.corrupt").stat().st_mode & 0o777 == 0o600
+
+
+def test_append_run_instance_uses_next_corrupt_backup_name(tmp_path):
+    path = tmp_path / "sne-air.json"
+    first = _make_instance("run-history").dump_json()
+    path.write_text(f"[\n{first}\n] garbage", encoding="utf-8")
+    (tmp_path / "sne-air.json.corrupt").write_text(
+        "older backup",
+        encoding="utf-8",
+    )
+
+    append_run_instance(
+        _make_instance("install-plugin"),
+        hostname="air",
+        run_dir=str(tmp_path),
+    )
+
+    assert (tmp_path / "sne-air.json.corrupt.1").read_text(
+        encoding="utf-8"
+    ) == f"[\n{first}\n] garbage"
 
 
 def test_repair_run_log_rewrites_recoverable_fragments(tmp_path):

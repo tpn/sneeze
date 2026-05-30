@@ -417,12 +417,15 @@ class SlackbotDevBase(TmuxDevCommandMixin, SlackbotInitBase):
     def _tmux_root(self) -> str:
         return self._codex_workdir_value()
 
-    def _max_seconds_value(self) -> int | None:
-        value = (
+    def _raw_max_seconds_value(self) -> int | None:
+        return (
             self._max_runtime_seconds
             if self._max_runtime_seconds is not None
             else self.max_runtime_seconds
         )
+
+    def _max_seconds_value(self) -> int | None:
+        value = self._raw_max_seconds_value()
         if value == 0:
             return None
         return value
@@ -552,7 +555,10 @@ class SlackbotDevBase(TmuxDevCommandMixin, SlackbotInitBase):
     def _smoke(self) -> None:
         self._ensure_scaffolded()
         self._json(query_status(self._profile(), **self._common()))
-        self._run_slackbot(max_runtime_seconds=self._max_seconds_value() or 3)
+        max_seconds = self._max_seconds_value()
+        if max_seconds is None and self._raw_max_seconds_value() is None:
+            max_seconds = 3
+        self._run_slackbot(max_runtime_seconds=max_seconds)
 
     def run(self):
         self._run_dev_action(
@@ -742,10 +748,27 @@ class SlackbotEnqueueCodexBase(SlackbotRouteCommand):
     _vargc_ = True
     _disable_interspersed_args_ = True
 
+    slack_user_id = None
+    _slack_user_id = None
+
+    class SlackUserIdArg(StringInvariant):
+        _arg = "--slack-user-id"
+        _help = "Slack user ID whose user-scoped config/secrets apply."
+        _mandatory = False
+
+    system_scoped = None
+
+    class SystemScopedArg(BoolInvariant):
+        _arg = "--system-scoped"
+        _help = "Force a system-scoped Codex run without user secrets."
+        _mandatory = False
+        _default = False
+
     def run(self):
         text = " ".join(self.args).strip()
         if not text:
             raise CommandError("Codex prompt is required")
+        slack_user_id = self._slack_user_id or self.slack_user_id
         path = enqueue_ingress(
             self._profile(),
             **self._common(),
@@ -757,7 +780,10 @@ class SlackbotEnqueueCodexBase(SlackbotRouteCommand):
             ),
             project=self._project or self.project,
             session=self._session or self.session,
-            system_scoped=True,
+            slack_user_id=slack_user_id,
+            system_scoped=(
+                True if self.system_scoped or not slack_user_id else None
+            ),
         )
         self._out(path)
 

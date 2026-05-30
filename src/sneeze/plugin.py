@@ -112,7 +112,9 @@ def import_plugin_modules(spec):
     commands_module = importlib.import_module(f"{spec.package}.commands")
     try:
         config_module = importlib.import_module(f"{spec.package}.config")
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as exc:
+        if exc.name != f"{spec.package}.config":
+            raise
         config_module = importlib.import_module("sneeze.config")
     return commands_module, config_module
 
@@ -205,15 +207,12 @@ dependencies = [
   "sneeze",
 ]
 
-[project.entry-points."{PLUGIN_ENTRY_POINT_GROUP}"]
-{username} = "{package}"
-
 [tool.setuptools]
 package-dir = {{"" = "src"}}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["sneeze*"]
+include = ["sneeze", "sneeze.*"]
 namespaces = true
 
 [tool.black]
