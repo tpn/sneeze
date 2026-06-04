@@ -1498,7 +1498,27 @@ def post_slack_message(
 
 def render_route_text(route: SlackbotRoute, text: str) -> str:
     prefix = " ".join(f"<@{user}>" for user in route.mention_user_ids)
-    return f"{prefix} {text}".strip() if prefix else text
+    slack_text = markdown_to_slack_mrkdwn(text)
+    return f"{prefix} {slack_text}".strip() if prefix else slack_text
+
+
+def markdown_to_slack_mrkdwn(text: str) -> str:
+    """Convert common Codex Markdown emphasis to Slack mrkdwn."""
+    if "**" not in text and "__" not in text:
+        return text
+    parts = re.split(r"(```.*?```|`[^`\n]*`)", text, flags=re.DOTALL)
+    for index in range(0, len(parts), 2):
+        parts[index] = re.sub(
+            r"(?<!\*)\*\*(?!\s)(.+?)(?<!\s)\*\*(?!\*)",
+            r"*\1*",
+            parts[index],
+        )
+        parts[index] = re.sub(
+            r"(?<!_)__(?!\s)(.+?)(?<!\s)__(?!_)",
+            r"*\1*",
+            parts[index],
+        )
+    return "".join(parts)
 
 
 def _post_single_slack_message(

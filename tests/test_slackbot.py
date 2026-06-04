@@ -695,6 +695,31 @@ def test_post_slack_message_renders_mentions(tmp_path, monkeypatch):
     assert calls == ["<@U999> hello"]
 
 
+def test_post_slack_message_converts_markdown_bold_to_slack(
+    tmp_path, monkeypatch
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    calls = []
+
+    def fake_slack_api_post(token, method, payload):
+        calls.append(payload["text"])
+        return {"ok": True, "ts": "1.000001", "channel": "C123"}
+
+    monkeypatch.setattr("sneeze.slackbot.slack_api_post", fake_slack_api_post)
+
+    post_slack_message(
+        config,
+        SlackbotRoute(channel_id="C123"),
+        "**Summary**\n- `**literal**` stays literal\n```\n**code**\n```",
+    )
+
+    assert calls == [
+        "*Summary*\n- `**literal**` stays literal\n```\n**code**\n```"
+    ]
+
+
 def test_post_slack_message_uses_response_url_fallback(tmp_path, monkeypatch):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
