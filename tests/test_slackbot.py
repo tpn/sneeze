@@ -46,6 +46,7 @@ from sneeze.slackbot import (
     safe_slack_storage_id,
     save_user_config_submission,
     scaffold_runtime,
+    slackbot_working_text,
     static_response_text_from_profile,
     store_user_secret_token,
     strip_bot_mentions,
@@ -111,6 +112,106 @@ def count_available_worker_slots(bot):
     for _ in range(acquired):
         bot.work_semaphore.release()
     return acquired
+
+
+def test_slackbot_working_text_includes_console_url(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(
+        profile,
+        bot_token="xoxb-test",
+        app_token="xapp-test",
+    )
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_CONSOLE_PUBLIC_BASE_URL=https://cccl.nvidia.com\n",
+        encoding="utf-8",
+    )
+    config = load_config(profile)
+
+    assert slackbot_working_text(config) == (
+        "Working...\n\n"
+        "Kickle console: https://cccl.nvidia.com/kickle/console/"
+    )
+
+
+def test_app_mention_uses_configured_default_execution_mode(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    config = replace(
+        config,
+        allowed_user_ids=("U111",),
+        env={
+            **config.env,
+            "SAMPLE_SLACKBOT_EXECUTION_MODE": "tmux",
+        },
+    )
+    bot = SlackSocketBot(config)
+    calls = []
+    monkeypatch.setattr(
+        bot,
+        "_run_codex_for_route",
+        lambda text, route, **kwargs: calls.append(kwargs),
+    )
+
+    bot._handle_event(
+        {
+            "type": "app_mention",
+            "user": "U111",
+            "channel": "C123",
+            "text": "summarize",
+            "ts": "1.000001",
+        }
+    )
+
+    assert calls[0]["execution_mode"] == "tmux"
+
+
+def test_codex_runner_tmux_mode_records_job(tmp_path, monkeypatch):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    runner = CodexRunner(config)
+    calls = []
+
+    def fake_run(args, check, capture_output, text):
+        calls.append(args)
+        assert Path(args[0]).name == "tmux"
+        assert args[1:4] == ["-L", "kickle", "new-session"]
+        run_dir = Path(args[-1]).parent
+        (run_dir / "output.txt").write_text("done\n", encoding="utf-8")
+        (run_dir / "stdout.jsonl").write_text(
+            '{"type":"session_created","session_id":"codex-1"}\n',
+            encoding="utf-8",
+        )
+        (run_dir / "stderr.txt").write_text("", encoding="utf-8")
+        (run_dir / "status.txt").write_text("0\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
+
+    result = runner.run_tmux(
+        "prompt",
+        route=SlackbotRoute(channel_id="C123", thread_ts="1.000001"),
+        project="docs",
+    )
+    jobs = read_json(config.paths.agent_tmux_jobs_path, {})
+    job = next(iter(jobs.values()))
+
+    assert result["returncode"] == 0
+    assert result["last_message"] == "done\n"
+    assert result["session_id"] == "codex-1"
+    assert result["tmux_session"].startswith("sample-codex-")
+    assert job["status"] == "finished"
+    assert job["tmux_socket"] == "kickle"
+    assert job["route"]["channel_id"] == "C123"
+    assert job["project"] == "docs"
+    assert not (Path(result["run_dir"]) / "run.sh").exists()
 
 
 def wait_until(predicate, *, timeout_s=1.0):
@@ -3515,7 +3616,7 @@ def test_event_dispatch_uses_normalized_slack_user_id(tmp_path):
     bot = SlackSocketBot(load_config(profile))
     calls = []
 
-    def fake_run_codex(text, route, *, slack_user_id=None):
+    def fake_run_codex(text, route, *, slack_user_id=None, **kwargs):
         calls.append((text, route, slack_user_id))
 
     bot._run_codex_for_route = fake_run_codex
@@ -4589,19 +4690,20 @@ def test_drain_ingress_does_not_reclaim_fresh_processing_file(tmp_path):
     assert claimed.exists()
 
 
-def test_enqueue_rejects_unimplemented_tmux_mode(tmp_path):
+def test_enqueue_accepts_tmux_execution_mode(tmp_path):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
 
-    with pytest.raises(ValueError, match="Expected one of: raw"):
-        enqueue_ingress(
-            profile,
-            kind="codex_prompt",
-            text="summarize",
-            route=SlackbotRoute(channel_id="C123"),
-            execution_mode="tmux",
-            system_scoped=True,
-        )
+    path = enqueue_ingress(
+        profile,
+        kind="codex_prompt",
+        text="summarize",
+        route=SlackbotRoute(channel_id="C123"),
+        execution_mode="tmux",
+        system_scoped=True,
+    )
+
+    assert read_json(path, {})["execution_mode"] == "tmux"
 
 
 def test_launchd_schedule_upsert_skips_systemd_unit_files(

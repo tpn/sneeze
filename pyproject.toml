@@ -38,9 +38,18 @@ sne = "sneeze.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+sneeze = [
+  "console_static/*.css",
+  "console_static/*.html",
+  "console_static/*.js",
+  "console_static/vendor/xterm/*",
+]
 
 [tool.black]
 line-length = 78

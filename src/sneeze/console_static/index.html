@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kickle Console</title>
+    <link rel="stylesheet" href="static/vendor/xterm/xterm.css" />
+    <link rel="stylesheet" href="static/console.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="sidebar">
+        <header class="sidebar-header">
+          <div>
+            <h1>Kickle Console</h1>
+            <p id="socket-label">tmux</p>
+          </div>
+          <button id="refresh" class="icon-button" title="Refresh sessions">
+            Refresh
+          </button>
+        </header>
+        <div id="user-pill" class="user-pill"></div>
+        <nav id="sessions" class="session-list" aria-label="tmux sessions">
+        </nav>
+      </aside>
+      <section class="terminal-panel">
+        <header class="terminal-header">
+          <div>
+            <h2 id="session-title">No session selected</h2>
+            <p id="session-meta"></p>
+          </div>
+          <label id="control-wrap" class="control-toggle hidden">
+            <input id="control-toggle" type="checkbox" />
+            <span>Control</span>
+          </label>
+        </header>
+        <div id="terminal" class="terminal"></div>
+      </section>
+    </main>
+    <script src="static/vendor/xterm/xterm.js"></script>
+    <script src="static/console.js"></script>
+  </body>
+</html>

@@ -26,6 +26,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .console import (
+    DEFAULT_CONSOLE_ROOT_PATH,
+    DEFAULT_TMUX_SOCKET,
+    normalize_root_path,
+)
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX fallback
@@ -55,7 +61,7 @@ CODEX_MODE_VALUES = (
     "workspace-write",
     "read-only",
 )
-EXECUTION_MODE_VALUES = ("raw",)
+EXECUTION_MODE_VALUES = ("raw", "tmux")
 NOTIFY_KIND_VALUES = ("none", "slack_message", "codex_prompt")
 MAX_SLACK_TEXT_CHARS = 3500
 RECENT_EVENT_TTL_SECONDS = 300.0
@@ -722,6 +728,7 @@ def prefixed_env_keys(profile: SlackbotProfile) -> OrderedDict[str, str]:
         "SLACKBOT_CODEX_MODEL",
         "SLACKBOT_CODEX_PROFILE",
         "SLACKBOT_CODEX_EXTRA_ARGS",
+        "SLACKBOT_EXECUTION_MODE",
         "SLACKBOT_ALLOWED_DM_USER_IDS",
         "SLACKBOT_ALLOWED_USER_IDS",
         "SLACKBOT_ALLOWED_CHANNEL_IDS",
@@ -729,6 +736,16 @@ def prefixed_env_keys(profile: SlackbotProfile) -> OrderedDict[str, str]:
         "SLACKBOT_WORKER_COUNT",
         "MCP_SERVER_URL",
         "TEAM_CONFIG_PATH",
+        "CONSOLE_HOST",
+        "CONSOLE_PORT",
+        "CONSOLE_ROOT_PATH",
+        "CONSOLE_PUBLIC_URL",
+        "CONSOLE_PUBLIC_BASE_URL",
+        "CONSOLE_TMUX_BIN",
+        "CONSOLE_TMUX_SOCKET",
+        "CONSOLE_AUTH_EMAIL_HEADER",
+        "CONSOLE_AUTH_EMAIL_DOMAIN",
+        "CONSOLE_ADMIN_EMAILS",
     ):
         keys[key] = profile.env_name(key)
     return keys
@@ -868,6 +885,9 @@ def managed_env_values(
             " ".join(profile.default_codex_extra_args),
         )
     ).strip()
+    values[keys["SLACKBOT_EXECUTION_MODE"]] = normalize_execution_mode(
+        current_value("SLACKBOT_EXECUTION_MODE", "raw")
+    )
     values[keys["SLACKBOT_ALLOWED_DM_USER_IDS"]] = current_value(
         "SLACKBOT_ALLOWED_DM_USER_IDS",
         render_csv(profile.default_allowed_dm_user_ids),
@@ -898,6 +918,19 @@ def managed_env_values(
         team_config_path
         or current_value("TEAM_CONFIG_PATH", profile.default_team_config_path)
     ).strip()
+    for key in (
+        "CONSOLE_HOST",
+        "CONSOLE_PORT",
+        "CONSOLE_ROOT_PATH",
+        "CONSOLE_PUBLIC_URL",
+        "CONSOLE_PUBLIC_BASE_URL",
+        "CONSOLE_TMUX_BIN",
+        "CONSOLE_TMUX_SOCKET",
+        "CONSOLE_AUTH_EMAIL_HEADER",
+        "CONSOLE_AUTH_EMAIL_DOMAIN",
+        "CONSOLE_ADMIN_EMAILS",
+    ):
+        values[keys[key]] = current_value(key, allow_empty=True).strip()
     for key, value in current.items():
         values.setdefault(key, value)
     return values
@@ -1680,6 +1713,31 @@ def render_thread_transcript(messages: list[dict[str, Any]]) -> str:
         text = message.get("text") or ""
         lines.append(f"[{ts}] {user}: {text}")
     return "\n".join(lines)
+
+
+def slackbot_console_url(config: SlackbotConfig) -> str | None:
+    direct = env_lookup(config.profile, config.env, "CONSOLE_PUBLIC_URL")
+    if direct:
+        return direct.rstrip("/") + "/"
+    base = env_lookup(config.profile, config.env, "CONSOLE_PUBLIC_BASE_URL")
+    if not base:
+        return None
+    root_path = normalize_root_path(
+        env_lookup(
+            config.profile,
+            config.env,
+            "CONSOLE_ROOT_PATH",
+            DEFAULT_CONSOLE_ROOT_PATH,
+        )
+    )
+    return base.rstrip("/") + root_path + "/"
+
+
+def slackbot_working_text(config: SlackbotConfig) -> str:
+    url = slackbot_console_url(config)
+    if not url:
+        return "Working..."
+    return f"Working...\n\nKickle console: {url}"
 
 
 def _block_plain_text(
@@ -3062,6 +3120,19 @@ class CodexRunner:
             *self._common_args(),
         ]
 
+    def _run_args(
+        self,
+        output_path: str,
+        *,
+        session_id: str | None = None,
+    ) -> list[str]:
+        args = self._resume_args() if session_id else self._exec_args()
+        if session_id:
+            args.extend(["-o", output_path, session_id, "-"])
+        else:
+            args.extend(["-o", output_path, "-"])
+        return args
+
     def run(
         self,
         prompt: str,
@@ -3074,11 +3145,7 @@ class CodexRunner:
         output = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
         output.close()
         try:
-            args = self._resume_args() if session_id else self._exec_args()
-            if session_id:
-                args.extend(["-o", output.name, session_id, "-"])
-            else:
-                args.extend(["-o", output.name, "-"])
+            args = self._run_args(output.name, session_id=session_id)
             proc = subprocess.run(
                 args,
                 input=prompt,
@@ -3108,6 +3175,219 @@ class CodexRunner:
                 os.unlink(output.name)
             except OSError:
                 pass
+
+    def run_tmux(
+        self,
+        prompt: str,
+        session_id: str | None = None,
+        *,
+        extra_env: dict[str, str] | None = None,
+        scrub_secret_env: bool = False,
+        use_scrub_allowlist: bool = False,
+        route: SlackbotRoute | None = None,
+        project: str | None = None,
+    ) -> dict[str, Any]:
+        run_id = uuid.uuid4().hex[:10]
+        created = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        tmux_session = safe_tmux_session_name(
+            f"{self.config.profile.app_slug}-codex-{created}-{run_id}"
+        )
+        run_dir = (
+            Path(self.config.paths.state_dir)
+            / "tmux-codex-runs"
+            / f"{created}-{run_id}"
+        )
+        run_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+        prompt_path = run_dir / "prompt.txt"
+        output_path = run_dir / "output.txt"
+        stdout_path = run_dir / "stdout.jsonl"
+        stderr_path = run_dir / "stderr.txt"
+        status_path = run_dir / "status.txt"
+        script_path = run_dir / "run.sh"
+        write_text(prompt_path, prompt, mode=0o600)
+        child_env = merge_child_process_env(
+            self.config,
+            extra_env,
+            scrub_secret_env=scrub_secret_env,
+            use_scrub_allowlist=use_scrub_allowlist,
+        )
+        args = self._run_args(str(output_path), session_id=session_id)
+        script = render_tmux_codex_script(
+            command=args,
+            env=child_env,
+            prompt_path=prompt_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            status_path=status_path,
+            workdir=Path(self.config.codex_workdir),
+        )
+        write_text(script_path, script, mode=0o700)
+        tmux_bin = codex_tmux_bin(self.config)
+        tmux_socket = codex_tmux_socket(self.config)
+        _record_agent_tmux_job(
+            self.config,
+            run_id,
+            {
+                "id": run_id,
+                "status": "running",
+                "tmux_session": tmux_session,
+                "tmux_socket": tmux_socket,
+                "run_dir": str(run_dir),
+                "route": route_to_dict(route) if route else None,
+                "project": project,
+                "created_at": utcnow_iso(),
+            },
+        )
+        start = subprocess.run(
+            [
+                tmux_bin,
+                "-L",
+                tmux_socket,
+                "new-session",
+                "-d",
+                "-s",
+                tmux_session,
+                str(script_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if start.returncode:
+            detail = (start.stderr or start.stdout or "").strip()
+            _record_agent_tmux_job(
+                self.config,
+                run_id,
+                {"status": "start-failed", "error": detail},
+            )
+            raise SlackbotError(
+                f"tmux Codex session failed to start: {detail}"
+            )
+        try:
+            while not status_path.exists():
+                time.sleep(0.5)
+            status_text = status_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).strip()
+            returncode = int(status_text or "1")
+            last_message = _read_optional_text(output_path)
+            stdout = _read_optional_text(stdout_path)
+            stderr = _read_optional_text(stderr_path)
+            result = {
+                "returncode": returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "last_message": last_message,
+                "session_id": extract_codex_session_id(stdout),
+                "tmux_session": tmux_session,
+                "tmux_socket": tmux_socket,
+                "run_dir": str(run_dir),
+            }
+            _record_agent_tmux_job(
+                self.config,
+                run_id,
+                {
+                    "status": "finished",
+                    "returncode": returncode,
+                    "codex_session_id": result["session_id"],
+                    "finished_at": utcnow_iso(),
+                },
+            )
+            return result
+        finally:
+            try:
+                script_path.unlink()
+            except OSError:
+                pass
+
+
+def safe_tmux_session_name(value: str) -> str:
+    candidate = re.sub(r"[^A-Za-z0-9_.:-]+", "-", value).strip("-")
+    if not candidate:
+        candidate = f"codex-{uuid.uuid4().hex[:8]}"
+    return candidate[:120]
+
+
+def codex_tmux_bin(config: SlackbotConfig) -> str:
+    value = (
+        env_lookup(config.profile, config.env, "CODEX_TMUX_BIN")
+        or env_lookup(config.profile, config.env, "CONSOLE_TMUX_BIN")
+        or "tmux"
+    )
+    resolved = shutil.which(value)
+    return resolved or value
+
+
+def codex_tmux_socket(config: SlackbotConfig) -> str:
+    return (
+        env_lookup(config.profile, config.env, "CODEX_TMUX_SOCKET")
+        or env_lookup(config.profile, config.env, "CONSOLE_TMUX_SOCKET")
+        or DEFAULT_TMUX_SOCKET
+    )
+
+
+def render_tmux_codex_script(
+    *,
+    command: list[str],
+    env: dict[str, str],
+    prompt_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    status_path: Path,
+    workdir: Path,
+) -> str:
+    lines = [
+        "#!/usr/bin/env bash",
+        "set +e",
+        f"cd {shlex.quote(str(workdir))} || exit 111",
+    ]
+    for name, value in sorted(env.items()):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            continue
+        lines.append(f"export {name}={quote_env_value(str(value))}")
+    lines.extend(
+        [
+            "",
+            (
+                f"{shlex.join(command)} "
+                f"< {shlex.quote(str(prompt_path))} "
+                f"> {shlex.quote(str(stdout_path))} "
+                f"2> {shlex.quote(str(stderr_path))}"
+            ),
+            "status=$?",
+            f"printf '%s\\n' \"$status\" > {shlex.quote(str(status_path))}",
+            "printf '\\nKickle Codex job finished with status %s.\\n' "
+            '"$status"',
+            "printf 'This tmux session is left open for inspection.\\n'",
+            "exec bash -l",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _read_optional_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+def _record_agent_tmux_job(
+    config: SlackbotConfig,
+    job_id: str,
+    values: dict[str, Any],
+) -> None:
+    with AGENT_TMUX_LOCK, locked_json_path(config.paths.agent_tmux_jobs_path):
+        data = read_json(config.paths.agent_tmux_jobs_path, {})
+        current = data.get(job_id)
+        if not isinstance(current, dict):
+            current = {}
+        current.update(values)
+        current.setdefault("id", job_id)
+        current["updated_at"] = utcnow_iso()
+        data[job_id] = current
+        write_json_atomic(config.paths.agent_tmux_jobs_path, data)
 
 
 def extract_codex_session_id(jsonl: str) -> str | None:
@@ -3744,7 +4024,12 @@ class SlackSocketBot:
             return
         if self._maybe_handle_agent_tmux(text, route):
             return
-        self._run_codex_for_route(text, route, slack_user_id=slack_user_id)
+        self._run_codex_for_route(
+            text,
+            route,
+            execution_mode=self._default_execution_mode(),
+            slack_user_id=slack_user_id,
+        )
 
     def _handle_slash(self, payload: dict[str, Any]) -> None:
         raw_command = str(payload.get("command") or "").strip()
@@ -3793,6 +4078,7 @@ class SlackSocketBot:
         self._run_codex_for_route(
             text,
             route,
+            execution_mode=self._default_execution_mode(),
             slack_user_id=str(payload.get("user_id") or "").strip() or None,
         )
 
@@ -3940,6 +4226,16 @@ class SlackSocketBot:
             return False
         post_slack_message(self.config, route, response)
         return True
+
+    def _default_execution_mode(self) -> str:
+        return normalize_execution_mode(
+            env_lookup(
+                self.config.profile,
+                self.config.env,
+                "SLACKBOT_EXECUTION_MODE",
+                "raw",
+            )
+        )
 
     def _open_user_config_modal(
         self,
@@ -4106,7 +4402,7 @@ class SlackSocketBot:
         user_config_error_callback: Callable[[Exception], None] | None = None,
         raise_user_config_errors: bool = False,
     ) -> None:
-        normalize_execution_mode(execution_mode)
+        execution_mode = normalize_execution_mode(execution_mode)
         user_config_error: Exception | None = None
         reply_body = None
         user_secret_env: dict[str, str] = {}
@@ -4202,7 +4498,7 @@ class SlackSocketBot:
         if should_run_codex:
             try:
                 placeholder = post_slack_message(
-                    self.config, route, "Working..."
+                    self.config, route, slackbot_working_text(self.config)
                 )
             except Exception as exc:
                 emit(self.out, f"Failed to post Slack placeholder: {exc}")
@@ -4263,11 +4559,25 @@ class SlackSocketBot:
                         run_kwargs["use_scrub_allowlist"] = True
                     if user_secret_env:
                         run_kwargs["extra_env"] = user_secret_env
-                    result = self.runner.run(
-                        self._build_prompt(prompt, route, project=project),
-                        session_id=(record or {}).get("session_id"),
-                        **run_kwargs,
+                    built_prompt = self._build_prompt(
+                        prompt,
+                        route,
+                        project=project,
                     )
+                    if execution_mode == "tmux":
+                        result = self.runner.run_tmux(
+                            built_prompt,
+                            session_id=(record or {}).get("session_id"),
+                            route=route,
+                            project=project,
+                            **run_kwargs,
+                        )
+                    else:
+                        result = self.runner.run(
+                            built_prompt,
+                            session_id=(record or {}).get("session_id"),
+                            **run_kwargs,
+                        )
                     if conversation_key and result.get("session_id"):
                         self.conversations.set(
                             conversation_key,
