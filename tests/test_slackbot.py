@@ -527,7 +527,7 @@ def test_schedule_upsert_list_and_run(tmp_path):
     assert "--env-path=" in service_text
     assert "--state-dir=" in service_text
     assert "--system-prompt-path=" in service_text
-    assert f'WorkingDirectory="{tmp_path}"' in service_text
+    assert f"WorkingDirectory={tmp_path}" in service_text
 
 
 def test_run_schedule_scrubs_secret_passthrough_env(tmp_path, monkeypatch):
@@ -729,10 +729,32 @@ def test_systemd_service_has_no_source_project_leaks(tmp_path):
     assert "--state-dir=" in text
     assert "--system-prompt-path=" in text
     assert "--unit-name=sample-slackbot.service" in text
-    assert 'EnvironmentFile="' in text
+    assert f"EnvironmentFile={config.paths.env_path}" in text
+    assert "EnvironmentFile=\"" not in text
     assert not any(
         word in text for word in ("legacy-internal-tool", "ticket-system")
     )
+
+
+def test_build_prompt_tells_codex_not_to_send_to_slack(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bot = SlackSocketBot(load_config(profile))
+
+    text = bot._build_prompt(
+        "Hi, you up?",
+        SlackbotRoute(
+            channel_id="D123",
+            dm_user_id="U123",
+            thread_ts="1.234",
+        ),
+    )
+
+    assert "The Slackbot wrapper will post" in text
+    assert "Do not call Slack send" in text
+    assert "Return the exact reply text as your final answer" in text
+    assert "Slack route:" in text
+    assert "Hi, you up?" in text
 
 
 def test_launchd_service_includes_only_non_secret_env(tmp_path, monkeypatch):
