@@ -99,6 +99,14 @@ USER_CONFIG_TRIGGER_WORDS = {
     "onboard",
     "setup",
 }
+SLACKBOT_CODEX_TRANSPORT_INSTRUCTIONS = """Slack transport:
+- You are running inside a Slackbot transport. The Slackbot wrapper will post
+  your final answer back to the Slack route shown below.
+- Do not call Slack send, draft, schedule, canvas, or message-write tools for
+  the current route. Return the exact reply text as your final answer.
+- Use Slack read/search tools only when the user's request explicitly needs
+  Slack context that was not included in this prompt.
+"""
 SECRET_ENV_NAME_PARTS = {
     "APIKEY",
     "AUTHORIZATION",
@@ -452,6 +460,15 @@ def quote_systemd_value(value: str) -> str:
         .replace("\n", "\\n")
     )
     return f'"{escaped}"'
+
+
+def systemd_path_value(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace(" ", "\\x20")
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+    )
 
 
 def read_env_file(path: str | Path) -> OrderedDict[str, str]:
@@ -2406,8 +2423,9 @@ def render_systemd_service(
         for part in (cli_bin, run_subcommand, *runtime_cli_args(config.paths))
     )
     syslog_name = syslog_identifier or f"{config.profile.app_slug}-slackbot"
-    working_dir = quote_systemd_value(config.codex_workdir)
+    working_dir = systemd_path_value(config.codex_workdir)
     log_file = quote_systemd_value(f"SNEEZE_LOG_FILE={config.paths.log_path}")
+    env_file = systemd_path_value(config.paths.env_path)
     return "\n".join(
         [
             "[Unit]",
@@ -2422,7 +2440,7 @@ def render_systemd_service(
             f"WorkingDirectory={working_dir}",
             'Environment="PYTHONUNBUFFERED=1"',
             f"Environment={log_file}",
-            f"EnvironmentFile={quote_systemd_value(config.paths.env_path)}",
+            f"EnvironmentFile={env_file}",
             f"ExecStart={command}",
             f"Restart={restart}",
             f"RestartSec={restart_sec}",
@@ -2737,7 +2755,7 @@ def render_schedule_service(
             "",
             "[Service]",
             "Type=oneshot",
-            f"WorkingDirectory={quote_systemd_value(schedule.workdir)}",
+            f"WorkingDirectory={systemd_path_value(schedule.workdir)}",
             'Environment="PYTHONUNBUFFERED=1"',
             f"ExecStart={command}",
             "",
@@ -4750,7 +4768,8 @@ class SlackSocketBot:
         route_info = json.dumps(route_to_dict(route), sort_keys=True)
         project_info = f"\nProject:\n{project}\n" if project else ""
         return (
-            f"{primer}\n\nSlack route:\n{route_info}\n{project_info}\n"
+            f"{primer}\n\n{SLACKBOT_CODEX_TRANSPORT_INSTRUCTIONS}\n"
+            f"Slack route:\n{route_info}\n{project_info}\n"
             f"Request:\n{prompt}\n"
         )
 
