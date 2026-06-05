@@ -684,7 +684,7 @@ class SlackbotRouteCommand(ProfiledSlackbotCommand):
 
     class ExecutionModeArg(StringInvariant):
         _arg = "--execution-mode"
-        _help = "Execution mode: raw."
+        _help = "Execution mode: raw or tmux."
         _mandatory = False
 
     project = None
