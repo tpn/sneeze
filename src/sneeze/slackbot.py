@@ -1492,7 +1492,7 @@ def slack_response_url_post(
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {"text": text}
     if blocks:
-        payload["blocks"] = blocks
+        payload["blocks"] = render_slack_blocks(blocks)
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         response_url,
@@ -1575,6 +1575,29 @@ def markdown_to_slack_mrkdwn(text: str) -> str:
     return "".join(parts)
 
 
+def _render_slack_mrkdwn_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_render_slack_mrkdwn_value(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    rendered = {
+        key: _render_slack_mrkdwn_value(item)
+        for key, item in value.items()
+    }
+    if rendered.get("type") == "mrkdwn" and isinstance(
+        rendered.get("text"),
+        str,
+    ):
+        rendered["text"] = markdown_to_slack_mrkdwn(rendered["text"])
+    return rendered
+
+
+def render_slack_blocks(
+    blocks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [_render_slack_mrkdwn_value(block) for block in blocks]
+
+
 def _post_single_slack_message(
     config: SlackbotConfig,
     route: SlackbotRoute,
@@ -1600,7 +1623,7 @@ def _post_single_slack_message(
         return None
     payload: dict[str, Any] = {"channel": channel, "text": text}
     if blocks:
-        payload["blocks"] = blocks
+        payload["blocks"] = render_slack_blocks(blocks)
     if route.thread_ts:
         payload["thread_ts"] = route.thread_ts
     try:
@@ -1623,11 +1646,12 @@ def post_slack_blocks(
     blocks: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     rendered_text = render_route_text(route, text)
+    rendered_blocks = render_slack_blocks(blocks)
     if not config.bot_token and route.response_url:
         return slack_response_url_post(
             route.response_url,
             rendered_text,
-            blocks=blocks,
+            blocks=rendered_blocks,
         )
     if not config.bot_token:
         raise SlackbotError("Slack bot token is missing")
@@ -1636,7 +1660,7 @@ def post_slack_blocks(
             config,
             route,
             rendered_text,
-            blocks=blocks,
+            blocks=rendered_blocks,
         )
     except SlackbotError:
         if not route.response_url:
@@ -1644,7 +1668,7 @@ def post_slack_blocks(
         return slack_response_url_post(
             route.response_url,
             rendered_text,
-            blocks=blocks,
+            blocks=rendered_blocks,
         )
 
 
@@ -1660,7 +1684,11 @@ def update_slack_message(
     return slack_api_post(
         config.bot_token,
         "chat.update",
-        {"channel": channel, "ts": ts, "text": text},
+        {
+            "channel": channel,
+            "ts": ts,
+            "text": markdown_to_slack_mrkdwn(text),
+        },
     )
 
 

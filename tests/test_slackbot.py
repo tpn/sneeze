@@ -38,6 +38,7 @@ from sneeze.slackbot import (
     read_json,
     read_user_secret_env,
     render_launchd_service,
+    render_slack_blocks,
     render_systemd_service,
     route_from_dict,
     route_to_dict,
@@ -50,6 +51,7 @@ from sneeze.slackbot import (
     static_response_text_from_profile,
     store_user_secret_token,
     strip_bot_mentions,
+    update_slack_message,
     upsert_schedule,
     user_config_mode_from_text,
     user_config_secret_field,
@@ -918,6 +920,81 @@ def test_post_slack_message_converts_markdown_bold_to_slack(
     ]
 
 
+def test_update_slack_message_converts_markdown_bold_to_slack(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    calls = []
+
+    def fake_slack_api_post(token, method, payload):
+        calls.append((method, payload))
+        return {"ok": True}
+
+    monkeypatch.setattr("sneeze.slackbot.slack_api_post", fake_slack_api_post)
+
+    update_slack_message(
+        config,
+        channel="C123",
+        ts="1.000001",
+        text="**Done**\n- `**literal**` stays literal",
+    )
+
+    assert calls == [
+        (
+            "chat.update",
+            {
+                "channel": "C123",
+                "ts": "1.000001",
+                "text": "*Done*\n- `**literal**` stays literal",
+            },
+        )
+    ]
+
+
+def test_render_slack_blocks_converts_mrkdwn_only():
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "**Summary**"},
+            "fields": [
+                {"type": "mrkdwn", "text": "__Status__: good"},
+                {"type": "plain_text", "text": "**literal**"},
+            ],
+        },
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": "`**literal**`"},
+                {"type": "plain_text", "text": "__literal__"},
+            ],
+        },
+    ]
+
+    rendered = render_slack_blocks(blocks)
+
+    assert rendered == [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "*Summary*"},
+            "fields": [
+                {"type": "mrkdwn", "text": "*Status*: good"},
+                {"type": "plain_text", "text": "**literal**"},
+            ],
+        },
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": "`**literal**`"},
+                {"type": "plain_text", "text": "__literal__"},
+            ],
+        },
+    ]
+    assert blocks[0]["text"]["text"] == "**Summary**"
+
+
 def test_post_slack_message_uses_response_url_fallback(tmp_path, monkeypatch):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
@@ -976,6 +1053,51 @@ def test_post_slack_blocks_preserves_blocks_with_response_url(
     )
 
     assert calls == [("https://response", "hello", blocks)]
+
+
+def test_post_slack_blocks_converts_mrkdwn_blocks_with_response_url(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = replace(load_config(profile), bot_token=None)
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "**Summary**"},
+        }
+    ]
+    calls = []
+
+    def fake_response_url_post(response_url, text, *, blocks=None):
+        calls.append((response_url, text, blocks))
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "sneeze.slackbot.slack_response_url_post",
+        fake_response_url_post,
+    )
+
+    post_slack_blocks(
+        config,
+        SlackbotRoute(response_url="https://response"),
+        "__Fallback__",
+        blocks,
+    )
+
+    assert calls == [
+        (
+            "https://response",
+            "*Fallback*",
+            [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "*Summary*"},
+                }
+            ],
+        )
+    ]
 
 
 def test_post_slack_blocks_preserves_blocks_after_dm_open(
@@ -3174,6 +3296,56 @@ def test_slack_dispatch_injects_user_github_token(
     assert calls[0][1]["use_scrub_allowlist"] is True
     assert calls[0][1]["extra_env"]["GH_TOKEN"] == "gh-user-secret"
     assert calls[0][1]["extra_env"]["ACME_TOKEN"] == "acme-user-secret"
+
+
+def test_codex_final_answer_update_uses_slack_mrkdwn(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = replace(load_config(profile), allowed_user_ids=("U111",))
+    bot = SlackSocketBot(config)
+    bot.bot_user_id = "UBOT"
+    updates = []
+
+    class FakeRunner:
+        def run(self, prompt, session_id=None, **kwargs):
+            return {
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "last_message": (
+                    "Slack send was cancelled. Drafted reply:\n\n"
+                    "**Yep**, I'm up."
+                ),
+                "session_id": "codex-session-1",
+            }
+
+    bot.runner = FakeRunner()
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: {"ts": "2.000001", "channel": "C123"},
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.update_slack_message",
+        lambda *args, **kwds: updates.append(kwds["text"]) or {"ok": True},
+    )
+
+    bot._handle_event(
+        {
+            "type": "app_mention",
+            "channel_type": "channel",
+            "user": "U111",
+            "channel": "C123",
+            "ts": "1.000001",
+            "text": "<@UBOT> are you up?",
+        }
+    )
+
+    assert updates == [
+        "Slack send was cancelled. Drafted reply:\n\n*Yep*, I'm up."
+    ]
 
 
 def test_codex_disabled_user_profile_blocks_work_session(
