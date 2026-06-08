@@ -365,6 +365,10 @@ def test_slackbot_profile_keeps_existing_positional_optionals_stable(
     assert profile.default_state_dir is None
     assert profile.default_system_prompt_path is None
     assert profile.user_config_secret_fields == ()
+    assert profile.default_service_restart == "on-failure"
+    assert profile.default_service_restart_sec == 10
+    assert profile.default_systemd_wants == ()
+    assert profile.default_systemd_after == ()
 
     full_profile = SlackbotProfile(
         "sample",
@@ -734,6 +738,77 @@ def test_systemd_service_has_no_source_project_leaks(tmp_path):
     assert not any(
         word in text for word in ("legacy-internal-tool", "ticket-system")
     )
+
+
+def test_systemd_service_includes_profile_service_defaults(tmp_path):
+    profile = replace(
+        make_profile(tmp_path),
+        default_service_restart="always",
+        default_service_restart_sec=5,
+        default_systemd_wants=(
+            "sample-mcp.service",
+            "network-online.target",
+        ),
+        default_systemd_after=("sample-mcp.service",),
+    )
+    scaffold_runtime(profile)
+    from sneeze.slackbot import load_config
+
+    config = load_config(profile, allow_missing_tokens=True)
+    text = render_systemd_service(
+        config,
+        cli_bin="sample",
+        run_subcommand="slackbot-run",
+        restart=profile.default_service_restart,
+        restart_sec=profile.default_service_restart_sec,
+    )
+
+    assert "Wants=network-online.target sample-mcp.service" in text
+    assert "After=network-online.target sample-mcp.service" in text
+    assert "Restart=always" in text
+    assert "RestartSec=5" in text
+
+
+def test_slackbot_service_install_uses_profile_restart_defaults(
+    tmp_path,
+    monkeypatch,
+):
+    import io
+
+    from sneeze.slackbot_commands import SlackbotServiceInstallBase
+
+    service_profile = replace(
+        make_profile(tmp_path),
+        default_service_restart="always",
+        default_service_restart_sec=5,
+    )
+    calls = {}
+
+    def fake_install_service(profile_arg, **kwds):
+        calls["profile"] = profile_arg
+        calls.update(kwds)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "sneeze.slackbot_commands.install_service",
+        fake_install_service,
+    )
+
+    class SampleSlackbotServiceInstall(SlackbotServiceInstallBase):
+        profile = service_profile
+
+    command = SampleSlackbotServiceInstall(
+        sys.stdin,
+        io.StringIO(),
+        io.StringIO(),
+    )
+    command.cli_display_name = "slackbot-service-install"
+    command.cli_bin = "/bin/echo"
+    command.run()
+
+    assert calls["profile"] == service_profile
+    assert calls["restart"] == "always"
+    assert calls["restart_sec"] == 5
 
 
 def test_build_prompt_tells_codex_not_to_send_to_slack(tmp_path):

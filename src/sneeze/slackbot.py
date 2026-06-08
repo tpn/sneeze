@@ -212,6 +212,10 @@ class SlackbotProfile:
     default_allowed_dm_user_ids: tuple[str, ...] = ()
     default_allowed_user_ids: tuple[str, ...] = ()
     default_allowed_channel_ids: tuple[str, ...] = ()
+    default_service_restart: str = "on-failure"
+    default_service_restart_sec: int = 10
+    default_systemd_wants: tuple[str, ...] = ()
+    default_systemd_after: tuple[str, ...] = ()
 
     @property
     def normalized_env_prefix(self) -> str:
@@ -2407,6 +2411,18 @@ def post_user_config_launcher(
     )
 
 
+def _systemd_unit_dependencies(*values: str) -> tuple[str, ...]:
+    seen = set()
+    deps = []
+    for value in values:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        deps.append(item)
+    return tuple(deps)
+
+
 def render_systemd_service(
     config: SlackbotConfig,
     *,
@@ -2426,12 +2442,20 @@ def render_systemd_service(
     working_dir = systemd_path_value(config.codex_workdir)
     log_file = quote_systemd_value(f"SNEEZE_LOG_FILE={config.paths.log_path}")
     env_file = systemd_path_value(config.paths.env_path)
+    wants = _systemd_unit_dependencies(
+        "network-online.target",
+        *config.profile.default_systemd_wants,
+    )
+    after = _systemd_unit_dependencies(
+        "network-online.target",
+        *config.profile.default_systemd_after,
+    )
     return "\n".join(
         [
             "[Unit]",
             f"Description={config.profile.app_slug} Slack bot",
-            "Wants=network-online.target",
-            "After=network-online.target",
+            f"Wants={' '.join(wants)}",
+            f"After={' '.join(after)}",
             f"StartLimitIntervalSec={start_limit_interval_sec}",
             f"StartLimitBurst={start_limit_burst}",
             "",

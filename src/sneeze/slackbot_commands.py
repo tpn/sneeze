@@ -611,15 +611,24 @@ class SlackbotServiceInstallBase(ProfiledSlackbotCommand):
         _mandatory = False
 
     def run(self):
+        profile = self._profile()
         result = install_service(
-            self._profile(),
+            profile,
             **self._common(),
             cli_bin=self._resolved_cli_bin(
                 self._cli_bin or self.cli_bin or sys.argv[0]
             ),
             run_subcommand=self._sibling_subcommand(self.run_subcommand),
-            restart=self._restart or self.restart or "on-failure",
-            restart_sec=self._restart_sec or self.restart_sec or 10,
+            restart=(
+                self._restart
+                or self.restart
+                or profile.default_service_restart
+            ),
+            restart_sec=(
+                self._restart_sec
+                or self.restart_sec
+                or profile.default_service_restart_sec
+            ),
             enable=bool(self.enable),
         )
         self._json(result)
