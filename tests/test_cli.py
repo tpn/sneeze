@@ -106,6 +106,24 @@ def test_version_flags_exit_cleanly(capsys, monkeypatch, tmp_path):
         assert "Unknown subcommand" not in captured.err
 
 
+def test_top_level_help_prefers_dash_help(capsys, monkeypatch, tmp_path):
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "help",
+        auto_plugins=False,
+    )
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+
+    assert cli.returncode == 0
+    assert "sne <subcommand> -h" in text
+    assert "sne <subcommand> --help" in text
+    assert "<subcommand> help" not in text
+
+
 def test_command_help_is_not_logged_as_error(
     monkeypatch,
     tmp_path,
@@ -134,6 +152,41 @@ def test_command_help_is_not_logged_as_error(
     assert instances[0].exit_code == 0
     assert instances[0].error_type is None
     assert instances[0].error_message is None
+
+
+def test_trailing_help_for_zero_arg_command_exits_before_start(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    from sneeze import runlog
+    from sneeze.commands import RunHistoryCommand
+    from sneeze.runlog import load_run_instances
+
+    _use_tmp_run_dir(tmp_path, monkeypatch)
+
+    def fail_if_dispatched(self):
+        raise AssertionError("command body should not run for help")
+
+    monkeypatch.setattr(RunHistoryCommand, "run", fail_if_dispatched)
+
+    cli = sneeze_cli.run(
+        "sne",
+        "sneeze",
+        "run-history",
+        "help",
+        auto_plugins=False,
+    )
+    captured = capsys.readouterr()
+    instances = load_run_instances(
+        [runlog.get_run_log_path(run_dir=str(tmp_path / "run"))]
+    )
+
+    assert cli.returncode == 0
+    assert "Usage: sne run-history" in captured.out
+    assert len(instances) == 1
+    assert instances[0].exit_code == 0
+    assert instances[0].error_type is None
 
 
 def test_help_subcommand_writes_single_run_log_entry(

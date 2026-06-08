@@ -176,6 +176,13 @@ class CommandLine:
                 ),
             )
         self._add_parser_options()
+        if (
+            len(args) == 1
+            and args[0].lower() == "help"
+            and getattr(self.command, "_vargc_", None) is not True
+        ):
+            self.parser.print_help()
+            self.parser.exit(status=0)
         opts, self.args = self.parser.parse_args(args)
         argc = getattr(self.command, "_argc_", 0)
         vargc = getattr(self.command, "_vargc_", None)
@@ -214,7 +221,8 @@ class CLI:
     __unknown_subcommand__ = "Unknown subcommand '%s'"
     __usage__ = "Type '%prog help' for usage."
     __help__ = """\
-        Type '%prog <subcommand> help' for help on a specific subcommand.
+        Type '%prog <subcommand> -h' or '%prog <subcommand> --help' for help
+        on a specific subcommand.
 
         Available subcommands:"""
 
