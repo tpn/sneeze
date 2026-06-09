@@ -3721,6 +3721,71 @@ def test_codex_final_answer_update_uses_slack_mrkdwn(
     ]
 
 
+def test_noisy_public_codex_result_is_dm_detail_and_sanitized_update(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = replace(load_config(profile), allowed_user_ids=("U111",))
+    bot = SlackSocketBot(config)
+    bot.bot_user_id = "UBOT"
+    posts = []
+    updates = []
+
+    class FakeRunner:
+        def run(self, prompt, session_id=None, **kwargs):
+            return {
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "last_message": (
+                    "I drafted the post at /tmp/post/index.qmd.\n\n"
+                    "I could not complete the actual publish flow:\n"
+                    "mkdir: cannot create directory: Read-only file system\n"
+                    "```bash\ncd ~/src/website\n./render-all.sh\n```"
+                ),
+                "session_id": "codex-session-1",
+            }
+
+    def fake_post(config, route, text):
+        posts.append((route, text))
+        channel = "D111" if route.dm_user_id else "C123"
+        return {"ts": f"{len(posts)}.000001", "channel": channel}
+
+    bot.runner = FakeRunner()
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr(
+        "sneeze.slackbot.update_slack_message",
+        lambda *args, **kwds: updates.append(kwds["text"]) or {"ok": True},
+    )
+
+    bot._handle_event(
+        {
+            "type": "app_mention",
+            "channel_type": "channel",
+            "user": "U111",
+            "channel": "C123",
+            "ts": "1.000001",
+            "text": "<@UBOT> publish the site",
+        }
+    )
+
+    detail_post = posts[1]
+    assert detail_post[0].dm_user_id == "U111"
+    assert "/tmp/post/index.qmd" in detail_post[1]
+    assert "Read-only file system" in detail_post[1]
+    assert updates == [
+        (
+            "I could not finish that from this bot run because the execution "
+            "environment blocked part of the requested work. I sent the "
+            "details to the requester in DM."
+        )
+    ]
+    assert "/tmp/" not in updates[0]
+    assert "```" not in updates[0]
+
+
 def test_top_level_app_mention_includes_recent_slack_context(
     tmp_path,
     monkeypatch,
