@@ -36,6 +36,7 @@ from sneeze.slackbot import (
     query_status,
     read_env_file,
     read_json,
+    read_slack_route_context,
     read_user_secret_env,
     render_launchd_service,
     render_slack_blocks,
@@ -663,6 +664,95 @@ def test_permalink_parser_rejects_non_slack_timestamp():
         )
 
 
+def test_read_slack_route_context_uses_thread_replies(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    calls = []
+
+    def fake_slack_api_post(token, method, payload):
+        calls.append((method, payload))
+        return {
+            "ok": True,
+            "messages": [
+                {"ts": "2.000001", "user": "U222", "text": "reply"},
+                {"ts": "1.000001", "user": "U111", "text": "parent"},
+            ],
+        }
+
+    monkeypatch.setattr("sneeze.slackbot.slack_api_post", fake_slack_api_post)
+
+    messages = read_slack_route_context(
+        config,
+        SlackbotRoute(channel_id="C123", thread_ts="1.000001"),
+        source_ts="2.000001",
+        source_thread_ts="1.000001",
+    )
+
+    assert calls == [
+        (
+            "conversations.replies",
+            {"channel": "C123", "ts": "1.000001", "limit": 200},
+        )
+    ]
+    assert [message["text"] for message in messages] == ["parent", "reply"]
+
+
+def test_read_slack_route_context_uses_recent_channel_history(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    calls = []
+
+    def fake_slack_api_post(token, method, payload):
+        calls.append((method, payload))
+        return {
+            "ok": True,
+            "messages": [
+                {
+                    "ts": "2.000001",
+                    "user": "U222",
+                    "text": "<@UBOT> compare to above",
+                },
+                {
+                    "ts": "1.000001",
+                    "user": "U111",
+                    "text": "Leo bot link: https://example.test/issue/19",
+                },
+            ],
+        }
+
+    monkeypatch.setattr("sneeze.slackbot.slack_api_post", fake_slack_api_post)
+
+    messages = read_slack_route_context(
+        config,
+        SlackbotRoute(channel_id="C123", thread_ts="2.000001"),
+        source_ts="2.000001",
+    )
+
+    assert calls == [
+        (
+            "conversations.history",
+            {
+                "channel": "C123",
+                "limit": 10,
+                "latest": "2.000001",
+                "inclusive": True,
+            },
+        )
+    ]
+    assert [message["text"] for message in messages] == [
+        "Leo bot link: https://example.test/issue/19",
+        "<@UBOT> compare to above",
+    ]
+
+
 def test_extract_codex_session_id_ignores_event_id():
     jsonl = "\n".join(
         [
@@ -825,12 +915,15 @@ def test_build_prompt_tells_codex_not_to_send_to_slack(tmp_path):
             dm_user_id="U123",
             thread_ts="1.234",
         ),
+        slack_context="[1.111111] U123: earlier message",
     )
 
     assert "The Slackbot wrapper will post" in text
     assert "Do not call Slack send" in text
     assert "Return the exact reply text as your final answer" in text
     assert "Slack route:" in text
+    assert "Slack context:" in text
+    assert "[1.111111] U123: earlier message" in text
     assert "Hi, you up?" in text
 
 
@@ -3346,6 +3439,83 @@ def test_codex_final_answer_update_uses_slack_mrkdwn(
     assert updates == [
         "Slack send was cancelled. Drafted reply:\n\n*Yep*, I'm up."
     ]
+
+
+def test_top_level_app_mention_includes_recent_slack_context(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = replace(load_config(profile), allowed_user_ids=("U111",))
+    bot = SlackSocketBot(config)
+    bot.bot_user_id = "UBOT"
+    prompts = []
+
+    class FakeRunner:
+        def run(self, prompt, session_id=None, **kwargs):
+            prompts.append(prompt)
+            return {
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "last_message": "I can compare them now.",
+                "session_id": "codex-session-1",
+            }
+
+    def fake_slack_api_post(token, method, payload):
+        if method == "conversations.history":
+            assert payload == {
+                "channel": "C123",
+                "limit": 10,
+                "latest": "2.000001",
+                "inclusive": True,
+            }
+            return {
+                "ok": True,
+                "messages": [
+                    {
+                        "ts": "2.000001",
+                        "user": "U111",
+                        "text": "<@UBOT> compare to the above link",
+                    },
+                    {
+                        "ts": "1.000001",
+                        "user": "U222",
+                        "text": (
+                            "Leo bot issue: "
+                            "https://gitlab.example/leof/bot/-/issues/19"
+                        ),
+                    },
+                ],
+            }
+        return {"ok": True}
+
+    bot.runner = FakeRunner()
+    monkeypatch.setattr("sneeze.slackbot.slack_api_post", fake_slack_api_post)
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: {"ts": "3.000001", "channel": "C123"},
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.update_slack_message",
+        lambda *args, **kwds: {"ok": True},
+    )
+
+    bot._handle_event(
+        {
+            "type": "app_mention",
+            "channel_type": "channel",
+            "user": "U111",
+            "channel": "C123",
+            "ts": "2.000001",
+            "text": "<@UBOT> compare to the above link",
+        }
+    )
+
+    assert "Slack context:" in prompts[0]
+    assert "https://gitlab.example/leof/bot/-/issues/19" in prompts[0]
+    assert "<@UBOT> compare to the above link" in prompts[0]
 
 
 def test_codex_disabled_user_profile_blocks_work_session(
