@@ -104,8 +104,10 @@ SLACKBOT_CODEX_TRANSPORT_INSTRUCTIONS = """Slack transport:
   your final answer back to the Slack route shown below.
 - Do not call Slack send, draft, schedule, canvas, or message-write tools for
   the current route. Return the exact reply text as your final answer.
-- Use Slack read/search tools only when the user's request explicitly needs
-  Slack context that was not included in this prompt.
+- Slack context from the current channel, DM, or thread may be included in
+  this prompt. Use it when the user refers to "above", "this thread", or prior
+  Slack messages. If needed Slack context is missing, say exactly what is
+  missing.
 """
 SECRET_ENV_NAME_PARTS = {
     "APIKEY",
@@ -1732,9 +1734,17 @@ def read_slack_thread(
     config: SlackbotConfig,
     permalink: str,
 ) -> list[dict[str, Any]]:
+    channel_id, thread_ts = parse_slack_thread_permalink(permalink)
+    return read_slack_thread_by_channel(config, channel_id, thread_ts)
+
+
+def read_slack_thread_by_channel(
+    config: SlackbotConfig,
+    channel_id: str,
+    thread_ts: str,
+) -> list[dict[str, Any]]:
     if not config.bot_token:
         raise SlackbotError("Slack bot token is missing")
-    channel_id, thread_ts = parse_slack_thread_permalink(permalink)
     messages: list[dict[str, Any]] = []
     cursor = None
     while True:
@@ -1751,7 +1761,73 @@ def read_slack_thread(
             "next_cursor"
         ) or None
         if not cursor:
-            return messages
+            return sort_slack_messages(messages)
+
+
+def read_slack_history(
+    config: SlackbotConfig,
+    channel_id: str,
+    *,
+    latest: str | None = None,
+    limit: int = 10,
+    inclusive: bool = True,
+) -> list[dict[str, Any]]:
+    if not config.bot_token:
+        raise SlackbotError("Slack bot token is missing")
+    payload: dict[str, Any] = {"channel": channel_id, "limit": limit}
+    if latest:
+        payload["latest"] = latest
+        payload["inclusive"] = inclusive
+    response = slack_api_post(
+        config.bot_token,
+        "conversations.history",
+        payload,
+    )
+    return sort_slack_messages(response.get("messages") or [])
+
+
+def read_slack_route_context(
+    config: SlackbotConfig,
+    route: SlackbotRoute,
+    *,
+    source_ts: str | None = None,
+    source_thread_ts: str | None = None,
+    history_limit: int = 10,
+) -> list[dict[str, Any]]:
+    if not route.channel_id:
+        return []
+    if source_thread_ts:
+        return read_slack_thread_by_channel(
+            config,
+            route.channel_id,
+            source_thread_ts,
+        )
+    if route.thread_ts and route.thread_ts != source_ts:
+        return read_slack_thread_by_channel(
+            config,
+            route.channel_id,
+            route.thread_ts,
+        )
+    return read_slack_history(
+        config,
+        route.channel_id,
+        latest=source_ts or route.thread_ts,
+        limit=history_limit,
+    )
+
+
+def _slack_ts_sort_key(message: dict[str, Any]) -> tuple[int, int, str]:
+    raw = str(message.get("ts") or "")
+    left, dot, right = raw.partition(".")
+    if dot and left.isdigit() and right.isdigit():
+        return (int(left), int(right), raw)
+    return (0, 0, raw)
+
+
+def sort_slack_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return sorted(messages, key=_slack_ts_sort_key)
 
 
 def render_thread_transcript(messages: list[dict[str, Any]]) -> str:
@@ -4099,6 +4175,7 @@ class SlackSocketBot:
             route,
             execution_mode=self._default_execution_mode(),
             slack_user_id=slack_user_id,
+            slack_context=self._slack_context_for_event(event, route),
         )
 
     def _handle_slash(self, payload: dict[str, Any]) -> None:
@@ -4150,6 +4227,10 @@ class SlackSocketBot:
             route,
             execution_mode=self._default_execution_mode(),
             slack_user_id=str(payload.get("user_id") or "").strip() or None,
+            slack_context=self._slack_context_for_route(
+                route,
+                source_thread_ts=route.thread_ts,
+            ),
         )
 
     def _handle_interactive(self, payload: dict[str, Any]) -> None:
@@ -4296,6 +4377,40 @@ class SlackSocketBot:
             return False
         post_slack_message(self.config, route, response)
         return True
+
+    def _slack_context_for_event(
+        self,
+        event: dict[str, Any],
+        route: SlackbotRoute,
+    ) -> str | None:
+        return self._slack_context_for_route(
+            route,
+            source_ts=event.get("ts") or None,
+            source_thread_ts=event.get("thread_ts") or None,
+        )
+
+    def _slack_context_for_route(
+        self,
+        route: SlackbotRoute,
+        *,
+        source_ts: str | None = None,
+        source_thread_ts: str | None = None,
+    ) -> str | None:
+        if not route.channel_id or not self.config.bot_token:
+            return None
+        try:
+            messages = read_slack_route_context(
+                self.config,
+                route,
+                source_ts=source_ts,
+                source_thread_ts=source_thread_ts,
+            )
+        except Exception as exc:
+            emit(self.out, f"Failed to read Slack context: {exc}")
+            return f"Slack context unavailable: {exc}"
+        if not messages:
+            return None
+        return render_thread_transcript(messages)
 
     def _default_execution_mode(self) -> str:
         return normalize_execution_mode(
@@ -4468,6 +4583,7 @@ class SlackSocketBot:
         session: str | None = None,
         slack_user_id: str | None = None,
         scrub_secret_env: bool = False,
+        slack_context: str | None = None,
         conversation_route: SlackbotRoute | None = None,
         user_config_error_callback: Callable[[Exception], None] | None = None,
         raise_user_config_errors: bool = False,
@@ -4633,6 +4749,7 @@ class SlackSocketBot:
                         prompt,
                         route,
                         project=project,
+                        slack_context=slack_context,
                     )
                     if execution_mode == "tmux":
                         result = self.runner.run_tmux(
@@ -4810,6 +4927,7 @@ class SlackSocketBot:
         route: SlackbotRoute,
         *,
         project: str | None = None,
+        slack_context: str | None = None,
     ) -> str:
         try:
             primer = Path(self.config.paths.system_prompt_path).read_text(
@@ -4819,9 +4937,12 @@ class SlackSocketBot:
             primer = self.config.profile.default_system_prompt
         route_info = json.dumps(route_to_dict(route), sort_keys=True)
         project_info = f"\nProject:\n{project}\n" if project else ""
+        context_info = (
+            f"\nSlack context:\n{slack_context}\n" if slack_context else ""
+        )
         return (
             f"{primer}\n\n{SLACKBOT_CODEX_TRANSPORT_INSTRUCTIONS}\n"
-            f"Slack route:\n{route_info}\n{project_info}\n"
+            f"Slack route:\n{route_info}\n{project_info}{context_info}\n"
             f"Request:\n{prompt}\n"
         )
 
