@@ -108,6 +108,22 @@ USER_CONFIG_TRIGGER_WORDS = {
     "onboard",
     "setup",
 }
+PUBLIC_REPLY_DETAIL_MARKERS = (
+    "codex exited",
+    "could not complete",
+    "couldn't complete",
+    "i hit an internal error",
+    "permission denied",
+    "read-only file system",
+    "sandbox",
+    "to publish from an unrestricted session",
+    "traceback",
+    "```",
+    "/home/",
+    "/tmp/",
+    "glab ",
+    "mkdir:",
+)
 SLACKBOT_CODEX_TRANSPORT_INSTRUCTIONS = """Slack transport:
 - You are running inside a Slackbot transport. The Slackbot wrapper will post
   your final answer back to the Slack route shown below.
@@ -1601,6 +1617,54 @@ def render_route_text(route: SlackbotRoute, text: str) -> str:
     prefix = " ".join(f"<@{user}>" for user in route.mention_user_ids)
     slack_text = markdown_to_slack_mrkdwn(text)
     return f"{prefix} {slack_text}".strip() if prefix else slack_text
+
+
+def should_dm_public_reply_details(
+    route: SlackbotRoute,
+    *,
+    slack_user_id: str | None,
+    text: str,
+    returncode: int | None = None,
+) -> bool:
+    if not slack_user_id or route.dm_user_id:
+        return False
+    if not route.channel_id or str(route.channel_id).startswith("D"):
+        return False
+    if returncode:
+        return True
+    lowered = text.casefold()
+    return any(marker in lowered for marker in PUBLIC_REPLY_DETAIL_MARKERS)
+
+
+def private_detail_message(route: SlackbotRoute, text: str) -> str:
+    route_bits = []
+    if route.channel_id:
+        route_bits.append(f"channel={route.channel_id}")
+    if route.thread_ts:
+        route_bits.append(f"thread_ts={route.thread_ts}")
+    route_text = " ".join(route_bits) or "unknown route"
+    return f"Detailed result for Slack request ({route_text}):\n\n{text}"
+
+
+def public_detail_summary(text: str, *, dm_sent: bool) -> str:
+    lowered = text.casefold()
+    if "read-only file system" in lowered or "sandbox" in lowered:
+        summary = (
+            "I could not finish that from this bot run because the execution "
+            "environment blocked part of the requested work."
+        )
+    elif "could not complete" in lowered or "couldn't complete" in lowered:
+        summary = "I could not complete that from this bot run."
+    elif "codex exited" in lowered or "traceback" in lowered:
+        summary = "I hit a Codex/runtime error while handling that."
+    else:
+        summary = (
+            "I have detailed operational notes for this request that are "
+            "better kept out of the public thread."
+        )
+    if dm_sent:
+        return f"{summary} I sent the details to the requester in DM."
+    return f"{summary} I could not send the detailed DM."
 
 
 def markdown_to_slack_mrkdwn(text: str) -> str:
@@ -4692,6 +4756,7 @@ class SlackSocketBot:
         execution_mode = normalize_execution_mode(execution_mode)
         user_config_error: Exception | None = None
         reply_body = None
+        codex_returncode: int | None = None
         user_secret_env: dict[str, str] = {}
         route_for_conversation = conversation_route or route
 
@@ -4881,6 +4946,7 @@ class SlackSocketBot:
                         or result["stderr"]
                         or result["stdout"]
                     )
+                    codex_returncode = result["returncode"]
                     if result["returncode"]:
                         reply_body = (
                             f"Codex exited with {result['returncode']}.\n\n"
@@ -4891,6 +4957,29 @@ class SlackSocketBot:
                 reply_body = (
                     f"I hit an internal error while talking to Codex: {exc}"
                 )
+        if should_dm_public_reply_details(
+            route,
+            slack_user_id=slack_user_id,
+            text=reply_body or "",
+            returncode=codex_returncode,
+        ):
+            dm_sent = False
+            try:
+                post_slack_message(
+                    self.config,
+                    SlackbotRoute(dm_user_id=slack_user_id),
+                    private_detail_message(route, reply_body or ""),
+                )
+                dm_sent = True
+            except Exception as exc:
+                emit(
+                    self.out,
+                    f"Failed to DM detailed public Slack reply: {exc}",
+                )
+            reply_body = public_detail_summary(
+                reply_body or "",
+                dm_sent=dm_sent,
+            )
         reply_text = render_route_text(route, reply_body or "(no response)")
         chunks = chunk_text(reply_text)
         followup_route = SlackbotRoute(
