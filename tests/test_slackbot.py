@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +39,7 @@ from sneeze.slackbot import (
     read_env_file,
     read_json,
     read_slack_route_context,
+    read_slack_thread,
     read_user_secret_env,
     render_launchd_service,
     render_slack_blocks,
@@ -666,6 +668,84 @@ def test_permalink_parser_rejects_non_slack_timestamp():
         )
 
 
+def test_read_slack_thread_resolves_reply_permalink_to_parent(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    calls = []
+
+    def fake_slack_api_post(token, method, payload):
+        calls.append((method, payload))
+        if method == "conversations.history":
+            return {"ok": True, "messages": []}
+        if (
+            method == "conversations.replies"
+            and payload["ts"] == "1716249602.000001"
+        ):
+            return {
+                "ok": True,
+                "messages": [
+                    {
+                        "ts": "1716249602.000001",
+                        "thread_ts": "1716249600.000001",
+                        "user": "U222",
+                        "text": "reply",
+                    }
+                ],
+            }
+        if method == "conversations.replies":
+            return {
+                "ok": True,
+                "messages": [
+                    {
+                        "ts": "1716249600.000001",
+                        "thread_ts": "1716249600.000001",
+                        "user": "U111",
+                        "text": "parent",
+                    },
+                    {
+                        "ts": "1716249602.000001",
+                        "thread_ts": "1716249600.000001",
+                        "user": "U222",
+                        "text": "reply",
+                    },
+                ],
+            }
+        raise AssertionError(method)
+
+    monkeypatch.setattr("sneeze.slackbot.slack_api_post", fake_slack_api_post)
+
+    messages = read_slack_thread(
+        config,
+        "https://example.slack.com/archives/C123/p1716249602000001",
+    )
+
+    assert calls == [
+        (
+            "conversations.history",
+            {
+                "channel": "C123",
+                "limit": 1,
+                "latest": "1716249602.000001",
+                "oldest": "1716249602.000001",
+                "inclusive": True,
+            },
+        ),
+        (
+            "conversations.replies",
+            {"channel": "C123", "ts": "1716249602.000001", "limit": 1},
+        ),
+        (
+            "conversations.replies",
+            {"channel": "C123", "ts": "1716249600.000001", "limit": 200},
+        ),
+    ]
+    assert [message["text"] for message in messages] == ["parent", "reply"]
+
+
 def test_read_slack_route_context_uses_thread_replies(
     tmp_path,
     monkeypatch,
@@ -701,6 +781,67 @@ def test_read_slack_route_context_uses_thread_replies(
         )
     ]
     assert [message["text"] for message in messages] == ["parent", "reply"]
+
+
+def test_read_slack_route_context_auto_joins_before_history(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    calls = []
+    attempts = {"history": 0}
+
+    def fake_slack_api_post(token, method, payload):
+        calls.append((method, payload))
+        if method == "conversations.history":
+            attempts["history"] += 1
+            if attempts["history"] == 1:
+                raise SlackApiError(
+                    method,
+                    {"ok": False, "error": "not_in_channel"},
+                )
+            return {
+                "ok": True,
+                "messages": [
+                    {"ts": "1.000001", "user": "U111", "text": "parent"},
+                ],
+            }
+        if method == "conversations.join":
+            return {"ok": True, "channel": {"id": "C123"}}
+        raise AssertionError(method)
+
+    monkeypatch.setattr("sneeze.slackbot.slack_api_post", fake_slack_api_post)
+
+    messages = read_slack_route_context(
+        config,
+        SlackbotRoute(channel_id="C123", thread_ts="1.000001"),
+        source_ts="1.000001",
+    )
+
+    assert calls == [
+        (
+            "conversations.history",
+            {
+                "channel": "C123",
+                "limit": 10,
+                "latest": "1.000001",
+                "inclusive": True,
+            },
+        ),
+        ("conversations.join", {"channel": "C123"}),
+        (
+            "conversations.history",
+            {
+                "channel": "C123",
+                "limit": 10,
+                "latest": "1.000001",
+                "inclusive": True,
+            },
+        ),
+    ]
+    assert [message["text"] for message in messages] == ["parent"]
 
 
 def test_read_slack_route_context_falls_back_when_thread_replies_invalid(
@@ -839,7 +980,7 @@ def test_slack_api_error_includes_response_metadata_messages():
     assert "[ERROR] invalid ts" in str(error)
 
 
-def test_slack_api_post_form_encodes_conversations_replies(monkeypatch):
+def test_slack_api_post_form_encodes_web_api_payloads(monkeypatch):
     requests = []
 
     class FakeResponse:
@@ -864,12 +1005,29 @@ def test_slack_api_post_form_encodes_conversations_replies(monkeypatch):
 
     slack_api_post(
         "xoxb-test",
-        "conversations.replies",
-        {"channel": "C123", "ts": "1.000001", "limit": 200},
+        "chat.postMessage",
+        {
+            "channel": "C123",
+            "text": "hello",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "*hello*"},
+                }
+            ],
+        },
     )
 
     request = requests[0]
-    assert request.data == b"channel=C123&ts=1.000001&limit=200"
+    parsed = urllib.parse.parse_qs(request.data.decode("utf-8"))
+    assert parsed["channel"] == ["C123"]
+    assert parsed["text"] == ["hello"]
+    assert json.loads(parsed["blocks"][0]) == [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "*hello*"},
+        }
+    ]
     assert request.get_header("Content-type").startswith(
         "application/x-www-form-urlencoded"
     )
