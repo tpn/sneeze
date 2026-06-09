@@ -15,6 +15,7 @@ from sneeze.slackbot import (
     USER_CONFIG_OPEN_ACTION_ID,
     WORK_QUEUE_DEPTH_PER_WORKER,
     CodexRunner,
+    SlackApiError,
     SlackbotError,
     SlackbotProfile,
     SlackbotRoute,
@@ -48,6 +49,7 @@ from sneeze.slackbot import (
     safe_slack_storage_id,
     save_user_config_submission,
     scaffold_runtime,
+    slack_api_post,
     slackbot_working_text,
     static_response_text_from_profile,
     store_user_secret_token,
@@ -701,6 +703,74 @@ def test_read_slack_route_context_uses_thread_replies(
     assert [message["text"] for message in messages] == ["parent", "reply"]
 
 
+def test_read_slack_route_context_falls_back_when_thread_replies_invalid(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    calls = []
+
+    def fake_slack_api_post(token, method, payload):
+        calls.append((method, payload))
+        if method == "conversations.replies":
+            raise SlackApiError(
+                method,
+                {
+                    "ok": False,
+                    "error": "invalid_arguments",
+                    "response_metadata": {
+                        "messages": ["[ERROR] invalid ts"],
+                    },
+                },
+            )
+        return {
+            "ok": True,
+            "messages": [
+                {
+                    "ts": "1.000001",
+                    "user": "U222",
+                    "text": "<@UBOT> compare to above",
+                },
+                {
+                    "ts": "0.999999",
+                    "user": "U111",
+                    "text": "Leo bot link: https://example.test/issue/19",
+                },
+            ],
+        }
+
+    monkeypatch.setattr("sneeze.slackbot.slack_api_post", fake_slack_api_post)
+
+    messages = read_slack_route_context(
+        config,
+        SlackbotRoute(channel_id="C123", thread_ts="1.000001"),
+        source_ts="2.000001",
+        source_thread_ts="1.000001",
+    )
+
+    assert calls == [
+        (
+            "conversations.replies",
+            {"channel": "C123", "ts": "1.000001", "limit": 200},
+        ),
+        (
+            "conversations.history",
+            {
+                "channel": "C123",
+                "limit": 10,
+                "latest": "1.000001",
+                "inclusive": True,
+            },
+        ),
+    ]
+    assert [message["text"] for message in messages] == [
+        "Leo bot link: https://example.test/issue/19",
+        "<@UBOT> compare to above",
+    ]
+
+
 def test_read_slack_route_context_uses_recent_channel_history(
     tmp_path,
     monkeypatch,
@@ -751,6 +821,58 @@ def test_read_slack_route_context_uses_recent_channel_history(
         "Leo bot link: https://example.test/issue/19",
         "<@UBOT> compare to above",
     ]
+
+
+def test_slack_api_error_includes_response_metadata_messages():
+    error = SlackApiError(
+        "conversations.replies",
+        {
+            "ok": False,
+            "error": "invalid_arguments",
+            "response_metadata": {
+                "messages": ["[ERROR] invalid ts"],
+            },
+        },
+    )
+
+    assert error.error == "invalid_arguments"
+    assert "[ERROR] invalid ts" in str(error)
+
+
+def test_slack_api_post_form_encodes_conversations_replies(monkeypatch):
+    requests = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def read(self):
+            return b'{"ok": true}'
+
+    def fake_urlopen(request, timeout):
+        requests.append(request)
+        assert timeout == 30
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "sneeze.slackbot.urllib.request.urlopen",
+        fake_urlopen,
+    )
+
+    slack_api_post(
+        "xoxb-test",
+        "conversations.replies",
+        {"channel": "C123", "ts": "1.000001", "limit": 200},
+    )
+
+    request = requests[0]
+    assert request.data == b"channel=C123&ts=1.000001&limit=200"
+    assert request.get_header("Content-type").startswith(
+        "application/x-www-form-urlencoded"
+    )
 
 
 def test_extract_codex_session_id_ignores_event_id():

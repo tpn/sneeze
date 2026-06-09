@@ -47,7 +47,16 @@ class SlackApiError(SlackbotError):
         self.method = method
         self.result = result
         self.error = str(result.get("error") or result)
-        super().__init__(f"Slack API {method} failed: {self.error}")
+        metadata = result.get("response_metadata") or {}
+        raw_messages = (
+            metadata.get("messages") if isinstance(metadata, dict) else None
+        )
+        messages = raw_messages if isinstance(raw_messages, list) else []
+        self.detail = "; ".join(str(item) for item in messages if str(item))
+        text = f"Slack API {method} failed: {self.error}"
+        if self.detail:
+            text += f" ({self.detail})"
+        super().__init__(text)
 
 
 SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"
@@ -55,6 +64,9 @@ SLACK_APP_TOKEN_ENV = "SLACK_APP_TOKEN"
 SLACK_TEAM_DOMAIN_ENV = "SLACK_TEAM_DOMAIN"
 SLACK_APP_ID_ENV = "SLACK_APP_ID"
 SLACK_CLIENT_ID_ENV = "SLACK_CLIENT_ID"
+SLACK_FORM_POST_METHODS = {
+    "conversations.replies",
+}
 
 CODEX_MODE_VALUES = (
     "danger-full-access",
@@ -1430,13 +1442,23 @@ def slack_api_post(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     url = f"https://slack.com/api/{method}"
-    data = json.dumps(payload).encode("utf-8")
+    if method in SLACK_FORM_POST_METHODS:
+        data = urllib.parse.urlencode(
+            {
+                key: _slack_form_value(value)
+                for key, value in payload.items()
+            }
+        ).encode("utf-8")
+        content_type = "application/x-www-form-urlencoded; charset=utf-8"
+    else:
+        data = json.dumps(payload).encode("utf-8")
+        content_type = "application/json; charset=utf-8"
     request = urllib.request.Request(
         url,
         data=data,
         headers={
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json; charset=utf-8",
+            "Content-Type": content_type,
         },
         method="POST",
     )
@@ -1484,6 +1506,14 @@ def slack_api_post(
     if not result.get("ok"):
         raise SlackApiError(method, result)
     return result
+
+
+def _slack_form_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return str(value)
 
 
 def slack_response_url_post(
@@ -1797,17 +1827,37 @@ def read_slack_route_context(
     if not route.channel_id:
         return []
     if source_thread_ts:
-        return read_slack_thread_by_channel(
-            config,
-            route.channel_id,
-            source_thread_ts,
-        )
+        try:
+            return read_slack_thread_by_channel(
+                config,
+                route.channel_id,
+                source_thread_ts,
+            )
+        except SlackApiError as exc:
+            if exc.error != "invalid_arguments":
+                raise
+            return read_slack_history(
+                config,
+                route.channel_id,
+                latest=source_thread_ts,
+                limit=history_limit,
+            )
     if route.thread_ts and route.thread_ts != source_ts:
-        return read_slack_thread_by_channel(
-            config,
-            route.channel_id,
-            route.thread_ts,
-        )
+        try:
+            return read_slack_thread_by_channel(
+                config,
+                route.channel_id,
+                route.thread_ts,
+            )
+        except SlackApiError as exc:
+            if exc.error != "invalid_arguments":
+                raise
+            return read_slack_history(
+                config,
+                route.channel_id,
+                latest=route.thread_ts,
+                limit=history_limit,
+            )
     return read_slack_history(
         config,
         route.channel_id,
