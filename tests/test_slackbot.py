@@ -17,15 +17,18 @@ from sneeze.slackbot import (
     WORK_QUEUE_DEPTH_PER_WORKER,
     CodexRunner,
     SlackApiError,
+    SlackbotDiagnosticResult,
     SlackbotError,
     SlackbotProfile,
     SlackbotRoute,
     SlackbotStaticResponse,
     SlackbotUserConfigSecretField,
     SlackSocketBot,
+    append_slackbot_audit_event,
     bind_agent_tmux_thread,
     build_user_config_view,
     chunk_text,
+    effective_codex_policy,
     enqueue_ingress,
     extract_codex_session_id,
     list_schedules,
@@ -40,10 +43,13 @@ from sneeze.slackbot import (
     read_json,
     read_slack_route_context,
     read_slack_thread,
+    read_slackbot_trust,
     read_user_secret_env,
+    render_effective_codex_policy,
     render_launchd_service,
     render_slack_blocks,
     render_systemd_service,
+    resolve_slack_mentions,
     route_from_dict,
     route_to_dict,
     run_schedule,
@@ -56,6 +62,8 @@ from sneeze.slackbot import (
     static_response_text_from_profile,
     store_user_secret_token,
     strip_bot_mentions,
+    trust_slack_channel,
+    untrust_slack_channel,
     update_slack_message,
     upsert_schedule,
     user_config_mode_from_text,
@@ -303,6 +311,7 @@ def test_scaffold_runtime_honors_profile_default_allowlists(tmp_path):
         default_allowed_dm_user_ids=("U999",),
         default_allowed_user_ids=("U111",),
         default_allowed_channel_ids=("C999",),
+        default_admin_user_ids=("UADMIN",),
     )
 
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
@@ -311,11 +320,13 @@ def test_scaffold_runtime_honors_profile_default_allowlists(tmp_path):
     assert config.allowed_dm_user_ids == ("U999",)
     assert config.allowed_user_ids == ("U111",)
     assert config.allowed_channel_ids == ("C999",)
+    assert config.admin_user_ids == ("UADMIN",)
     env_path = Path(config.paths.env_path)
     env_text = env_path.read_text(encoding="utf-8")
     assert "SAMPLE_SLACKBOT_ALLOWED_DM_USER_IDS=U999" in env_text
     assert "SAMPLE_SLACKBOT_ALLOWED_USER_IDS=U111" in env_text
     assert "SAMPLE_SLACKBOT_ALLOWED_CHANNEL_IDS=C999" in env_text
+    assert "SAMPLE_SLACKBOT_ADMIN_USER_IDS=UADMIN" in env_text
     assert SlackSocketBot(config)._is_authorized("U222", "C999")
 
     env_text = (
@@ -331,6 +342,10 @@ def test_scaffold_runtime_honors_profile_default_allowlists(tmp_path):
             "SAMPLE_SLACKBOT_ALLOWED_CHANNEL_IDS=C999",
             "SAMPLE_SLACKBOT_ALLOWED_CHANNEL_IDS=",
         )
+        .replace(
+            "SAMPLE_SLACKBOT_ADMIN_USER_IDS=UADMIN",
+            "SAMPLE_SLACKBOT_ADMIN_USER_IDS=",
+        )
     )
     env_path.write_text(env_text, encoding="utf-8")
     cleared_config = load_config(profile)
@@ -338,6 +353,7 @@ def test_scaffold_runtime_honors_profile_default_allowlists(tmp_path):
     assert cleared_config.allowed_dm_user_ids == ()
     assert cleared_config.allowed_user_ids == ()
     assert cleared_config.allowed_channel_ids == ()
+    assert cleared_config.admin_user_ids == ()
     assert not SlackSocketBot(cleared_config)._is_authorized("U222", "C999")
 
     scaffold_runtime(profile)
@@ -346,6 +362,19 @@ def test_scaffold_runtime_honors_profile_default_allowlists(tmp_path):
     assert "SAMPLE_SLACKBOT_ALLOWED_DM_USER_IDS=\n" in env_text
     assert "SAMPLE_SLACKBOT_ALLOWED_USER_IDS=\n" in env_text
     assert "SAMPLE_SLACKBOT_ALLOWED_CHANNEL_IDS=\n" in env_text
+    assert "SAMPLE_SLACKBOT_ADMIN_USER_IDS=\n" in env_text
+
+
+def test_admin_falls_back_to_allowed_users(tmp_path):
+    profile = replace(
+        make_profile(tmp_path),
+        default_allowed_user_ids=("U111",),
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+
+    assert config.admin_user_ids == ("U111",)
+    assert SlackSocketBot(config)._is_admin("U111")
 
 
 def test_slackbot_profile_keeps_existing_positional_optionals_stable(
@@ -3860,7 +3889,7 @@ def test_top_level_app_mention_includes_recent_slack_context(
 
     assert "Slack context:" in prompts[0]
     assert "https://gitlab.example/leof/bot/-/issues/19" in prompts[0]
-    assert "<@UBOT> compare to the above link" in prompts[0]
+    assert "you compare to the above link" in prompts[0]
 
 
 def test_codex_disabled_user_profile_blocks_work_session(
@@ -5393,6 +5422,158 @@ def test_authorization_allows_user_or_channel_match(tmp_path):
     assert bot._is_authorized("U111", "D123")
     assert bot._is_authorized("U222", "C999")
     assert not bot._is_authorized("U222", "C123")
+
+
+def test_runtime_channel_trust_allows_channel(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+
+    assert trust_slack_channel(config.paths, "C777")
+    assert not trust_slack_channel(config.paths, "C777")
+    trust = read_slackbot_trust(config.paths)
+    assert trust["trusted_channel_ids"] == ["C777"]
+    assert SlackSocketBot(config)._is_authorized("U222", "C777")
+    assert untrust_slack_channel(config.paths, "C777")
+    assert not SlackSocketBot(config)._is_authorized("U222", "C777")
+
+
+def test_control_policy_command_posts_without_codex(tmp_path, monkeypatch):
+    profile = replace(
+        make_profile(tmp_path),
+        default_allowed_user_ids=("U111",),
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bot = SlackSocketBot(load_config(profile))
+    calls = []
+
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: calls.append(text),
+    )
+    monkeypatch.setattr(
+        bot,
+        "_run_codex_for_route",
+        lambda *args, **kwds: pytest.fail("control command used Codex"),
+    )
+
+    handled = bot._maybe_handle_control_command(
+        "!config",
+        SlackbotRoute(channel_id="C123"),
+        "U111",
+    )
+
+    assert handled
+    assert "effective Codex policy" in calls[0]
+    assert "workspace-write" in calls[0]
+
+
+def test_diag_command_dms_public_details(tmp_path, monkeypatch):
+    profile = replace(
+        make_profile(tmp_path),
+        default_allowed_user_ids=("U111",),
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bot = SlackSocketBot(load_config(profile))
+    calls = []
+
+    monkeypatch.setattr(
+        "sneeze.slackbot.run_slackbot_diagnostics",
+        lambda config: [
+            SlackbotDiagnosticResult(
+                name="sample",
+                label="Sample check",
+                status="PASS",
+                detail="ok",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: calls.append((route, text)),
+    )
+
+    assert bot._maybe_handle_control_command(
+        "!diag",
+        SlackbotRoute(channel_id="C123", thread_ts="1.000001"),
+        "U111",
+    )
+
+    assert calls[0][0].dm_user_id == "U111"
+    assert "Sample check" in calls[0][1]
+    assert calls[1][0].channel_id == "C123"
+    assert "DM" in calls[1][1]
+
+
+def test_effective_codex_policy_and_rendering(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(
+        profile,
+        bot_token="xoxb-test",
+        app_token="xapp-test",
+        codex_mode="danger-full-access",
+    )
+    config = load_config(profile)
+
+    policy = effective_codex_policy(config)
+    rendered = render_effective_codex_policy(config)
+
+    assert policy["danger_full_access"] is True
+    assert "yolo-style" in rendered
+
+
+def test_append_slackbot_audit_event_writes_private_jsonl(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+
+    append_slackbot_audit_event(
+        config,
+        {
+            "kind": "test",
+            "value": 1,
+            "SLACK_BOT_TOKEN": "xoxb-secret-token",
+            "message": "Bearer abcdef ghp_secret sk-secret",
+        },
+    )
+
+    path = Path(config.paths.audit_path)
+    record = json.loads(path.read_text().splitlines()[0])
+    assert record["kind"] == "test"
+    assert record["app_slug"] == "sample"
+    assert record["SLACK_BOT_TOKEN"] == "***"
+    assert record["message"] == "Bearer *** ghp_*** sk-***"
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_resolve_slack_mentions_uses_users_info(tmp_path, monkeypatch):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    calls = []
+
+    def fake_slack_api_post(token, method, payload):
+        calls.append((method, payload))
+        return {
+            "ok": True,
+            "user": {
+                "profile": {"display_name": "Alice"},
+                "real_name": "Alice Example",
+            },
+        }
+
+    monkeypatch.setattr("sneeze.slackbot.slack_api_post", fake_slack_api_post)
+
+    assert (
+        resolve_slack_mentions(
+            config,
+            "hi <@U111> and <@UBOT>",
+            bot_user_id="UBOT",
+            cache={},
+        )
+        == "hi @Alice and you"
+    )
+    assert calls == [("users.info", {"user": "U111"})]
 
 
 def test_agent_tmux_commands_require_tmux_prefix(tmp_path, monkeypatch):
