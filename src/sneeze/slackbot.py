@@ -184,6 +184,14 @@ SECRET_ENV_NAME_SUBSTRINGS = {
     "SECRET",
     "TOKEN",
 }
+SECRET_TEXT_RE = re.compile(
+    r"(Bearer\s+)[A-Za-z0-9._~+/=-]+"
+    r"|(xox[baprs]-)[A-Za-z0-9-]+"
+    r"|(glpat-)[A-Za-z0-9_-]+"
+    r"|(gh[pousr]_)[A-Za-z0-9_]+"
+    r"|(sk-)[A-Za-z0-9_-]+",
+    re.IGNORECASE,
+)
 USER_CONFIG_FIELDS = {
     "display_name": ("display_name", "display_name"),
     "default_project": ("default_project", "default_project"),
@@ -207,6 +215,24 @@ class SlackbotUserConfigSecretField:
 class SlackbotStaticResponse:
     names: tuple[str, ...]
     text: str
+
+
+@dataclass(frozen=True)
+class SlackbotDiagnosticCheck:
+    name: str
+    label: str
+    command: tuple[str, ...]
+    cwd: str | None = None
+    timeout_seconds: int = 30
+    ok_returncodes: tuple[int, ...] = (0,)
+
+
+@dataclass(frozen=True)
+class SlackbotDiagnosticResult:
+    name: str
+    label: str
+    status: str
+    detail: str
 
 
 CORE_USER_CONFIG_SECRET_FIELDS: tuple[SlackbotUserConfigSecretField, ...] = ()
@@ -239,6 +265,8 @@ class SlackbotProfile:
     default_allowed_dm_user_ids: tuple[str, ...] = ()
     default_allowed_user_ids: tuple[str, ...] = ()
     default_allowed_channel_ids: tuple[str, ...] = ()
+    default_admin_user_ids: tuple[str, ...] = ()
+    diagnostic_checks: tuple[SlackbotDiagnosticCheck, ...] = ()
     default_service_restart: str = "on-failure"
     default_service_restart_sec: int = 10
     default_systemd_wants: tuple[str, ...] = ()
@@ -269,6 +297,8 @@ class SlackbotPaths:
     schedule_reports_dir: str
     agents_dir: str
     user_config_dir: str
+    trust_path: str
+    audit_path: str
     systemd_dir: str
     launchd_dir: str
     system_prompt_path: str
@@ -303,6 +333,7 @@ class SlackbotConfig:
     allowed_dm_user_ids: tuple[str, ...] = ()
     allowed_user_ids: tuple[str, ...] = ()
     allowed_channel_ids: tuple[str, ...] = ()
+    admin_user_ids: tuple[str, ...] = ()
     worker_count: int = 2
     mcp_server_url: str | None = None
     team_config_path: str | None = None
@@ -744,6 +775,8 @@ def resolve_paths(
         schedule_reports_dir=str(state / "schedule-runs"),
         agents_dir=str(prompt_path.parent),
         user_config_dir=str(state / "users"),
+        trust_path=str(state / "trust.json"),
+        audit_path=str(state / "audit.jsonl"),
         systemd_dir=str(systemd_dir),
         launchd_dir=str(launchd_dir),
         system_prompt_path=str(prompt_path),
@@ -780,6 +813,7 @@ def prefixed_env_keys(profile: SlackbotProfile) -> OrderedDict[str, str]:
         "SLACKBOT_ALLOWED_DM_USER_IDS",
         "SLACKBOT_ALLOWED_USER_IDS",
         "SLACKBOT_ALLOWED_CHANNEL_IDS",
+        "SLACKBOT_ADMIN_USER_IDS",
         "SLACKBOT_SYSTEM_PROMPT_PATH",
         "SLACKBOT_WORKER_COUNT",
         "MCP_SERVER_URL",
@@ -951,6 +985,11 @@ def managed_env_values(
         render_csv(profile.default_allowed_channel_ids),
         allow_empty=True,
     ).strip()
+    values[keys["SLACKBOT_ADMIN_USER_IDS"]] = current_value(
+        "SLACKBOT_ADMIN_USER_IDS",
+        render_csv(profile.default_admin_user_ids),
+        allow_empty=True,
+    ).strip()
     values[keys["SLACKBOT_SYSTEM_PROMPT_PATH"]] = paths.system_prompt_path
     values[keys["SLACKBOT_WORKER_COUNT"]] = str(
         normalize_positive_int(
@@ -1079,6 +1118,8 @@ def scaffold_runtime(
         paths.schedule_reports_dir,
         paths.agents_dir,
         paths.user_config_dir,
+        Path(paths.trust_path).parent,
+        Path(paths.audit_path).parent,
         paths.systemd_dir,
         paths.launchd_dir,
     ):
@@ -1152,6 +1193,40 @@ def load_config(
         ),
         "Codex workdir",
     )
+    allowed_dm_user_ids = parse_csv(
+        env_lookup_allow_empty(
+            profile,
+            env,
+            "SLACKBOT_ALLOWED_DM_USER_IDS",
+            render_csv(profile.default_allowed_dm_user_ids),
+        )
+    )
+    allowed_user_ids = parse_csv(
+        env_lookup_allow_empty(
+            profile,
+            env,
+            "SLACKBOT_ALLOWED_USER_IDS",
+            render_csv(profile.default_allowed_user_ids),
+        )
+    )
+    allowed_channel_ids = parse_csv(
+        env_lookup_allow_empty(
+            profile,
+            env,
+            "SLACKBOT_ALLOWED_CHANNEL_IDS",
+            render_csv(profile.default_allowed_channel_ids),
+        )
+    )
+    configured_admin_user_ids = parse_csv(
+        env_lookup_allow_empty(
+            profile,
+            env,
+            "SLACKBOT_ADMIN_USER_IDS",
+            render_csv(profile.default_admin_user_ids),
+        )
+    )
+    fallback_admin_user_ids = tuple(OrderedDict.fromkeys(allowed_user_ids))
+    admin_user_ids = configured_admin_user_ids or fallback_admin_user_ids
     return SlackbotConfig(
         profile=profile,
         paths=paths,
@@ -1213,30 +1288,10 @@ def load_config(
                 " ".join(profile.default_codex_extra_args),
             )
         ),
-        allowed_dm_user_ids=parse_csv(
-            env_lookup_allow_empty(
-                profile,
-                env,
-                "SLACKBOT_ALLOWED_DM_USER_IDS",
-                render_csv(profile.default_allowed_dm_user_ids),
-            )
-        ),
-        allowed_user_ids=parse_csv(
-            env_lookup_allow_empty(
-                profile,
-                env,
-                "SLACKBOT_ALLOWED_USER_IDS",
-                render_csv(profile.default_allowed_user_ids),
-            )
-        ),
-        allowed_channel_ids=parse_csv(
-            env_lookup_allow_empty(
-                profile,
-                env,
-                "SLACKBOT_ALLOWED_CHANNEL_IDS",
-                render_csv(profile.default_allowed_channel_ids),
-            )
-        ),
+        allowed_dm_user_ids=allowed_dm_user_ids,
+        allowed_user_ids=allowed_user_ids,
+        allowed_channel_ids=allowed_channel_ids,
+        admin_user_ids=admin_user_ids,
         worker_count=normalize_positive_int(
             env_lookup(profile, env, "SLACKBOT_WORKER_COUNT"),
             profile.default_worker_count,
@@ -1260,6 +1315,372 @@ def mask_secret(value: str | None) -> str:
     if not value:
         return "missing"
     return f"present:{len(value)}"
+
+
+def redact_secret_text(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        for group in match.groups():
+            if group:
+                return f"{group}***"
+        return "***"
+
+    return SECRET_TEXT_RE.sub(replace, value)
+
+
+def redact_secret_value(value: Any, *, key: str | None = None) -> Any:
+    if key and is_secret_env_name(key):
+        return "***"
+    if isinstance(value, str):
+        return redact_secret_text(value)
+    if isinstance(value, dict):
+        return {
+            str(item_key): redact_secret_value(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_secret_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_secret_value(item) for item in value)
+    return value
+
+
+def read_slackbot_trust(paths: SlackbotPaths) -> dict[str, Any]:
+    data = read_json(paths.trust_path, {})
+    trusted_channels = parse_csv(data.get("trusted_channel_ids") or ())
+    trusted_users = parse_csv(data.get("trusted_user_ids") or ())
+    return {
+        "trusted_channel_ids": sorted(set(trusted_channels)),
+        "trusted_user_ids": sorted(set(trusted_users)),
+    }
+
+
+def write_slackbot_trust(paths: SlackbotPaths, data: dict[str, Any]) -> None:
+    trusted = {
+        "trusted_channel_ids": sorted(
+            set(parse_csv(data.get("trusted_channel_ids") or ()))
+        ),
+        "trusted_user_ids": sorted(
+            set(parse_csv(data.get("trusted_user_ids") or ()))
+        ),
+    }
+    with locked_json_path(paths.trust_path):
+        write_json_atomic(paths.trust_path, trusted)
+
+
+def trust_slack_channel(paths: SlackbotPaths, channel_id: str) -> bool:
+    channel_id = str(channel_id or "").strip()
+    if not channel_id:
+        raise SlackbotError("Slack channel ID is required")
+    with locked_json_path(paths.trust_path):
+        data = read_slackbot_trust(paths)
+        channels = set(data["trusted_channel_ids"])
+        changed = channel_id not in channels
+        channels.add(channel_id)
+        data["trusted_channel_ids"] = sorted(channels)
+        write_json_atomic(paths.trust_path, data)
+        return changed
+
+
+def untrust_slack_channel(paths: SlackbotPaths, channel_id: str) -> bool:
+    channel_id = str(channel_id or "").strip()
+    if not channel_id:
+        raise SlackbotError("Slack channel ID is required")
+    with locked_json_path(paths.trust_path):
+        data = read_slackbot_trust(paths)
+        channels = set(data["trusted_channel_ids"])
+        changed = channel_id in channels
+        channels.discard(channel_id)
+        data["trusted_channel_ids"] = sorted(channels)
+        write_json_atomic(paths.trust_path, data)
+        return changed
+
+
+def slackbot_admin_user_ids(config: SlackbotConfig) -> tuple[str, ...]:
+    return tuple(
+        OrderedDict.fromkeys(
+            (
+                *config.admin_user_ids,
+                *config.allowed_user_ids,
+            )
+        )
+    )
+
+
+def is_slackbot_admin(config: SlackbotConfig, user_id: str | None) -> bool:
+    if not user_id:
+        return False
+    return user_id in slackbot_admin_user_ids(config)
+
+
+def slack_user_display_name(
+    config: SlackbotConfig,
+    user_id: str,
+    *,
+    bot_user_id: str | None = None,
+    cache: dict[str, str] | None = None,
+) -> str:
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return user_id
+    if bot_user_id and user_id == bot_user_id:
+        return "you"
+    if cache is not None and user_id in cache:
+        return cache[user_id]
+    if not config.bot_token:
+        return user_id
+    try:
+        response = slack_api_post(
+            config.bot_token,
+            "users.info",
+            {"user": user_id},
+        )
+    except SlackbotError:
+        return user_id
+    user = response.get("user") or {}
+    profile = user.get("profile") or {}
+    name = (
+        profile.get("display_name")
+        or profile.get("real_name")
+        or user.get("real_name")
+        or user.get("name")
+        or user_id
+    )
+    if cache is not None:
+        cache[user_id] = str(name)
+    return str(name)
+
+
+_SLACK_USER_MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)>")
+
+
+def resolve_slack_mentions(
+    config: SlackbotConfig,
+    text: str,
+    *,
+    bot_user_id: str | None = None,
+    cache: dict[str, str] | None = None,
+) -> str:
+    result = text
+    for user_id in sorted(set(_SLACK_USER_MENTION_RE.findall(text))):
+        name = slack_user_display_name(
+            config,
+            user_id,
+            bot_user_id=bot_user_id,
+            cache=cache,
+        )
+        replacement = "you" if name == "you" else f"@{name}"
+        result = result.replace(f"<@{user_id}>", replacement)
+    return result
+
+
+def effective_codex_policy(config: SlackbotConfig) -> dict[str, Any]:
+    return {
+        "codex_bin": config.codex_bin,
+        "codex_mode": config.codex_mode,
+        "codex_model": config.codex_model or "",
+        "codex_profile": config.codex_profile or "",
+        "codex_workdir": config.codex_workdir,
+        "codex_extra_args": list(config.codex_extra_args),
+        "mcp_server_url": config.mcp_server_url or "",
+        "team_config_path": config.team_config_path or "",
+        "danger_full_access": config.codex_mode == "danger-full-access",
+        "approval_policy": (
+            "bypass" if config.codex_mode == "danger-full-access" else ""
+        ),
+    }
+
+
+def render_effective_codex_policy(config: SlackbotConfig) -> str:
+    policy = effective_codex_policy(config)
+    lines = [
+        f"*{config.profile.app_slug} effective Codex policy*",
+        f"- mode: `{policy['codex_mode']}`",
+        f"- workdir: `{policy['codex_workdir']}`",
+        f"- bin: `{policy['codex_bin']}`",
+        f"- model: `{policy['codex_model'] or '(default)'}`",
+        f"- profile: `{policy['codex_profile'] or '(default)'}`",
+        (
+            "- extra args: "
+            + (
+                " ".join(f"`{arg}`" for arg in policy["codex_extra_args"])
+                if policy["codex_extra_args"]
+                else "`(none)`"
+            )
+        ),
+        f"- MCP URL: `{policy['mcp_server_url'] or '(none)'}`",
+    ]
+    if policy["danger_full_access"]:
+        lines.append(
+            "- note: this bot is currently running Codex with yolo-style "
+            "filesystem and sandbox bypass enabled."
+        )
+    return "\n".join(lines)
+
+
+def append_slackbot_audit_event(
+    config: SlackbotConfig,
+    event: dict[str, Any],
+) -> None:
+    record = redact_secret_value(dict(event))
+    record.setdefault("created_at", utcnow_iso())
+    record.setdefault("app_slug", config.profile.app_slug)
+    text = json.dumps(record, sort_keys=True, default=str) + "\n"
+    path = Path(config.paths.audit_path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+    path.chmod(0o600)
+
+
+def _diagnostic_result(
+    name: str,
+    label: str,
+    status: str,
+    detail: str,
+) -> SlackbotDiagnosticResult:
+    status = status.upper()
+    if status not in {"PASS", "WARN", "FAIL"}:
+        status = "WARN"
+    detail = redact_secret_text(detail.strip()) or "(no detail)"
+    if len(detail) > 700:
+        detail = detail[:680].rstrip() + " ... [truncated]"
+    return SlackbotDiagnosticResult(
+        name=name,
+        label=label,
+        status=status,
+        detail=detail,
+    )
+
+
+def run_diagnostic_check(
+    check: SlackbotDiagnosticCheck,
+) -> SlackbotDiagnosticResult:
+    if not check.command:
+        return _diagnostic_result(
+            check.name,
+            check.label,
+            "WARN",
+            "No command configured.",
+        )
+    try:
+        proc = subprocess.run(
+            list(check.command),
+            cwd=check.cwd or None,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=check.timeout_seconds,
+        )
+    except FileNotFoundError as exc:
+        return _diagnostic_result(check.name, check.label, "FAIL", str(exc))
+    except subprocess.TimeoutExpired:
+        return _diagnostic_result(
+            check.name,
+            check.label,
+            "FAIL",
+            f"Timed out after {check.timeout_seconds}s.",
+        )
+    detail = (proc.stdout or proc.stderr or "").strip()
+    if proc.stderr and proc.stdout:
+        detail = f"{proc.stdout.strip()}\nstderr:\n{proc.stderr.strip()}"
+    status = "PASS" if proc.returncode in check.ok_returncodes else "FAIL"
+    if proc.returncode not in check.ok_returncodes:
+        detail = f"exit {proc.returncode}: {detail}"
+    return _diagnostic_result(check.name, check.label, status, detail)
+
+
+def run_slackbot_diagnostics(
+    config: SlackbotConfig,
+) -> list[SlackbotDiagnosticResult]:
+    results: list[SlackbotDiagnosticResult] = []
+    if config.bot_token:
+        try:
+            auth = slack_api_post(config.bot_token, "auth.test", {})
+        except SlackbotError as exc:
+            results.append(
+                _diagnostic_result(
+                    "slack_auth",
+                    "Slack auth",
+                    "FAIL",
+                    str(exc),
+                )
+            )
+        else:
+            detail = "team={team} user_id={user_id}".format(
+                team=auth.get("team") or "",
+                user_id=auth.get("user_id") or "",
+            ).strip()
+            results.append(
+                _diagnostic_result("slack_auth", "Slack auth", "PASS", detail)
+            )
+    else:
+        results.append(
+            _diagnostic_result(
+                "slack_auth",
+                "Slack auth",
+                "FAIL",
+                "Slack bot token is missing.",
+            )
+        )
+    codex_check = SlackbotDiagnosticCheck(
+        name="codex_version",
+        label="Codex CLI",
+        command=(config.codex_bin, "--version"),
+        timeout_seconds=10,
+    )
+    results.append(run_diagnostic_check(codex_check))
+    workdir = Path(config.codex_workdir)
+    if workdir.exists() and workdir.is_dir():
+        results.append(
+            _diagnostic_result(
+                "codex_workdir",
+                "Codex workdir",
+                "PASS",
+                str(workdir),
+            )
+        )
+    else:
+        results.append(
+            _diagnostic_result(
+                "codex_workdir",
+                "Codex workdir",
+                "FAIL",
+                f"{workdir} is not a directory.",
+            )
+        )
+    svc = service_status(
+        config.profile,
+        runtime_root=config.paths.runtime_root,
+        env_path=config.paths.env_path,
+        state_dir=config.paths.state_dir,
+        system_prompt_path=config.paths.system_prompt_path,
+        unit_name=config.paths.unit_name,
+    )
+    results.append(
+        _diagnostic_result(
+            "service",
+            "Service",
+            "PASS" if svc.get("active") == "active" else "WARN",
+            f"{svc.get('unit_name')}: {svc.get('active')}",
+        )
+    )
+    for check in config.profile.diagnostic_checks:
+        results.append(run_diagnostic_check(check))
+    return results
+
+
+def render_diagnostic_results(
+    results: Iterable[SlackbotDiagnosticResult],
+    *,
+    title: str = "Slackbot diagnostics",
+) -> str:
+    lines = [f"*{title}*"]
+    for result in results:
+        lines.append(
+            f"- {result.status} {result.label}: {result.detail}"
+        )
+    return "\n".join(lines)
 
 
 def query_status(
@@ -1296,8 +1717,18 @@ def query_status(
         "mcp_server_url": config.mcp_server_url or "",
         "team_config_path": config.team_config_path or "",
         "user_config_dir": config.paths.user_config_dir,
+        "trust_path": config.paths.trust_path,
+        "audit_path": config.paths.audit_path,
         "bot_token": mask_secret(config.bot_token),
         "app_token": mask_secret(config.app_token),
+        "admin_user_ids": list(config.admin_user_ids),
+        "allowed_dm_user_ids": list(config.allowed_dm_user_ids),
+        "allowed_user_ids": list(config.allowed_user_ids),
+        "allowed_channel_ids": list(config.allowed_channel_ids),
+        "trusted_channel_ids": read_slackbot_trust(config.paths)[
+            "trusted_channel_ids"
+        ],
+        "effective_codex_policy": effective_codex_policy(config),
     }
     if config.bot_token:
         try:
@@ -1995,12 +2426,21 @@ def sort_slack_messages(
     return sorted(messages, key=_slack_ts_sort_key)
 
 
-def render_thread_transcript(messages: list[dict[str, Any]]) -> str:
+def render_thread_transcript(
+    messages: list[dict[str, Any]],
+    *,
+    user_name_resolver: Callable[[str], str] | None = None,
+    text_resolver: Callable[[str], str] | None = None,
+) -> str:
     lines = []
     for message in messages:
         user = message.get("user") or message.get("username") or "unknown"
+        if user_name_resolver and user != "unknown":
+            user = user_name_resolver(str(user))
         ts = message.get("ts") or ""
         text = message.get("text") or ""
+        if text_resolver:
+            text = text_resolver(str(text))
         lines.append(f"[{ts}] {user}: {text}")
     return "\n".join(lines)
 
@@ -3805,6 +4245,7 @@ class SlackSocketBot:
         self.bot_user_id: str | None = None
         self.team_name: str | None = None
         self.team_domain: str | None = config.slack_domain
+        self.user_name_cache: dict[str, str] = {}
         if (
             config.allowed_channel_ids
             and not config.allowed_dm_user_ids
@@ -4333,6 +4774,8 @@ class SlackSocketBot:
             route,
         ):
             return
+        if self._maybe_handle_control_command(text, route, slack_user_id):
+            return
         if self._maybe_handle_agent_tmux(text, route):
             return
         self._run_codex_for_route(
@@ -4384,6 +4827,12 @@ class SlackSocketBot:
             self._post_unauthorized(route)
             return
         if self._maybe_handle_static_response(text, route):
+            return
+        if self._maybe_handle_control_command(
+            text,
+            route,
+            str(payload.get("user_id") or "").strip() or None,
+        ):
             return
         if not text:
             return
@@ -4509,6 +4958,9 @@ class SlackSocketBot:
     def _allows_early_dm_response(self, user_id: str | None) -> bool:
         return self._is_authorized(user_id, None, channel_type="im")
 
+    def _is_admin(self, user_id: str | None) -> bool:
+        return is_slackbot_admin(self.config, user_id)
+
     def _trusted_user_config_channel_type(
         self,
         user_id: str | None,
@@ -4543,6 +4995,217 @@ class SlackSocketBot:
         post_slack_message(self.config, route, response)
         return True
 
+    def _maybe_handle_control_command(
+        self,
+        text: str,
+        route: SlackbotRoute,
+        user_id: str | None,
+    ) -> bool:
+        tokens = text.strip().split()
+        if not tokens:
+            return False
+        command = tokens[0].casefold()
+        if command not in {
+            "!help",
+            "help",
+            "!config",
+            "policy",
+            "status",
+            "!policy",
+            "!status",
+            "!diag",
+            "diag",
+            "diagnostics",
+            "!diagnostics",
+            "!allow-channel",
+            "allow-channel",
+            "trust-channel",
+            "!revoke-channel",
+            "revoke-channel",
+            "untrust-channel",
+            "!trust",
+            "trust",
+        }:
+            return False
+        channel_type = "im" if route.dm_user_id else None
+        if not self._is_authorized(
+            user_id,
+            route.channel_id,
+            channel_type=channel_type,
+        ):
+            self._post_unauthorized(route)
+            return True
+        if command in {"!help", "help"}:
+            post_slack_message(
+                self.config,
+                route,
+                (
+                    "Available bot controls: `!config`, `policy`, `!diag`, "
+                    "`trust`, `!allow-channel`, `!revoke-channel`. "
+                    "Use `config` without `!` to open your user config modal."
+                ),
+            )
+            return True
+        if command in {"!config", "policy", "status", "!policy", "!status"}:
+            post_slack_message(
+                self.config,
+                route,
+                render_effective_codex_policy(self.config),
+            )
+            return True
+        if command in {"!diag", "diag", "diagnostics", "!diagnostics"}:
+            self._handle_diagnostics_command(route, user_id)
+            return True
+        if command in {"!trust", "trust"}:
+            self._handle_trust_status_command(route, user_id)
+            return True
+        if command in {"!allow-channel", "allow-channel", "trust-channel"}:
+            channel = tokens[1] if len(tokens) > 1 else route.channel_id
+            self._handle_channel_trust_command(
+                route,
+                user_id,
+                channel,
+                trusted=True,
+            )
+            return True
+        if command in {
+            "!revoke-channel",
+            "revoke-channel",
+            "untrust-channel",
+        }:
+            channel = tokens[1] if len(tokens) > 1 else route.channel_id
+            self._handle_channel_trust_command(
+                route,
+                user_id,
+                channel,
+                trusted=False,
+            )
+            return True
+        return False
+
+    def _handle_diagnostics_command(
+        self,
+        route: SlackbotRoute,
+        user_id: str | None,
+    ) -> None:
+        if not self._is_admin(user_id):
+            post_slack_message(
+                self.config,
+                route,
+                "Only a Slackbot admin can run diagnostics.",
+            )
+            return
+        append_slackbot_audit_event(
+            self.config,
+            {
+                "kind": "slackbot_control",
+                "command": "diag",
+                "route": route_to_dict(route),
+                "slack_user_id": user_id,
+            },
+        )
+        detail = render_diagnostic_results(
+            run_slackbot_diagnostics(self.config),
+            title=f"{self.config.profile.app_slug} diagnostics",
+        )
+        if route.dm_user_id or not user_id:
+            post_slack_message(self.config, route, detail)
+            return
+        dm_sent = False
+        try:
+            post_slack_message(
+                self.config,
+                SlackbotRoute(dm_user_id=user_id),
+                detail,
+            )
+            dm_sent = True
+        except Exception as exc:
+            emit(self.out, f"Failed to DM Slackbot diagnostics: {exc}")
+        public_text = (
+            "I sent diagnostics to the requester in DM."
+            if dm_sent
+            else "I could not send the diagnostics DM."
+        )
+        post_slack_message(self.config, route, public_text)
+
+    def _handle_trust_status_command(
+        self,
+        route: SlackbotRoute,
+        user_id: str | None,
+    ) -> None:
+        if not self._is_admin(user_id):
+            post_slack_message(
+                self.config,
+                route,
+                "Only a Slackbot admin can inspect runtime trust.",
+            )
+            return
+        trust = read_slackbot_trust(self.config.paths)
+        channels = trust["trusted_channel_ids"]
+        users = trust["trusted_user_ids"]
+        channel_text = (
+            ", ".join(f"`{item}`" for item in channels) or "`(none)`"
+        )
+        user_text = ", ".join(f"`{item}`" for item in users) or "`(none)`"
+        post_slack_message(
+            self.config,
+            route,
+            (
+                "*Runtime trust*\n"
+                f"- channels: {channel_text}\n"
+                f"- users: {user_text}"
+            ),
+        )
+
+    def _handle_channel_trust_command(
+        self,
+        route: SlackbotRoute,
+        user_id: str | None,
+        channel_id: str | None,
+        *,
+        trusted: bool,
+    ) -> None:
+        if not self._is_admin(user_id):
+            post_slack_message(
+                self.config,
+                route,
+                "Only a Slackbot admin can change channel trust.",
+            )
+            return
+        if not channel_id:
+            post_slack_message(
+                self.config,
+                route,
+                "No channel ID was available for this request.",
+            )
+            return
+        if trusted:
+            changed = trust_slack_channel(self.config.paths, channel_id)
+            state = "trusted" if changed else "already trusted"
+            command = "allow-channel"
+        else:
+            changed = untrust_slack_channel(self.config.paths, channel_id)
+            state = (
+                "no longer trusted" if changed else "not currently trusted"
+            )
+            command = "revoke-channel"
+        append_slackbot_audit_event(
+            self.config,
+            {
+                "kind": "slackbot_control",
+                "command": command,
+                "channel_id": channel_id,
+                "route": route_to_dict(route),
+                "slack_user_id": user_id,
+                "changed": changed,
+            },
+        )
+        post_slack_message(
+            self.config,
+            route,
+            f"Channel `{channel_id}` is {state}.",
+        )
+
     def _slack_context_for_event(
         self,
         event: dict[str, Any],
@@ -4575,7 +5238,15 @@ class SlackSocketBot:
             return f"Slack context unavailable: {exc}"
         if not messages:
             return None
-        return render_thread_transcript(messages)
+        return render_thread_transcript(
+            messages,
+            text_resolver=lambda value: resolve_slack_mentions(
+                self.config,
+                value,
+                bot_user_id=self.bot_user_id,
+                cache=self.user_name_cache,
+            ),
+        )
 
     def _default_execution_mode(self) -> str:
         return normalize_execution_mode(
@@ -4640,6 +5311,13 @@ class SlackSocketBot:
         *,
         channel_type: str | None = None,
     ) -> bool:
+        if self._is_admin(user_id):
+            return True
+        trust = read_slackbot_trust(self.config.paths)
+        if user_id and user_id in trust["trusted_user_ids"]:
+            return True
+        if channel_id and channel_id in trust["trusted_channel_ids"]:
+            return True
         allowed_dm_users = self.config.allowed_dm_user_ids
         allowed_users = self.config.allowed_user_ids
         allowed_channels = self.config.allowed_channel_ids
@@ -4844,6 +5522,7 @@ class SlackSocketBot:
             if dm_user_id != route.dm_user_id:
                 route = replace(route, dm_user_id=dm_user_id)
         should_run_codex = reply_body is None
+        audit_run_id = uuid.uuid4().hex
         placeholder = None
         placeholder_ts = None
         placeholder_channel = None
@@ -4891,6 +5570,25 @@ class SlackSocketBot:
             if should_run_codex
             else None
         )
+        if should_run_codex:
+            append_slackbot_audit_event(
+                self.config,
+                {
+                    "kind": "codex_invocation",
+                    "status": "started",
+                    "run_id": audit_run_id,
+                    "route": route_to_dict(route),
+                    "slack_user_id": slack_user_id,
+                    "execution_mode": execution_mode,
+                    "project": project,
+                    "session": session,
+                    "conversation_key": conversation_key,
+                    "prompt_sha256": hashlib.sha256(
+                        prompt.encode("utf-8", errors="replace")
+                    ).hexdigest(),
+                    "policy": effective_codex_policy(self.config),
+                },
+            )
         try:
             lock_context = (
                 self._conversation_lock(conversation_key)
@@ -4947,12 +5645,34 @@ class SlackSocketBot:
                         or result["stdout"]
                     )
                     codex_returncode = result["returncode"]
+                    append_slackbot_audit_event(
+                        self.config,
+                        {
+                            "kind": "codex_invocation",
+                            "status": "finished",
+                            "run_id": audit_run_id,
+                            "returncode": codex_returncode,
+                            "session_id": result.get("session_id"),
+                            "conversation_key": conversation_key,
+                        },
+                    )
                     if result["returncode"]:
                         reply_body = (
                             f"Codex exited with {result['returncode']}.\n\n"
                             f"{reply_body}"
                         )
         except Exception as exc:
+            if should_run_codex:
+                append_slackbot_audit_event(
+                    self.config,
+                    {
+                        "kind": "codex_invocation",
+                        "status": "failed",
+                        "run_id": audit_run_id,
+                        "error": str(exc),
+                        "conversation_key": conversation_key,
+                    },
+                )
             if reply_body is None:
                 reply_body = (
                     f"I hit an internal error while talking to Codex: {exc}"
