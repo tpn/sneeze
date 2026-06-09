@@ -64,9 +64,6 @@ SLACK_APP_TOKEN_ENV = "SLACK_APP_TOKEN"
 SLACK_TEAM_DOMAIN_ENV = "SLACK_TEAM_DOMAIN"
 SLACK_APP_ID_ENV = "SLACK_APP_ID"
 SLACK_CLIENT_ID_ENV = "SLACK_CLIENT_ID"
-SLACK_FORM_POST_METHODS = {
-    "conversations.replies",
-}
 
 CODEX_MODE_VALUES = (
     "danger-full-access",
@@ -1442,23 +1439,20 @@ def slack_api_post(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     url = f"https://slack.com/api/{method}"
-    if method in SLACK_FORM_POST_METHODS:
-        data = urllib.parse.urlencode(
-            {
-                key: _slack_form_value(value)
-                for key, value in payload.items()
-            }
-        ).encode("utf-8")
-        content_type = "application/x-www-form-urlencoded; charset=utf-8"
-    else:
-        data = json.dumps(payload).encode("utf-8")
-        content_type = "application/json; charset=utf-8"
+    data = urllib.parse.urlencode(
+        {
+            key: _slack_form_value(value)
+            for key, value in payload.items()
+        }
+    ).encode("utf-8")
     request = urllib.request.Request(
         url,
         data=data,
         headers={
             "Authorization": f"Bearer {token}",
-            "Content-Type": content_type,
+            "Content-Type": (
+                "application/x-www-form-urlencoded; charset=utf-8"
+            ),
         },
         method="POST",
     )
@@ -1514,6 +1508,27 @@ def _slack_form_value(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value)
     return str(value)
+
+
+def slack_api_post_with_auto_join(
+    config: SlackbotConfig,
+    method: str,
+    channel_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if not config.bot_token:
+        raise SlackbotError("Slack bot token is missing")
+    try:
+        return slack_api_post(config.bot_token, method, payload)
+    except SlackApiError as exc:
+        if exc.error != "not_in_channel":
+            raise
+        slack_api_post(
+            config.bot_token,
+            "conversations.join",
+            {"channel": channel_id},
+        )
+        return slack_api_post(config.bot_token, method, payload)
 
 
 def slack_response_url_post(
@@ -1764,8 +1779,38 @@ def read_slack_thread(
     config: SlackbotConfig,
     permalink: str,
 ) -> list[dict[str, Any]]:
-    channel_id, thread_ts = parse_slack_thread_permalink(permalink)
+    channel_id, message_ts = parse_slack_thread_permalink(permalink)
+    thread_ts = resolve_slack_thread_ts(config, channel_id, message_ts)
     return read_slack_thread_by_channel(config, channel_id, thread_ts)
+
+
+def resolve_slack_thread_ts(
+    config: SlackbotConfig,
+    channel_id: str,
+    message_ts: str,
+) -> str:
+    messages = read_slack_history(
+        config,
+        channel_id,
+        latest=message_ts,
+        oldest=message_ts,
+        limit=1,
+    )
+    if not messages:
+        response = slack_api_post_with_auto_join(
+            config,
+            "conversations.replies",
+            channel_id,
+            {"channel": channel_id, "ts": message_ts, "limit": 1},
+        )
+        messages = sort_slack_messages(response.get("messages") or [])
+    if not messages:
+        raise SlackbotError("Slack message did not resolve to a thread")
+    message = messages[0]
+    thread_ts = str(message.get("thread_ts") or message.get("ts") or "")
+    if not thread_ts:
+        raise SlackbotError("Slack message did not include a thread ts")
+    return thread_ts
 
 
 def read_slack_thread_by_channel(
@@ -1781,9 +1826,10 @@ def read_slack_thread_by_channel(
         payload = {"channel": channel_id, "ts": thread_ts, "limit": 200}
         if cursor:
             payload["cursor"] = cursor
-        response = slack_api_post(
-            config.bot_token,
+        response = slack_api_post_with_auto_join(
+            config,
             "conversations.replies",
+            channel_id,
             payload,
         )
         messages.extend(response.get("messages") or [])
@@ -1799,6 +1845,7 @@ def read_slack_history(
     channel_id: str,
     *,
     latest: str | None = None,
+    oldest: str | None = None,
     limit: int = 10,
     inclusive: bool = True,
 ) -> list[dict[str, Any]]:
@@ -1808,9 +1855,13 @@ def read_slack_history(
     if latest:
         payload["latest"] = latest
         payload["inclusive"] = inclusive
-    response = slack_api_post(
-        config.bot_token,
+    if oldest:
+        payload["oldest"] = oldest
+        payload["inclusive"] = inclusive
+    response = slack_api_post_with_auto_join(
+        config,
         "conversations.history",
+        channel_id,
         payload,
     )
     return sort_slack_messages(response.get("messages") or [])
