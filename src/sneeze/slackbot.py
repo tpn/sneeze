@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -96,6 +97,8 @@ CHILD_ENV_PASSTHROUGH = {
 CODEX_SESSION_EVENT_TYPES = ("session_meta", "session_created")
 WORK_QUEUE_DEPTH_PER_WORKER = 4
 USER_CONFIG_DISPATCH_LIMIT = 4
+AGENT_TMUX_CAPTURE_DEFAULT_LINES = 80
+AGENT_TMUX_CAPTURE_MAX_LINES = 200
 USER_CONFIG_MODAL_CALLBACK_ID = "sneeze_user_config"
 USER_CONFIG_OPEN_ACTION_ID = "sneeze_open_user_config"
 USER_CONFIG_CODEX_BLOCK_ID = "codex_enabled"
@@ -271,6 +274,9 @@ class SlackbotProfile:
     default_service_restart_sec: int = 10
     default_systemd_wants: tuple[str, ...] = ()
     default_systemd_after: tuple[str, ...] = ()
+    default_execution_mode: str = "raw"
+    default_codex_tmux_socket: str | None = None
+    default_codex_tmux_conf: str | None = None
 
     @property
     def normalized_env_prefix(self) -> str:
@@ -330,6 +336,7 @@ class SlackbotConfig:
     codex_profile: str | None = None
     codex_workdir: str = ""
     codex_extra_args: tuple[str, ...] = ()
+    execution_mode: str = "raw"
     allowed_dm_user_ids: tuple[str, ...] = ()
     allowed_user_ids: tuple[str, ...] = ()
     allowed_channel_ids: tuple[str, ...] = ()
@@ -810,6 +817,8 @@ def prefixed_env_keys(profile: SlackbotProfile) -> OrderedDict[str, str]:
         "SLACKBOT_CODEX_PROFILE",
         "SLACKBOT_CODEX_EXTRA_ARGS",
         "SLACKBOT_EXECUTION_MODE",
+        "CODEX_TMUX_CONF",
+        "CODEX_TMUX_SOCKET",
         "SLACKBOT_ALLOWED_DM_USER_IDS",
         "SLACKBOT_ALLOWED_USER_IDS",
         "SLACKBOT_ALLOWED_CHANNEL_IDS",
@@ -883,6 +892,9 @@ def managed_env_values(
     codex_profile: str | None = None,
     codex_workdir: str | None = None,
     codex_extra_args: str | None = None,
+    execution_mode: str | None = None,
+    codex_tmux_conf: str | None = None,
+    codex_tmux_socket: str | None = None,
     worker_count: int | None = None,
     mcp_server_url: str | None = None,
     team_config_path: str | None = None,
@@ -968,8 +980,28 @@ def managed_env_values(
         )
     ).strip()
     values[keys["SLACKBOT_EXECUTION_MODE"]] = normalize_execution_mode(
-        current_value("SLACKBOT_EXECUTION_MODE", "raw")
+        execution_mode
+        or current_value(
+            "SLACKBOT_EXECUTION_MODE",
+            profile.default_execution_mode,
+        )
     )
+    values[keys["CODEX_TMUX_CONF"]] = (
+        codex_tmux_conf
+        or current_value(
+            "CODEX_TMUX_CONF",
+            profile.default_codex_tmux_conf,
+            allow_empty=True,
+        )
+    ).strip()
+    values[keys["CODEX_TMUX_SOCKET"]] = (
+        codex_tmux_socket
+        or current_value(
+            "CODEX_TMUX_SOCKET",
+            profile.default_codex_tmux_socket,
+            allow_empty=True,
+        )
+    ).strip()
     values[keys["SLACKBOT_ALLOWED_DM_USER_IDS"]] = current_value(
         "SLACKBOT_ALLOWED_DM_USER_IDS",
         render_csv(profile.default_allowed_dm_user_ids),
@@ -1044,6 +1076,9 @@ def scaffold_runtime(
     codex_profile: str | None = None,
     codex_workdir: str | None = None,
     codex_extra_args: str | None = None,
+    execution_mode: str | None = None,
+    codex_tmux_conf: str | None = None,
+    codex_tmux_socket: str | None = None,
     worker_count: int | None = None,
     mcp_server_url: str | None = None,
     team_config_path: str | None = None,
@@ -1088,6 +1123,9 @@ def scaffold_runtime(
         codex_profile=codex_profile,
         codex_workdir=codex_workdir,
         codex_extra_args=codex_extra_args,
+        execution_mode=execution_mode,
+        codex_tmux_conf=codex_tmux_conf,
+        codex_tmux_socket=codex_tmux_socket,
         worker_count=worker_count,
         mcp_server_url=mcp_server_url,
         team_config_path=team_config_path,
@@ -1288,6 +1326,14 @@ def load_config(
                 " ".join(profile.default_codex_extra_args),
             )
         ),
+        execution_mode=normalize_execution_mode(
+            env_lookup(
+                profile,
+                env,
+                "SLACKBOT_EXECUTION_MODE",
+                profile.default_execution_mode,
+            )
+        ),
         allowed_dm_user_ids=allowed_dm_user_ids,
         allowed_user_ids=allowed_user_ids,
         allowed_channel_ids=allowed_channel_ids,
@@ -1475,12 +1521,15 @@ def resolve_slack_mentions(
 
 def effective_codex_policy(config: SlackbotConfig) -> dict[str, Any]:
     return {
+        "execution_mode": config.execution_mode,
         "codex_bin": config.codex_bin,
         "codex_mode": config.codex_mode,
         "codex_model": config.codex_model or "",
         "codex_profile": config.codex_profile or "",
         "codex_workdir": config.codex_workdir,
         "codex_extra_args": list(config.codex_extra_args),
+        "codex_tmux_socket": codex_tmux_socket(config),
+        "codex_tmux_conf": codex_tmux_conf(config) or "",
         "mcp_server_url": config.mcp_server_url or "",
         "team_config_path": config.team_config_path or "",
         "danger_full_access": config.codex_mode == "danger-full-access",
@@ -1494,6 +1543,7 @@ def render_effective_codex_policy(config: SlackbotConfig) -> str:
     policy = effective_codex_policy(config)
     lines = [
         f"*{config.profile.app_slug} effective Codex policy*",
+        f"- execution: `{policy['execution_mode']}`",
         f"- mode: `{policy['codex_mode']}`",
         f"- workdir: `{policy['codex_workdir']}`",
         f"- bin: `{policy['codex_bin']}`",
@@ -1509,6 +1559,11 @@ def render_effective_codex_policy(config: SlackbotConfig) -> str:
         ),
         f"- MCP URL: `{policy['mcp_server_url'] or '(none)'}`",
     ]
+    if policy["execution_mode"] == "tmux":
+        lines.append(f"- tmux socket: `{policy['codex_tmux_socket']}`")
+        lines.append(
+            f"- tmux config: `{policy['codex_tmux_conf'] or '(default)'}`"
+        )
     if policy["danger_full_access"]:
         lines.append(
             "- note: this bot is currently running Codex with yolo-style "
@@ -1713,6 +1768,9 @@ def query_status(
         "codex_bin": config.codex_bin,
         "codex_mode": config.codex_mode,
         "codex_workdir": config.codex_workdir,
+        "execution_mode": config.execution_mode,
+        "codex_tmux_socket": codex_tmux_socket(config),
+        "codex_tmux_conf": codex_tmux_conf(config) or "",
         "worker_count": config.worker_count,
         "mcp_server_url": config.mcp_server_url or "",
         "team_config_path": config.team_config_path or "",
@@ -3974,7 +4032,9 @@ class CodexRunner:
         )
         write_text(script_path, script, mode=0o700)
         tmux_bin = codex_tmux_bin(self.config)
+        tmux_command = codex_tmux_command(self.config, tmux_bin=tmux_bin)
         tmux_socket = codex_tmux_socket(self.config)
+        tmux_conf = codex_tmux_conf(self.config)
         _record_agent_tmux_job(
             self.config,
             run_id,
@@ -3983,21 +4043,29 @@ class CodexRunner:
                 "status": "running",
                 "tmux_session": tmux_session,
                 "tmux_socket": tmux_socket,
+                "tmux_conf": tmux_conf,
                 "run_dir": str(run_dir),
                 "route": route_to_dict(route) if route else None,
                 "project": project,
                 "created_at": utcnow_iso(),
             },
         )
+        if tmux_conf:
+            subprocess.run(
+                [*tmux_command, "source-file", tmux_conf],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
         start = subprocess.run(
             [
-                tmux_bin,
-                "-L",
-                tmux_socket,
+                *tmux_command,
                 "new-session",
                 "-d",
                 "-s",
                 tmux_session,
+                "-c",
+                self.config.codex_workdir,
                 str(script_path),
             ],
             check=False,
@@ -4033,6 +4101,7 @@ class CodexRunner:
                 "session_id": extract_codex_session_id(stdout),
                 "tmux_session": tmux_session,
                 "tmux_socket": tmux_socket,
+                "tmux_conf": tmux_conf,
                 "run_dir": str(run_dir),
             }
             _record_agent_tmux_job(
@@ -4074,7 +4143,167 @@ def codex_tmux_socket(config: SlackbotConfig) -> str:
     return (
         env_lookup(config.profile, config.env, "CODEX_TMUX_SOCKET")
         or env_lookup(config.profile, config.env, "CONSOLE_TMUX_SOCKET")
+        or config.profile.default_codex_tmux_socket
         or DEFAULT_TMUX_SOCKET
+    )
+
+
+def codex_tmux_conf(config: SlackbotConfig) -> str | None:
+    value = (
+        env_lookup(config.profile, config.env, "CODEX_TMUX_CONF")
+        or config.profile.default_codex_tmux_conf
+    )
+    if not value:
+        return None
+    return str(Path(value).expanduser())
+
+
+def codex_tmux_command(
+    config: SlackbotConfig,
+    *,
+    tmux_bin: str | None = None,
+) -> list[str]:
+    command = [
+        tmux_bin or codex_tmux_bin(config),
+        "-L",
+        codex_tmux_socket(config),
+    ]
+    tmux_conf = codex_tmux_conf(config)
+    if tmux_conf:
+        command.extend(["-f", tmux_conf])
+    return command
+
+
+def agent_tmux_capture_line_count(value: str | int | None) -> int:
+    if value is None:
+        return AGENT_TMUX_CAPTURE_DEFAULT_LINES
+    try:
+        line_count = int(str(value).strip())
+    except ValueError as exc:
+        message = "tmux tail line count must be an integer"
+        raise SlackbotError(message) from exc
+    if line_count < 1:
+        raise SlackbotError("tmux tail line count must be positive")
+    return min(line_count, AGENT_TMUX_CAPTURE_MAX_LINES)
+
+
+def local_host_aliases() -> set[str]:
+    aliases = {"localhost", "127.0.0.1", "::1"}
+    for value in (
+        os.environ.get("HOST"),
+        os.environ.get("HOSTNAME"),
+        socket.gethostname(),
+        socket.getfqdn(),
+    ):
+        if not value:
+            continue
+        normalized = value.strip().lower()
+        if not normalized:
+            continue
+        aliases.add(normalized)
+        aliases.add(normalized.split(".", 1)[0])
+    return aliases
+
+
+def is_local_tmux_host(host: str | None) -> bool:
+    if not host:
+        return True
+    normalized = host.strip().lower()
+    return normalized in local_host_aliases()
+
+
+def tmux_command_for_binding(
+    config: SlackbotConfig,
+    binding: dict[str, Any],
+) -> tuple[list[str], str, str | None]:
+    tmux_socket = str(binding.get("tmux_socket") or codex_tmux_socket(config))
+    tmux_conf_value = binding.get("tmux_conf")
+    tmux_conf = (
+        str(tmux_conf_value) if tmux_conf_value else codex_tmux_conf(config)
+    )
+    command = [codex_tmux_bin(config), "-L", tmux_socket]
+    if tmux_conf:
+        command.extend(["-f", tmux_conf])
+    return command, tmux_socket, tmux_conf
+
+
+def capture_agent_tmux_thread(
+    config: SlackbotConfig,
+    *,
+    channel_id: str,
+    thread_ts: str,
+    line_count: str | int | None = None,
+) -> dict[str, Any]:
+    binding = query_agent_tmux_thread(
+        config.profile,
+        runtime_root=config.paths.runtime_root,
+        env_path=config.paths.env_path,
+        state_dir=config.paths.state_dir,
+        system_prompt_path=config.paths.system_prompt_path,
+        unit_name=config.paths.unit_name,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+    )
+    if not binding:
+        raise SlackbotError("No tmux session is bound to this Slack thread")
+    host = str(binding.get("host") or "")
+    if not is_local_tmux_host(host):
+        raise SlackbotError(
+            "This thread is bound to a tmux session on "
+            f"{host}, but this bot can only capture local tmux panes"
+        )
+    tmux_session = str(binding.get("tmux_session") or "")
+    if not tmux_session:
+        raise SlackbotError("The tmux binding is missing a session name")
+    lines = agent_tmux_capture_line_count(line_count)
+    tmux_command, tmux_socket, tmux_conf = tmux_command_for_binding(
+        config,
+        binding,
+    )
+    result = subprocess.run(
+        [
+            *tmux_command,
+            "capture-pane",
+            "-p",
+            "-t",
+            tmux_session,
+            "-S",
+            f"-{lines}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if detail:
+            detail = f": {detail}"
+        raise SlackbotError(
+            f"tmux capture failed for {tmux_session} on socket "
+            f"{tmux_socket}{detail}"
+        )
+    enriched_binding = dict(binding)
+    enriched_binding.setdefault("tmux_socket", tmux_socket)
+    if tmux_conf:
+        enriched_binding.setdefault("tmux_conf", tmux_conf)
+    return {
+        "binding": enriched_binding,
+        "line_count": lines,
+        "text": result.stdout.rstrip(),
+    }
+
+
+def render_agent_tmux_capture(result: dict[str, Any]) -> str:
+    binding = dict(result.get("binding") or {})
+    host = str(binding.get("host") or "localhost")
+    tmux_session = str(binding.get("tmux_session") or "(unknown)")
+    tmux_socket = str(binding.get("tmux_socket") or DEFAULT_TMUX_SOCKET)
+    line_count = int(result.get("line_count") or 0)
+    text = str(result.get("text") or "").rstrip() or "(pane is blank)"
+    return (
+        f"Last {line_count} lines from `{host}:{tmux_session}` "
+        f"on tmux socket `{tmux_socket}`:\n"
+        f"```text\n{text}\n```"
     )
 
 
@@ -5254,7 +5483,7 @@ class SlackSocketBot:
                 self.config.profile,
                 self.config.env,
                 "SLACKBOT_EXECUTION_MODE",
-                "raw",
+                self.config.execution_mode,
             )
         )
 
@@ -5781,7 +6010,11 @@ class SlackSocketBot:
         if len(tokens) < 2:
             return False
         command = tokens[1].lower()
-        if command == "use" and len(tokens) == 4:
+        if command == "use" and len(tokens) in (4, 5):
+            if len(tokens) == 5:
+                tmux_socket = tokens[4]
+            else:
+                tmux_socket = codex_tmux_socket(self.config)
             binding = bind_agent_tmux_thread(
                 self.config.profile,
                 runtime_root=self.config.paths.runtime_root,
@@ -5793,13 +6026,16 @@ class SlackSocketBot:
                 thread_ts=route.thread_ts,
                 host=tokens[2],
                 tmux_session=tokens[3],
+                tmux_socket=tmux_socket,
+                tmux_conf=codex_tmux_conf(self.config),
             )
             post_slack_message(
                 self.config,
                 route,
                 (
                     "Bound this thread to "
-                    f"{binding['host']}:{binding['tmux_session']}."
+                    f"{binding['host']}:{binding['tmux_session']} "
+                    f"on tmux socket `{binding['tmux_socket']}`."
                 ),
             )
             return True
@@ -5814,7 +6050,31 @@ class SlackSocketBot:
                 channel_id=route.channel_id,
                 thread_ts=route.thread_ts,
             )
-            body = json.dumps(binding or {}, indent=2, sort_keys=True)
+            if binding:
+                tmux_socket = str(
+                    binding.get("tmux_socket")
+                    or codex_tmux_socket(self.config)
+                )
+                body = (
+                    "Thread tmux binding: "
+                    f"`{binding.get('host')}:{binding.get('tmux_session')}` "
+                    f"on socket `{tmux_socket}`."
+                )
+            else:
+                body = "No tmux session is bound to this Slack thread."
+            post_slack_message(self.config, route, body)
+            return True
+        if command in ("tail", "capture", "pipe") and len(tokens) in (2, 3):
+            try:
+                result = capture_agent_tmux_thread(
+                    self.config,
+                    channel_id=route.channel_id,
+                    thread_ts=route.thread_ts,
+                    line_count=tokens[2] if len(tokens) == 3 else None,
+                )
+                body = render_agent_tmux_capture(result)
+            except SlackbotError as exc:
+                body = str(exc)
             post_slack_message(self.config, route, body)
             return True
         if command == "jobs" and len(tokens) == 2:
@@ -6096,6 +6356,7 @@ def run_slackbot(
     codex_profile: str | None = None,
     codex_workdir: str | None = None,
     codex_extra_args: str | None = None,
+    execution_mode: str | None = None,
     worker_count: int | None = None,
     mcp_server_url: str | None = None,
     team_config_path: str | None = None,
@@ -6138,6 +6399,8 @@ def run_slackbot(
         )
     if codex_extra_args is not None:
         overrides["codex_extra_args"] = parse_extra_args(codex_extra_args)
+    if execution_mode is not None:
+        overrides["execution_mode"] = normalize_execution_mode(execution_mode)
     if worker_count:
         overrides["worker_count"] = worker_count
     if overrides:
@@ -6154,6 +6417,8 @@ def bind_agent_tmux_thread(
     thread_ts: str,
     host: str,
     tmux_session: str,
+    tmux_socket: str | None = None,
+    tmux_conf: str | None = None,
     runtime_root: str | None = None,
     env_path: str | None = None,
     state_dir: str | None = None,
@@ -6178,6 +6443,10 @@ def bind_agent_tmux_thread(
             "tmux_session": tmux_session,
             "updated_at": utcnow_iso(),
         }
+        if tmux_socket:
+            data[key]["tmux_socket"] = tmux_socket
+        if tmux_conf:
+            data[key]["tmux_conf"] = tmux_conf
         write_json_atomic(paths.agent_tmux_bindings_path, data)
         return data[key]
 

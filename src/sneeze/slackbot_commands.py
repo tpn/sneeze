@@ -20,17 +20,20 @@ from .slackbot import (
     SlackbotProfile,
     SlackbotRoute,
     bind_agent_tmux_thread,
+    capture_agent_tmux_thread,
     enqueue_ingress,
     env_lookup,
     install_service,
     list_agent_tmux_jobs,
     list_schedules,
+    load_config,
     query_agent_tmux_thread,
     query_status,
     read_env_file,
     read_slack_thread,
     remove_schedule,
     remove_service,
+    render_agent_tmux_capture,
     render_thread_transcript,
     resolve_paths,
     run_schedule,
@@ -221,6 +224,14 @@ class SlackbotInitBase(ProfiledSlackbotCommand):
         _help = "Extra Codex CLI arguments."
         _mandatory = False
 
+    execution_mode = None
+    _execution_mode = None
+
+    class ExecutionModeArg(StringInvariant):
+        _arg = "--execution-mode"
+        _help = "Default execution mode: raw or tmux."
+        _mandatory = False
+
     worker_count = None
     _worker_count = None
 
@@ -262,6 +273,7 @@ class SlackbotInitBase(ProfiledSlackbotCommand):
             codex_extra_args=(
                 self._codex_extra_args or self.codex_extra_args
             ),
+            execution_mode=self._execution_mode or self.execution_mode,
             worker_count=self._worker_count or self.worker_count,
             mcp_server_url=self._mcp_server_url or self.mcp_server_url,
             team_config_path=(
@@ -455,6 +467,7 @@ class SlackbotDevBase(TmuxDevCommandMixin, SlackbotInitBase):
             codex_extra_args=(
                 self._codex_extra_args or self.codex_extra_args
             ),
+            execution_mode=self._execution_mode or self.execution_mode,
             worker_count=self._worker_count or self.worker_count,
             mcp_server_url=self._mcp_server_url or self.mcp_server_url,
             team_config_path=(
@@ -500,6 +513,7 @@ class SlackbotDevBase(TmuxDevCommandMixin, SlackbotInitBase):
                 "--codex-extra-args",
                 self._codex_extra_args or self.codex_extra_args,
             ),
+            ("--execution-mode", self._execution_mode or self.execution_mode),
             ("--worker-count", self._worker_count or self.worker_count),
             ("--mcp-server-url", self._mcp_server_url or self.mcp_server_url),
             (
@@ -538,6 +552,7 @@ class SlackbotDevBase(TmuxDevCommandMixin, SlackbotInitBase):
             codex_extra_args=(
                 self._codex_extra_args or self.codex_extra_args
             ),
+            execution_mode=self._execution_mode or self.execution_mode,
             worker_count=self._worker_count or self.worker_count,
             mcp_server_url=self._mcp_server_url or self.mcp_server_url,
             team_config_path=(
@@ -954,6 +969,22 @@ class SlackbotBindSessionBase(ProfiledSlackbotCommand):
         _help = "tmux session name."
         _mandatory = True
 
+    tmux_socket = None
+    _tmux_socket = None
+
+    class TmuxSocketArg(StringInvariant):
+        _arg = "--tmux-socket"
+        _help = "tmux socket name."
+        _mandatory = False
+
+    tmux_conf = None
+    _tmux_conf = None
+
+    class TmuxConfArg(StringInvariant):
+        _arg = "--tmux-conf"
+        _help = "tmux config path."
+        _mandatory = False
+
     def run(self):
         self._json(
             bind_agent_tmux_thread(
@@ -963,6 +994,8 @@ class SlackbotBindSessionBase(ProfiledSlackbotCommand):
                 thread_ts=self._thread_ts or self.thread_ts,
                 host=self._host or self.host,
                 tmux_session=self._tmux_session or self.tmux_session,
+                tmux_socket=self._tmux_socket or self.tmux_socket,
+                tmux_conf=self._tmux_conf or self.tmux_conf,
             )
         )
 
@@ -994,6 +1027,42 @@ class SlackbotThreadStatusBase(ProfiledSlackbotCommand):
             )
             or {}
         )
+
+
+class SlackbotThreadTailBase(ProfiledSlackbotCommand):
+    channel_id = None
+    _channel_id = None
+
+    class ChannelIdArg(StringInvariant):
+        _arg = "--channel-id"
+        _help = "Slack channel ID."
+        _mandatory = True
+
+    thread_ts = None
+    _thread_ts = None
+
+    class ThreadTsArg(StringInvariant):
+        _arg = "--thread-ts"
+        _help = "Slack thread timestamp."
+        _mandatory = True
+
+    lines = None
+    _lines = None
+
+    class LinesArg(PositiveIntegerInvariant):
+        _arg = "--lines"
+        _help = "Number of pane lines to capture."
+        _mandatory = False
+
+    def run(self):
+        config = load_config(self._profile(), **self._common())
+        result = capture_agent_tmux_thread(
+            config,
+            channel_id=self._channel_id or self.channel_id,
+            thread_ts=self._thread_ts or self.thread_ts,
+            line_count=self._lines or self.lines,
+        )
+        self._out(render_agent_tmux_capture(result))
 
 
 class SlackbotNurseJobsBase(ProfiledSlackbotCommand):
