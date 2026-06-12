@@ -194,6 +194,7 @@ def test_profile_execution_and_tmux_defaults_flow_into_config(tmp_path):
         default_execution_mode="tmux",
         default_codex_tmux_socket="codex",
         default_codex_tmux_conf=str(tmp_path / "codex.tmux.conf"),
+        default_codex_tmux_lifecycle="persistent",
     )
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
 
@@ -205,9 +206,12 @@ def test_profile_execution_and_tmux_defaults_flow_into_config(tmp_path):
     assert config.env["SAMPLE_CODEX_TMUX_CONF"] == str(
         tmp_path / "codex.tmux.conf"
     )
+    assert config.env["SAMPLE_CODEX_TMUX_LIFECYCLE"] == "persistent"
+    assert config.codex_tmux_lifecycle == "persistent"
     assert status["execution_mode"] == "tmux"
     assert status["codex_tmux_socket"] == "codex"
     assert status["codex_tmux_conf"] == str(tmp_path / "codex.tmux.conf")
+    assert status["codex_tmux_lifecycle"] == "persistent"
 
 
 def test_codex_runner_tmux_mode_records_job(tmp_path, monkeypatch):
@@ -220,6 +224,8 @@ def test_codex_runner_tmux_mode_records_job(tmp_path, monkeypatch):
     def fake_run(args, check, capture_output, text):
         calls.append(args)
         assert Path(args[0]).name == "tmux"
+        if "kill-session" in args:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         assert args[1:4] == ["-L", "kickle", "new-session"]
         run_dir = Path(args[-1]).parent
         (run_dir / "output.txt").write_text("done\n", encoding="utf-8")
@@ -245,11 +251,15 @@ def test_codex_runner_tmux_mode_records_job(tmp_path, monkeypatch):
     assert result["last_message"] == "done\n"
     assert result["session_id"] == "codex-1"
     assert result["tmux_session"].startswith("sample-codex-")
+    assert result["tmux_lifecycle"] == "ephemeral"
     assert job["status"] == "finished"
     assert job["tmux_socket"] == "kickle"
+    assert job["tmux_lifecycle"] == "ephemeral"
+    assert job["tmux_session_closed"] is True
     assert job["route"]["channel_id"] == "C123"
     assert job["project"] == "docs"
     assert not (Path(result["run_dir"]) / "run.sh").exists()
+    assert any("kill-session" in call for call in calls)
 
 
 def test_codex_runner_tmux_mode_uses_configured_tmux_conf(
@@ -270,6 +280,14 @@ def test_codex_runner_tmux_mode_uses_configured_tmux_conf(
         calls.append(args)
         if args[-2:] == ["source-file", str(tmp_path / "codex.tmux.conf")]:
             assert Path(args[0]).name == "tmux"
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "kill-session" in args:
+            assert args[1:5] == [
+                "-L",
+                "codex",
+                "-f",
+                str(tmp_path / "codex.tmux.conf"),
+            ]
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         assert Path(args[0]).name == "tmux"
         assert args[1:5] == [
@@ -300,7 +318,7 @@ def test_codex_runner_tmux_mode_uses_configured_tmux_conf(
 
     result = runner.run_tmux("prompt")
 
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert Path(calls[0][0]).name == "tmux"
     assert calls[0][1:] == [
         "-L",
@@ -312,6 +330,45 @@ def test_codex_runner_tmux_mode_uses_configured_tmux_conf(
     ]
     assert result["tmux_socket"] == "codex"
     assert result["tmux_conf"] == str(tmp_path / "codex.tmux.conf")
+    assert any("kill-session" in call for call in calls)
+
+
+def test_codex_runner_persistent_tmux_lifecycle_leaves_session(
+    tmp_path,
+    monkeypatch,
+):
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_lifecycle="persistent",
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    runner = CodexRunner(config)
+    calls = []
+
+    def fake_run(args, check, capture_output, text):
+        calls.append(args)
+        assert "kill-session" not in args
+        run_dir = Path(args[-1]).parent
+        (run_dir / "output.txt").write_text("done\n", encoding="utf-8")
+        (run_dir / "stdout.jsonl").write_text(
+            '{"type":"session_created","session_id":"codex-1"}\n',
+            encoding="utf-8",
+        )
+        (run_dir / "stderr.txt").write_text("", encoding="utf-8")
+        (run_dir / "status.txt").write_text("0\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
+
+    result = runner.run_tmux("prompt")
+    jobs = read_json(config.paths.agent_tmux_jobs_path, {})
+    job = next(iter(jobs.values()))
+
+    assert result["tmux_lifecycle"] == "persistent"
+    assert job["tmux_lifecycle"] == "persistent"
+    assert "tmux_session_closed" not in job
+    assert not any("kill-session" in call for call in calls)
 
 
 def wait_until(predicate, *, timeout_s=1.0):
@@ -1161,6 +1218,15 @@ def test_extract_codex_session_id_ignores_event_id():
     )
 
     assert extract_codex_session_id(jsonl) == "real-session-id"
+
+
+def test_extract_codex_session_id_reads_thread_started_event():
+    assert (
+        extract_codex_session_id(
+            '{"type":"thread.started","thread_id":"session-thread"}\n'
+        )
+        == "session-thread"
+    )
 
 
 def test_text_helpers_cover_mentions_and_chunk_boundary():
@@ -4436,6 +4502,62 @@ def test_dm_named_sessions_are_isolated_by_slack_user(
     )
 
 
+def test_stale_session_resume_retries_as_fresh_session(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bot = SlackSocketBot(load_config(profile))
+    bot.conversations.set(
+        "dm:D111:U111",
+        {"session_id": "stale-session", "updated_at": "now"},
+    )
+    session_ids = []
+
+    class FakeRunner:
+        def run(self, prompt, session_id=None, **kwargs):
+            session_ids.append(session_id)
+            if session_id == "stale-session":
+                return {
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": "session not found",
+                    "last_message": "",
+                    "session_id": None,
+                }
+            return {
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "last_message": "fresh reply",
+                "session_id": "fresh-session",
+            }
+
+    bot.runner = FakeRunner()
+    posts = []
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: posts.append(text)
+        or {"ts": "2.000001", "channel": "D111"},
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.update_slack_message",
+        lambda *args, **kwds: posts.append(kwds["text"]) or {"ok": True},
+    )
+
+    bot._run_codex_for_route(
+        "continue",
+        SlackbotRoute(channel_id="D111", dm_user_id="U111"),
+    )
+
+    assert session_ids == ["stale-session", None]
+    assert bot.conversations.get("dm:D111:U111")["session_id"] == (
+        "fresh-session"
+    )
+    assert posts[-1] == "fresh reply"
+
+
 def test_channel_thread_sessions_are_isolated_by_slack_user(
     tmp_path,
     monkeypatch,
@@ -5719,7 +5841,7 @@ def test_resolve_slack_mentions_uses_users_info(tmp_path, monkeypatch):
     assert calls == [("users.info", {"user": "U111"})]
 
 
-def test_agent_tmux_commands_require_tmux_prefix(tmp_path, monkeypatch):
+def test_agent_tmux_commands_accept_exact_aliases(tmp_path, monkeypatch):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
     bot = SlackSocketBot(load_config(profile))
@@ -5736,8 +5858,26 @@ def test_agent_tmux_commands_require_tmux_prefix(tmp_path, monkeypatch):
     )
 
     assert not bot._maybe_handle_agent_tmux("status of the PR", route)
+    assert bot._maybe_handle_agent_tmux("status", route)
     assert bot._maybe_handle_agent_tmux("tmux status", route)
-    assert calls
+    assert bot._maybe_handle_agent_tmux("u", route)
+    assert len(calls) == 3
+
+
+def test_agent_tmux_help_alias_posts_command_summary(tmp_path, monkeypatch):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bot = SlackSocketBot(load_config(profile))
+    route = SlackbotRoute(channel_id="C123", thread_ts="1.000001")
+    calls = []
+
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: calls.append(text),
+    )
+
+    assert bot._maybe_handle_agent_tmux("?", route)
+    assert "Tmux thread controls" in calls[0]
 
 
 def test_agent_tmux_tail_command_posts_pane_capture(tmp_path, monkeypatch):
@@ -5776,7 +5916,7 @@ def test_agent_tmux_tail_command_posts_pane_capture(tmp_path, monkeypatch):
         lambda config, route, text: posts.append(text),
     )
 
-    assert bot._maybe_handle_agent_tmux("tmux tail 3", route)
+    assert bot._maybe_handle_agent_tmux("tail 3", route)
 
     assert calls[0][-6:] == [
         "capture-pane",
