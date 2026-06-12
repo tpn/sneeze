@@ -27,6 +27,7 @@ from sneeze.slackbot import (
     append_slackbot_audit_event,
     bind_agent_tmux_thread,
     build_user_config_view,
+    capture_agent_tmux_thread,
     chunk_text,
     effective_codex_policy,
     enqueue_ingress,
@@ -187,6 +188,28 @@ def test_app_mention_uses_configured_default_execution_mode(
     assert calls[0]["execution_mode"] == "tmux"
 
 
+def test_profile_execution_and_tmux_defaults_flow_into_config(tmp_path):
+    profile = replace(
+        make_profile(tmp_path),
+        default_execution_mode="tmux",
+        default_codex_tmux_socket="codex",
+        default_codex_tmux_conf=str(tmp_path / "codex.tmux.conf"),
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+
+    config = load_config(profile)
+    status = query_status(profile)
+
+    assert config.execution_mode == "tmux"
+    assert config.env["SAMPLE_CODEX_TMUX_SOCKET"] == "codex"
+    assert config.env["SAMPLE_CODEX_TMUX_CONF"] == str(
+        tmp_path / "codex.tmux.conf"
+    )
+    assert status["execution_mode"] == "tmux"
+    assert status["codex_tmux_socket"] == "codex"
+    assert status["codex_tmux_conf"] == str(tmp_path / "codex.tmux.conf")
+
+
 def test_codex_runner_tmux_mode_records_job(tmp_path, monkeypatch):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
@@ -227,6 +250,68 @@ def test_codex_runner_tmux_mode_records_job(tmp_path, monkeypatch):
     assert job["route"]["channel_id"] == "C123"
     assert job["project"] == "docs"
     assert not (Path(result["run_dir"]) / "run.sh").exists()
+
+
+def test_codex_runner_tmux_mode_uses_configured_tmux_conf(
+    tmp_path,
+    monkeypatch,
+):
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+        default_codex_tmux_conf=str(tmp_path / "codex.tmux.conf"),
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    runner = CodexRunner(config)
+    calls = []
+
+    def fake_run(args, check, capture_output, text):
+        calls.append(args)
+        if args[-2:] == ["source-file", str(tmp_path / "codex.tmux.conf")]:
+            assert Path(args[0]).name == "tmux"
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        assert Path(args[0]).name == "tmux"
+        assert args[1:5] == [
+            "-L",
+            "codex",
+            "-f",
+            str(tmp_path / "codex.tmux.conf"),
+        ]
+        assert args[5:11] == [
+            "new-session",
+            "-d",
+            "-s",
+            args[8],
+            "-c",
+            str(tmp_path),
+        ]
+        run_dir = Path(args[-1]).parent
+        (run_dir / "output.txt").write_text("done\n", encoding="utf-8")
+        (run_dir / "stdout.jsonl").write_text(
+            '{"type":"session_created","session_id":"codex-1"}\n',
+            encoding="utf-8",
+        )
+        (run_dir / "stderr.txt").write_text("", encoding="utf-8")
+        (run_dir / "status.txt").write_text("0\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
+
+    result = runner.run_tmux("prompt")
+
+    assert len(calls) == 2
+    assert Path(calls[0][0]).name == "tmux"
+    assert calls[0][1:] == [
+        "-L",
+        "codex",
+        "-f",
+        str(tmp_path / "codex.tmux.conf"),
+        "source-file",
+        str(tmp_path / "codex.tmux.conf"),
+    ]
+    assert result["tmux_socket"] == "codex"
+    assert result["tmux_conf"] == str(tmp_path / "codex.tmux.conf")
 
 
 def wait_until(predicate, *, timeout_s=1.0):
@@ -276,7 +361,7 @@ def test_scaffold_runtime_does_not_chmod_existing_env_parent(tmp_path):
         default_env_path=str(env_parent / "sample.env"),
     )
 
-    scaffold_runtime(profile)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
 
     assert (env_parent.stat().st_mode & 0o777) == 0o755
 
@@ -1105,6 +1190,8 @@ def test_agent_tmux_binding_store(tmp_path):
         thread_ts="1.23",
         host="dgx",
         tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_conf=str(tmp_path / "codex.tmux.conf"),
     )
     binding = query_agent_tmux_thread(
         profile,
@@ -1114,6 +1201,62 @@ def test_agent_tmux_binding_store(tmp_path):
 
     assert binding["host"] == "dgx"
     assert binding["tmux_session"] == "codex-work"
+    assert binding["tmux_socket"] == "codex"
+    assert binding["tmux_conf"] == str(tmp_path / "codex.tmux.conf")
+
+
+def test_agent_tmux_capture_bound_thread(tmp_path, monkeypatch):
+    tmux_conf = tmp_path / "codex.tmux.conf"
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+        default_codex_tmux_conf=str(tmux_conf),
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="C123",
+        thread_ts="1.23",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_conf=str(tmux_conf),
+    )
+    config = load_config(profile)
+    calls = []
+
+    def fake_run(args, check, capture_output, text):
+        calls.append(args)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="alpha\nbeta\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
+
+    result = capture_agent_tmux_thread(
+        config,
+        channel_id="C123",
+        thread_ts="1.23",
+        line_count=5,
+    )
+
+    assert result["text"] == "alpha\nbeta"
+    assert result["line_count"] == 5
+    assert Path(calls[0][0]).name == "tmux"
+    assert calls[0][1:] == [
+        "-L",
+        "codex",
+        "-f",
+        str(tmux_conf),
+        "capture-pane",
+        "-p",
+        "-t",
+        "codex-work",
+        "-S",
+        "-5",
+    ]
 
 
 def test_systemd_service_has_no_source_project_leaks(tmp_path):
@@ -5597,6 +5740,56 @@ def test_agent_tmux_commands_require_tmux_prefix(tmp_path, monkeypatch):
     assert calls
 
 
+def test_agent_tmux_tail_command_posts_pane_capture(tmp_path, monkeypatch):
+    tmux_conf = tmp_path / "codex.tmux.conf"
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+        default_codex_tmux_conf=str(tmux_conf),
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="C123",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_conf=str(tmux_conf),
+    )
+    bot = SlackSocketBot(load_config(profile))
+    route = SlackbotRoute(channel_id="C123", thread_ts="1.000001")
+    posts = []
+    calls = []
+
+    def fake_run(args, check, capture_output, text):
+        calls.append(args)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="worker line one\nworker line two\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: posts.append(text),
+    )
+
+    assert bot._maybe_handle_agent_tmux("tmux tail 3", route)
+
+    assert calls[0][-6:] == [
+        "capture-pane",
+        "-p",
+        "-t",
+        "codex-work",
+        "-S",
+        "-3",
+    ]
+    assert "Last 3 lines" in posts[0]
+    assert "worker line two" in posts[0]
+
+
 def test_user_config_trigger_words_require_exact_message():
     assert user_config_mode_from_text("setup") == "bootstrap"
     assert user_config_mode_from_text("config") == "config"
@@ -6071,6 +6264,7 @@ def test_run_slackbot_applies_runtime_overrides(tmp_path, monkeypatch):
         codex_profile="dev",
         codex_workdir=str(workdir),
         codex_extra_args="--approval-mode never",
+        execution_mode="tmux",
         worker_count=7,
         mcp_server_url="http://127.0.0.1:8765/mcp",
         team_config_path=str(team_config_path),
@@ -6089,6 +6283,7 @@ def test_run_slackbot_applies_runtime_overrides(tmp_path, monkeypatch):
     assert config.codex_profile == "dev"
     assert config.codex_workdir == str(workdir.resolve())
     assert config.codex_extra_args == ("--approval-mode", "never")
+    assert config.execution_mode == "tmux"
     assert config.worker_count == 7
     assert config.mcp_server_url == "http://127.0.0.1:8765/mcp"
     assert config.team_config_path == str(team_config_path)
