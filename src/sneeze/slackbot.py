@@ -104,6 +104,11 @@ WORK_QUEUE_DEPTH_PER_WORKER = 4
 USER_CONFIG_DISPATCH_LIMIT = 4
 AGENT_TMUX_CAPTURE_DEFAULT_LINES = 80
 AGENT_TMUX_CAPTURE_MAX_LINES = 200
+AGENT_TMUX_WATCH_STATES = ("awaiting_start", "need_nudge", "watching")
+AGENT_TMUX_POLL_SECONDS = 15.0
+AGENT_TMUX_PROGRESS_SECONDS = 60.0
+AGENT_TMUX_PROGRESS_LINES = 80
+AGENT_TMUX_STATUS_EXCERPT_CHARS = 1800
 USER_CONFIG_MODAL_CALLBACK_ID = "sneeze_user_config"
 USER_CONFIG_OPEN_ACTION_ID = "sneeze_open_user_config"
 USER_CONFIG_CODEX_BLOCK_ID = "codex_enabled"
@@ -139,8 +144,8 @@ SLACKBOT_CODEX_TRANSPORT_INSTRUCTIONS = """Slack transport:
   the current route. Return the exact reply text as your final answer.
 - For public channels and public threads, keep the final reply concise and
   outcome-focused. Do not paste long logs, shell transcripts, stack traces, or
-  unrestricted-session instructions unless the user explicitly asks for them in
-  public.
+  unrestricted-session instructions unless the user explicitly asks for them
+  in public.
 - Slack context from the current channel, DM, or thread may be included in
   this prompt. Use it when the user refers to "above", "this thread", or prior
   Slack messages. If needed Slack context is missing, say exactly what is
@@ -1605,9 +1610,7 @@ def render_effective_codex_policy(config: SlackbotConfig) -> str:
         lines.append(
             f"- tmux config: `{policy['codex_tmux_conf'] or '(default)'}`"
         )
-        lines.append(
-            f"- tmux lifecycle: `{policy['codex_tmux_lifecycle']}`"
-        )
+        lines.append(f"- tmux lifecycle: `{policy['codex_tmux_lifecycle']}`")
     if policy["danger_full_access"]:
         lines.append(
             "- note: this bot is currently running Codex with yolo-style "
@@ -1776,9 +1779,7 @@ def render_diagnostic_results(
 ) -> str:
     lines = [f"*{title}*"]
     for result in results:
-        lines.append(
-            f"- {result.status} {result.label}: {result.detail}"
-        )
+        lines.append(f"- {result.status} {result.label}: {result.detail}")
     return "\n".join(lines)
 
 
@@ -1990,10 +1991,7 @@ def slack_api_post(
 ) -> dict[str, Any]:
     url = f"https://slack.com/api/{method}"
     data = urllib.parse.urlencode(
-        {
-            key: _slack_form_value(value)
-            for key, value in payload.items()
-        }
+        {key: _slack_form_value(value) for key, value in payload.items()}
     ).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -2226,8 +2224,7 @@ def _render_slack_mrkdwn_value(value: Any) -> Any:
     if not isinstance(value, dict):
         return value
     rendered = {
-        key: _render_slack_mrkdwn_value(item)
-        for key, item in value.items()
+        key: _render_slack_mrkdwn_value(item) for key, item in value.items()
     }
     if rendered.get("type") == "mrkdwn" and isinstance(
         rendered.get("text"),
@@ -4288,6 +4285,208 @@ def tmux_command_for_binding(
     return command, tmux_socket, tmux_conf
 
 
+@dataclass(frozen=True)
+class AgentTmuxState:
+    binding: dict[str, Any]
+    pane_cwd: str | None
+    pane_text: str
+    pane_excerpt: str
+    prompt_line: str | None
+    status_line: str | None
+    context_remaining_percent: int | None
+    working: bool
+    codex_session_id: str | None = None
+    codex_session_path: str | None = None
+    codex_last_user_message: str | None = None
+    codex_last_assistant_message: str | None = None
+    sampled_at: str = ""
+
+
+def agent_tmux_thread_key(channel_id: str, thread_ts: str) -> str:
+    return f"{channel_id}:{thread_ts}"
+
+
+def _clean_agent_tmux_text(text: str) -> str:
+    lines = [
+        line.rstrip() for line in text.replace("\r\n", "\n").splitlines()
+    ]
+    return "\n".join(lines).strip()
+
+
+def _agent_tmux_excerpt(text: str, *, lines: int) -> str:
+    normalized = _clean_agent_tmux_text(text)
+    if not normalized:
+        return ""
+    return "\n".join(normalized.splitlines()[-lines:])
+
+
+def _agent_tmux_fingerprint(*parts: str | None) -> str:
+    joined = "\n".join(part or "" for part in parts)
+    return hashlib.sha1(joined.encode("utf-8")).hexdigest()
+
+
+def _agent_tmux_context_remaining_percent(text: str) -> int | None:
+    match = re.search(r"(\d{1,3})%\s+left", text)
+    if not match:
+        return None
+    try:
+        value = int(match.group(1))
+    except ValueError:
+        return None
+    return value if 0 <= value <= 100 else None
+
+
+def _agent_tmux_prompt_line(text: str) -> str | None:
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith(("›", ">", "$")):
+            return stripped
+    return None
+
+
+def _agent_tmux_prompt_input(prompt_line: str | None) -> str | None:
+    if not prompt_line:
+        return None
+    stripped = prompt_line.strip()
+    if stripped.startswith(("›", ">", "$")):
+        stripped = stripped[1:].strip()
+    return stripped or None
+
+
+def _agent_tmux_is_working(text: str) -> bool:
+    patterns = (
+        r"\bWorking\s*\(",
+        r"\bStill working\b",
+        r"\bpress esc to interrupt\b",
+    )
+    return any(
+        re.search(pattern, text, re.IGNORECASE) for pattern in patterns
+    )
+
+
+def _agent_tmux_next_continuation_point(text: str | None) -> str | None:
+    if not text:
+        return None
+    patterns = (
+        r"Best next continuation point:\s*(.+)",
+        r"Clean next continuation point:\s*(.+)",
+        r"Next continuation point:\s*(.+)",
+        r"Next step:\s*(.+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.S)
+        if not match:
+            continue
+        clause = match.group(1).strip().splitlines()[0].strip()
+        clause = clause.strip("` ").rstrip(".")
+        if clause:
+            return clause
+    return None
+
+
+def _agent_tmux_elapsed_since(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        then = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (datetime.now(UTC) - then).total_seconds()
+
+
+def _agent_tmux_latest_codex_messages(
+    pane_cwd: str | None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    if not pane_cwd:
+        return None, None, None, None
+    root = Path.home() / ".codex" / "sessions"
+    if not root.exists():
+        return None, None, None, None
+    candidates: list[Path] = []
+    for path in root.rglob("*.jsonl"):
+        try:
+            with path.open(encoding="utf-8") as handle:
+                first_line = handle.readline()
+            first = json.loads(first_line)
+        except Exception:
+            continue
+        if not isinstance(first, dict) or first.get("type") != "session_meta":
+            continue
+        payload = first.get("payload") or {}
+        if not isinstance(payload, dict) or payload.get("cwd") != pane_cwd:
+            continue
+        candidates.append(path)
+    if not candidates:
+        return None, None, None, None
+    candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    session_path = candidates[0]
+    session_id = None
+    last_user = None
+    last_assistant = None
+    try:
+        lines = session_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None, str(session_path), None, None
+    if lines:
+        try:
+            first = json.loads(lines[0])
+            payload = first.get("payload") or {}
+            if isinstance(payload, dict):
+                session_id = payload.get("id")
+        except Exception:
+            pass
+    for raw_line in reversed(lines):
+        try:
+            entry = json.loads(raw_line)
+        except Exception:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        payload = entry.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        if (
+            last_user is None
+            and entry.get("type") == "event_msg"
+            and payload.get("type") == "user_message"
+        ):
+            message = payload.get("message")
+            if isinstance(message, str) and message.strip():
+                last_user = message.strip()
+        if (
+            last_assistant is None
+            and entry.get("type") == "event_msg"
+            and payload.get("type") == "agent_message"
+        ):
+            message = payload.get("message")
+            if isinstance(message, str) and message.strip():
+                last_assistant = message.strip()
+        if (
+            last_assistant is None
+            and entry.get("type") == "response_item"
+            and payload.get("type") == "message"
+            and payload.get("role") == "assistant"
+        ):
+            content = payload.get("content") or []
+            texts = [
+                item.get("text")
+                for item in content
+                if isinstance(item, dict)
+                and isinstance(item.get("text"), str)
+                and item.get("text").strip()
+            ]
+            if texts:
+                last_assistant = texts[0].strip()
+        if last_user and last_assistant:
+            break
+    return (
+        str(session_id) if session_id else None,
+        str(session_path),
+        last_user,
+        last_assistant,
+    )
+
+
 def capture_agent_tmux_thread(
     config: SlackbotConfig,
     *,
@@ -4354,6 +4553,190 @@ def capture_agent_tmux_thread(
     }
 
 
+def sample_agent_tmux_thread(
+    config: SlackbotConfig,
+    *,
+    channel_id: str,
+    thread_ts: str,
+) -> AgentTmuxState:
+    result = capture_agent_tmux_thread(
+        config,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        line_count=AGENT_TMUX_PROGRESS_LINES,
+    )
+    binding = dict(result["binding"])
+    tmux_command, _, _ = tmux_command_for_binding(config, binding)
+    tmux_session = str(binding.get("tmux_session") or "")
+    panes = subprocess.run(
+        [
+            *tmux_command,
+            "list-panes",
+            "-t",
+            tmux_session,
+            "-F",
+            "#{pane_id}\t#{pane_active}\t#{pane_current_path}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    pane_cwd = None
+    if panes.returncode == 0:
+        rows = [line.split("\t", 2) for line in panes.stdout.splitlines()]
+        valid_rows = [row for row in rows if len(row) == 3]
+        active = next((row for row in valid_rows if row[1] == "1"), None)
+        if active is None and valid_rows:
+            active = valid_rows[0]
+        if active is not None:
+            pane_cwd = active[2] or None
+    pane_text = _clean_agent_tmux_text(str(result.get("text") or ""))
+    status_line = None
+    for line in reversed(pane_text.splitlines()):
+        stripped = line.strip()
+        if stripped:
+            status_line = stripped
+            break
+    session_id, session_path, last_user, last_assistant = (
+        _agent_tmux_latest_codex_messages(pane_cwd)
+    )
+    return AgentTmuxState(
+        binding=binding,
+        pane_cwd=pane_cwd,
+        pane_text=pane_text,
+        pane_excerpt=_agent_tmux_excerpt(
+            pane_text,
+            lines=AGENT_TMUX_PROGRESS_LINES,
+        ),
+        prompt_line=_agent_tmux_prompt_line(pane_text),
+        status_line=status_line,
+        context_remaining_percent=_agent_tmux_context_remaining_percent(
+            pane_text
+        ),
+        working=_agent_tmux_is_working(pane_text),
+        codex_session_id=session_id,
+        codex_session_path=session_path,
+        codex_last_user_message=last_user,
+        codex_last_assistant_message=last_assistant,
+        sampled_at=utcnow_iso(),
+    )
+
+
+def send_agent_tmux_keys(
+    config: SlackbotConfig,
+    binding: dict[str, Any],
+    *,
+    text: str | None = None,
+    enter: bool = False,
+    interrupt: bool = False,
+) -> None:
+    host = str(binding.get("host") or "")
+    if not is_local_tmux_host(host):
+        raise SlackbotError(
+            "This thread is bound to a remote tmux host; Sneeze can only "
+            "send keys to local tmux panes"
+        )
+    tmux_session = str(binding.get("tmux_session") or "")
+    if not tmux_session:
+        raise SlackbotError("The tmux binding is missing a session name")
+    tmux_command, tmux_socket, _ = tmux_command_for_binding(config, binding)
+    args = [*tmux_command, "send-keys", "-t", tmux_session]
+    if interrupt:
+        args.append("C-c")
+    elif enter:
+        if text:
+            args.append(text)
+        args.append("Enter")
+    else:
+        args.append(text or "")
+    result = subprocess.run(
+        args,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if detail:
+            detail = f": {detail}"
+        raise SlackbotError(
+            f"tmux send-keys failed for {tmux_session} on socket "
+            f"{tmux_socket}{detail}"
+        )
+
+
+def send_agent_tmux_nudge(
+    config: SlackbotConfig,
+    binding: dict[str, Any],
+    nudge_text: str,
+) -> AgentTmuxState:
+    send_agent_tmux_keys(config, binding, text=nudge_text)
+    time.sleep(0.2)
+    send_agent_tmux_keys(config, binding, enter=True)
+    return sample_agent_tmux_thread(
+        config,
+        channel_id=str(binding.get("channel_id") or ""),
+        thread_ts=str(binding.get("thread_ts") or ""),
+    )
+
+
+def get_agent_tmux_job(
+    config: SlackbotConfig,
+    *,
+    channel_id: str,
+    thread_ts: str,
+) -> dict[str, Any] | None:
+    key = agent_tmux_thread_key(channel_id, thread_ts)
+    with AGENT_TMUX_LOCK, locked_json_path(config.paths.agent_tmux_jobs_path):
+        data = read_json(config.paths.agent_tmux_jobs_path, {})
+        job = data.get(key)
+        return dict(job) if isinstance(job, dict) else None
+
+
+def store_agent_tmux_job(
+    config: SlackbotConfig,
+    *,
+    channel_id: str,
+    thread_ts: str,
+    values: dict[str, Any],
+) -> dict[str, Any]:
+    key = agent_tmux_thread_key(channel_id, thread_ts)
+    with AGENT_TMUX_LOCK, locked_json_path(config.paths.agent_tmux_jobs_path):
+        data = read_json(config.paths.agent_tmux_jobs_path, {})
+        current = data.get(key)
+        if not isinstance(current, dict):
+            current = {}
+        current.update(values)
+        current.setdefault("id", key)
+        current["channel_id"] = channel_id
+        current["thread_ts"] = thread_ts
+        current["updated_at"] = utcnow_iso()
+        data[key] = current
+        write_json_atomic(config.paths.agent_tmux_jobs_path, data)
+        return dict(current)
+
+
+def active_agent_tmux_jobs(config: SlackbotConfig) -> list[dict[str, Any]]:
+    now = time.time()
+    with AGENT_TMUX_LOCK, locked_json_path(config.paths.agent_tmux_jobs_path):
+        data = read_json(config.paths.agent_tmux_jobs_path, {})
+    jobs = []
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            continue
+        if value.get("state") not in AGENT_TMUX_WATCH_STATES:
+            continue
+        try:
+            next_poll_at = float(value.get("next_poll_at") or 0.0)
+        except (TypeError, ValueError):
+            next_poll_at = 0.0
+        if next_poll_at <= now:
+            job = dict(value)
+            job.setdefault("id", key)
+            jobs.append(job)
+    return jobs
+
+
 def render_agent_tmux_capture(result: dict[str, Any]) -> str:
     binding = dict(result.get("binding") or {})
     host = str(binding.get("host") or "localhost")
@@ -4368,15 +4751,111 @@ def render_agent_tmux_capture(result: dict[str, Any]) -> str:
     )
 
 
+def render_agent_tmux_status(
+    state: AgentTmuxState,
+    *,
+    job: dict[str, Any] | None = None,
+) -> str:
+    binding = state.binding
+    lines = [
+        "Thread tmux binding: "
+        f"`{binding.get('host')}:{binding.get('tmux_session')}` "
+        f"on socket `{binding.get('tmux_socket') or DEFAULT_TMUX_SOCKET}`.",
+        "State: " + ("working" if state.working else "idle / waiting"),
+    ]
+    if state.context_remaining_percent is not None:
+        lines.append(f"Context remaining: {state.context_remaining_percent}%")
+    if state.pane_cwd:
+        lines.append(f"Pane cwd: `{state.pane_cwd}`")
+    if state.codex_session_id:
+        lines.append(f"Codex session: `{state.codex_session_id}`")
+    if job:
+        mode = str(job.get("mode") or "")
+        status = str(job.get("state") or "")
+        if mode or status:
+            lines.append(f"Watcher: `{mode or '?'} / {status or '?'}`")
+        if job.get("goal_text"):
+            lines.append(f"Goal: {job['goal_text']}")
+        if job.get("last_nudge_text"):
+            lines.append(f"Last nudge: {job['last_nudge_text']}")
+        if job.get("paused_reason"):
+            lines.append(f"Paused reason: {job['paused_reason']}")
+    if state.prompt_line:
+        lines.append(f"Prompt line: `{state.prompt_line}`")
+    excerpt = (
+        state.codex_last_assistant_message
+        or state.codex_last_user_message
+        or state.pane_excerpt
+    )
+    if excerpt:
+        lines.append(
+            "Latest block:\n```text\n"
+            f"{excerpt[:AGENT_TMUX_STATUS_EXCERPT_CHARS].strip()}\n```"
+        )
+    return "\n".join(lines)
+
+
 def render_agent_tmux_help() -> str:
     return (
         "Tmux thread controls:\n"
         "- `use <host> <tmux-session> [tmux-socket]` bind this thread\n"
         "- `st` / `status` / `u` show the current binding\n"
         "- `tail [lines]` show a bounded pane capture\n"
+        "- `p [context]` / `proceed [context]` send one safe next nudge\n"
+        "- `n <goal>` / `nurse <goal>` keep nudging when safe\n"
+        "- `c` / `cancel` stop the watcher and interrupt if working\n"
         "- `jobs` list recorded tmux-backed Codex jobs\n\n"
         "The older `tmux <command>` forms still work."
     )
+
+
+def agent_tmux_decide_next(
+    state: AgentTmuxState,
+    *,
+    mode: str,
+    goal_text: str | None = None,
+    extra_context: str | None = None,
+    last_nudge_text: str | None = None,
+) -> dict[str, Any]:
+    source = (
+        state.codex_last_assistant_message
+        or state.pane_excerpt
+        or state.status_line
+        or ""
+    )
+    next_point = _agent_tmux_next_continuation_point(source)
+    if next_point:
+        nudge = next_point[:1].upper() + next_point[1:]
+        if not re.search(r"[.!?]$", nudge):
+            nudge += "."
+        return {
+            "decision": "send_nudge",
+            "summary": "Found an explicit next continuation point.",
+            "reason": "explicit next continuation point",
+            "nudge_text": nudge,
+            "expected_next": next_point,
+        }
+    if mode == "proceed" and extra_context:
+        nudge = extra_context.strip()
+        if nudge and nudge != last_nudge_text:
+            return {
+                "decision": "send_nudge",
+                "summary": "Using the provided proceed context.",
+                "reason": "user supplied proceed context",
+                "nudge_text": nudge,
+                "expected_next": nudge,
+            }
+    if mode == "nurse" and not goal_text:
+        return {
+            "decision": "pause",
+            "summary": "Nurse mode needs a goal before I can continue.",
+            "reason": "missing nurse goal",
+        }
+    return {
+        "decision": "pause",
+        "summary": "I could not infer a safe next nudge from the pane.",
+        "reason": "no explicit next continuation point",
+    }
 
 
 def render_tmux_codex_script(
@@ -4424,7 +4903,8 @@ def render_tmux_codex_script(
     else:
         lines.extend(
             [
-                "printf 'This tmux session will be closed by the Slackbot.\\n'",
+                "printf 'This tmux session will be closed by the "
+                "Slackbot.\\n'",
                 "exec bash -l",
             ]
         )
@@ -4567,6 +5047,8 @@ class SlackSocketBot:
         self.team_name: str | None = None
         self.team_domain: str | None = config.slack_domain
         self.user_name_cache: dict[str, str] = {}
+        self.agent_tmux_inflight: set[str] = set()
+        self.agent_tmux_inflight_lock = threading.Lock()
         if (
             config.allowed_channel_ids
             and not config.allowed_dm_user_ids
@@ -4657,6 +5139,7 @@ class SlackSocketBot:
                 deadline is None or time.monotonic() < deadline
             ):
                 self.drain_ingress()
+                self._tick_agent_tmux_jobs()
                 stop_event.wait(1.0)
         finally:
             for sig, previous in previous_handlers.items():
@@ -5044,8 +5527,6 @@ class SlackSocketBot:
         channel_type = event.get("channel_type")
         if event_type not in ("app_mention", "message"):
             return
-        if event_type == "message" and channel_type not in {"im", "mpim"}:
-            return
         if event.get("subtype") is not None:
             return
         if event.get("bot_id"):
@@ -5068,6 +5549,15 @@ class SlackSocketBot:
             dm_user_id=slack_user_id if channel_type == "im" else None,
             thread_ts=thread_ts,
         )
+        if event_type == "message" and channel_type not in {"im", "mpim"}:
+            if not thread_ts or not self._is_authorized(
+                slack_user_id,
+                channel,
+                channel_type=channel_type,
+            ):
+                return
+            self._maybe_handle_agent_tmux(text, route)
+            return
         if channel_type == "im" and not self._allows_early_dm_response(
             slack_user_id
         ):
@@ -6108,6 +6598,548 @@ class SlackSocketBot:
         post_user_config_launcher(self.config, route, mode=mode)
         return True
 
+    def _agent_tmux_thread_route(self, job: dict[str, Any]) -> SlackbotRoute:
+        return SlackbotRoute(
+            channel_id=str(job.get("channel_id") or ""),
+            thread_ts=str(job.get("thread_ts") or ""),
+        )
+
+    def _post_agent_tmux_job(self, job: dict[str, Any], text: str) -> None:
+        post_slack_message(
+            self.config, self._agent_tmux_thread_route(job), text
+        )
+
+    def _complete_agent_tmux_job(
+        self,
+        job: dict[str, Any],
+        *,
+        state: str,
+        summary: str,
+    ) -> dict[str, Any]:
+        return store_agent_tmux_job(
+            self.config,
+            channel_id=str(job.get("channel_id") or ""),
+            thread_ts=str(job.get("thread_ts") or ""),
+            values={
+                **job,
+                "state": state,
+                "paused_reason": None if state == "complete" else summary,
+                "last_completion_summary": summary,
+                "last_completion_fingerprint": _agent_tmux_fingerprint(
+                    summary
+                ),
+                "next_poll_at": time.time() + 3600.0,
+            },
+        )
+
+    def _store_agent_tmux_watch_job(
+        self,
+        *,
+        route: SlackbotRoute,
+        state: AgentTmuxState,
+        mode: str,
+        status: str,
+        goal_text: str | None,
+        extra_context: str | None,
+        pending_nudge_text: str | None = None,
+        previous_job: dict[str, Any] | None = None,
+        last_nudge_text: str | None = None,
+    ) -> dict[str, Any]:
+        previous_job = previous_job or {}
+        completion_source = (
+            state.codex_last_assistant_message
+            or state.pane_excerpt
+            or state.status_line
+            or ""
+        )
+        values = {
+            **previous_job,
+            "host": state.binding.get("host"),
+            "tmux_session": state.binding.get("tmux_session"),
+            "tmux_socket": state.binding.get("tmux_socket")
+            or codex_tmux_socket(self.config),
+            "tmux_conf": state.binding.get("tmux_conf"),
+            "mode": mode,
+            "state": status,
+            "goal_text": goal_text,
+            "extra_context": extra_context,
+            "pending_nudge_text": pending_nudge_text,
+            "last_nudge_text": (
+                last_nudge_text
+                if last_nudge_text is not None
+                else previous_job.get("last_nudge_text")
+            ),
+            "last_nudge_at": (
+                utcnow_iso()
+                if last_nudge_text is not None
+                else previous_job.get("last_nudge_at")
+            ),
+            "nudge_count": int(previous_job.get("nudge_count") or 0)
+            + (1 if last_nudge_text is not None else 0),
+            "last_progress_fingerprint": _agent_tmux_fingerprint(
+                state.pane_excerpt,
+                state.codex_last_assistant_message,
+                state.status_line,
+            ),
+            "last_completion_summary": completion_source,
+            "last_completion_fingerprint": _agent_tmux_fingerprint(
+                completion_source
+            ),
+            "paused_reason": None,
+            "next_poll_at": time.time() + AGENT_TMUX_POLL_SECONDS,
+        }
+        return store_agent_tmux_job(
+            self.config,
+            channel_id=str(route.channel_id or ""),
+            thread_ts=str(route.thread_ts or ""),
+            values=values,
+        )
+
+    def _sample_agent_tmux_route(
+        self,
+        route: SlackbotRoute,
+    ) -> AgentTmuxState:
+        return sample_agent_tmux_thread(
+            self.config,
+            channel_id=str(route.channel_id or ""),
+            thread_ts=str(route.thread_ts or ""),
+        )
+
+    def _handle_agent_tmux_status(
+        self,
+        route: SlackbotRoute,
+        job: dict[str, Any] | None,
+    ) -> None:
+        try:
+            state = self._sample_agent_tmux_route(route)
+        except SlackbotError as exc:
+            post_slack_message(self.config, route, str(exc))
+            return
+        post_slack_message(
+            self.config,
+            route,
+            render_agent_tmux_status(state, job=job),
+        )
+
+    def _handle_agent_tmux_cancel(
+        self,
+        route: SlackbotRoute,
+        job: dict[str, Any] | None,
+    ) -> None:
+        canceled = False
+        if job and job.get("state") in AGENT_TMUX_WATCH_STATES:
+            self._complete_agent_tmux_job(
+                job,
+                state="canceled",
+                summary="Canceled by Slack request.",
+            )
+            canceled = True
+        try:
+            state = self._sample_agent_tmux_route(route)
+        except SlackbotError:
+            state = None
+        if state and state.working:
+            try:
+                send_agent_tmux_keys(
+                    self.config, state.binding, interrupt=True
+                )
+                post_slack_message(
+                    self.config,
+                    route,
+                    "Sent Ctrl-C to the bound tmux session."
+                    + (" Canceled the active watcher." if canceled else ""),
+                )
+                return
+            except SlackbotError as exc:
+                post_slack_message(
+                    self.config, route, f"Cancel failed: {exc}"
+                )
+                return
+        if canceled:
+            post_slack_message(
+                self.config,
+                route,
+                "Canceled the active watcher. The tmux session was idle.",
+            )
+        else:
+            post_slack_message(
+                self.config,
+                route,
+                "No active watcher is registered for this thread.",
+            )
+
+    def _handle_agent_tmux_nudge_command(
+        self,
+        route: SlackbotRoute,
+        *,
+        command: str,
+        text: str | None,
+        job: dict[str, Any] | None,
+    ) -> None:
+        mode = "nurse" if command in {"n", "nurse"} else "proceed"
+        goal_text = text if mode == "nurse" else None
+        extra_context = text if mode == "proceed" else None
+        if mode == "nurse" and not goal_text:
+            post_slack_message(
+                self.config,
+                route,
+                "Provide a nurse goal, for example `n finish the deploy`.",
+            )
+            return
+        if job and job.get("state") in AGENT_TMUX_WATCH_STATES:
+            post_slack_message(
+                self.config,
+                route,
+                "This thread already has an active "
+                f"`{job.get('mode')}` watcher. Use `st` or `c` first.",
+            )
+            return
+        try:
+            state = self._sample_agent_tmux_route(route)
+        except SlackbotError as exc:
+            post_slack_message(self.config, route, str(exc))
+            return
+        if state.working:
+            if mode == "nurse":
+                self._store_agent_tmux_watch_job(
+                    route=route,
+                    state=state,
+                    mode=mode,
+                    status="watching",
+                    goal_text=goal_text,
+                    extra_context=None,
+                    previous_job=job,
+                )
+                post_slack_message(
+                    self.config,
+                    route,
+                    "Attached nurse monitoring to the already-running tmux "
+                    f"session. Goal: {goal_text}",
+                )
+            else:
+                post_slack_message(
+                    self.config,
+                    route,
+                    "The bound tmux session is already working. I did not "
+                    "send another nudge.",
+                )
+            return
+        decision = agent_tmux_decide_next(
+            state,
+            mode=mode,
+            goal_text=goal_text,
+            extra_context=extra_context,
+            last_nudge_text=(job or {}).get("last_nudge_text"),
+        )
+        if decision["decision"] != "send_nudge" or not decision.get(
+            "nudge_text"
+        ):
+            if mode == "nurse":
+                stored = self._store_agent_tmux_watch_job(
+                    route=route,
+                    state=state,
+                    mode=mode,
+                    status="paused",
+                    goal_text=goal_text,
+                    extra_context=None,
+                    previous_job=job,
+                )
+                self._complete_agent_tmux_job(
+                    stored,
+                    state="paused",
+                    summary=str(decision.get("reason") or "paused"),
+                )
+            post_slack_message(
+                self.config,
+                route,
+                f"{decision.get('summary')}\n\nPaused: "
+                f"{decision.get('reason')}",
+            )
+            return
+        nudge_text = str(decision["nudge_text"])
+        try:
+            sent_state = send_agent_tmux_nudge(
+                self.config,
+                state.binding,
+                nudge_text,
+            )
+        except SlackbotError as exc:
+            post_slack_message(
+                self.config, route, f"Unable to send nudge: {exc}"
+            )
+            return
+        self._store_agent_tmux_watch_job(
+            route=route,
+            state=sent_state,
+            mode=mode,
+            status="watching" if sent_state.working else "awaiting_start",
+            goal_text=goal_text,
+            extra_context=extra_context,
+            previous_job=job,
+            last_nudge_text=nudge_text,
+        )
+        post_slack_message(
+            self.config,
+            route,
+            f"{decision.get('summary')}\n\nNudge sent:\n> {nudge_text}\n\n"
+            f"Registration: {'working' if sent_state.working else 'sent'}",
+        )
+
+    def _tick_agent_tmux_jobs(self) -> None:
+        for job in active_agent_tmux_jobs(self.config):
+            key = str(job.get("id") or "")
+            if not key:
+                continue
+            with self.agent_tmux_inflight_lock:
+                if key in self.agent_tmux_inflight:
+                    continue
+                self.agent_tmux_inflight.add(key)
+            self.executor.submit(self._process_agent_tmux_job_safe, key)
+
+    def _process_agent_tmux_job_safe(self, key: str) -> None:
+        try:
+            self._process_agent_tmux_job(key)
+        except Exception as exc:
+            emit(self.out, f"agent-tmux watcher failed for {key}: {exc}")
+        finally:
+            with self.agent_tmux_inflight_lock:
+                self.agent_tmux_inflight.discard(key)
+
+    def _process_agent_tmux_job(self, key: str) -> None:
+        channel_id, _, thread_ts = key.partition(":")
+        if not channel_id or not thread_ts:
+            return
+        job = get_agent_tmux_job(
+            self.config,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+        )
+        if not job or job.get("state") not in AGENT_TMUX_WATCH_STATES:
+            return
+        route = SlackbotRoute(channel_id=channel_id, thread_ts=thread_ts)
+        try:
+            state = self._sample_agent_tmux_route(route)
+        except SlackbotError as exc:
+            self._complete_agent_tmux_job(
+                job,
+                state="paused",
+                summary=f"Unable to inspect tmux session: {exc}",
+            )
+            self._post_agent_tmux_job(
+                job,
+                f"Paused watcher: unable to inspect tmux session: {exc}",
+            )
+            return
+        if job.get("state") == "need_nudge":
+            if state.working:
+                store_agent_tmux_job(
+                    self.config,
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    values={
+                        **job,
+                        "next_poll_at": time.time() + AGENT_TMUX_POLL_SECONDS,
+                    },
+                )
+                return
+            pending = str(job.get("pending_nudge_text") or "")
+            if not pending:
+                self._complete_agent_tmux_job(
+                    job,
+                    state="paused",
+                    summary="Pending nudge text was missing.",
+                )
+                return
+            try:
+                sent_state = send_agent_tmux_nudge(
+                    self.config,
+                    state.binding,
+                    pending,
+                )
+            except SlackbotError as exc:
+                self._complete_agent_tmux_job(
+                    job,
+                    state="paused",
+                    summary=f"Unable to send deferred nudge: {exc}",
+                )
+                self._post_agent_tmux_job(
+                    job,
+                    f"Paused deferred nudge: {exc}",
+                )
+                return
+            self._store_agent_tmux_watch_job(
+                route=route,
+                state=sent_state,
+                mode=str(job.get("mode") or "nurse"),
+                status="watching" if sent_state.working else "awaiting_start",
+                goal_text=job.get("goal_text"),
+                extra_context=job.get("extra_context"),
+                previous_job=job,
+                last_nudge_text=pending,
+            )
+            self._post_agent_tmux_job(
+                job,
+                f"Nudge sent after waiting:\n> {pending}",
+            )
+            return
+
+        progress_fingerprint = _agent_tmux_fingerprint(
+            state.pane_excerpt,
+            state.codex_last_assistant_message,
+            state.status_line,
+        )
+        if job.get("state") == "awaiting_start":
+            prompt_input = _agent_tmux_prompt_input(state.prompt_line)
+            last_nudge = str(job.get("last_nudge_text") or "")
+            if state.working:
+                store_agent_tmux_job(
+                    self.config,
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    values={
+                        **job,
+                        "state": "watching",
+                        "last_progress_fingerprint": progress_fingerprint,
+                        "next_poll_at": time.time() + AGENT_TMUX_POLL_SECONDS,
+                    },
+                )
+                return
+            if prompt_input and last_nudge and prompt_input == last_nudge:
+                self._complete_agent_tmux_job(
+                    job,
+                    state="paused",
+                    summary=(
+                        "The previous nudge appears to still be sitting in "
+                        "the Codex prompt."
+                    ),
+                )
+                self._post_agent_tmux_job(
+                    job,
+                    "Nudge paused: the text appears to still be sitting in "
+                    "the Codex prompt, so I did not resend it.",
+                )
+                return
+            store_agent_tmux_job(
+                self.config,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                values={
+                    **job,
+                    "state": "watching",
+                    "last_progress_fingerprint": progress_fingerprint,
+                    "next_poll_at": time.time() + AGENT_TMUX_POLL_SECONDS,
+                },
+            )
+            return
+
+        if state.working:
+            elapsed = _agent_tmux_elapsed_since(job.get("last_progress_at"))
+            should_post = progress_fingerprint != job.get(
+                "last_progress_fingerprint"
+            ) and (elapsed is None or elapsed >= AGENT_TMUX_PROGRESS_SECONDS)
+            updates = {
+                **job,
+                "state": "watching",
+                "last_progress_fingerprint": progress_fingerprint,
+                "next_poll_at": time.time() + AGENT_TMUX_POLL_SECONDS,
+            }
+            if should_post:
+                message = (
+                    state.codex_last_assistant_message
+                    or state.pane_excerpt
+                    or state.status_line
+                    or "The upstream session is still working."
+                )
+                self._post_agent_tmux_job(
+                    job,
+                    "Progress update:\n```text\n"
+                    f"{message[:AGENT_TMUX_STATUS_EXCERPT_CHARS]}\n```",
+                )
+                updates["last_progress_at"] = utcnow_iso()
+                updates["last_progress_message"] = message[
+                    :AGENT_TMUX_STATUS_EXCERPT_CHARS
+                ]
+            store_agent_tmux_job(
+                self.config,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                values=updates,
+            )
+            return
+
+        completion_source = (
+            state.codex_last_assistant_message
+            or state.pane_excerpt
+            or state.status_line
+            or "The upstream session returned to an idle prompt."
+        )
+        completion_fingerprint = _agent_tmux_fingerprint(completion_source)
+        if completion_fingerprint != job.get("last_completion_fingerprint"):
+            self._post_agent_tmux_job(
+                job,
+                "Completion snapshot:\n```text\n"
+                f"{completion_source[:AGENT_TMUX_STATUS_EXCERPT_CHARS]}\n```",
+            )
+        if job.get("mode") == "proceed":
+            self._complete_agent_tmux_job(
+                job,
+                state="complete",
+                summary=completion_source,
+            )
+            return
+
+        decision = agent_tmux_decide_next(
+            state,
+            mode="nurse",
+            goal_text=job.get("goal_text"),
+            extra_context=job.get("extra_context"),
+            last_nudge_text=job.get("last_nudge_text"),
+        )
+        if decision["decision"] != "send_nudge" or not decision.get(
+            "nudge_text"
+        ):
+            self._complete_agent_tmux_job(
+                job,
+                state="paused",
+                summary=str(decision.get("reason") or "paused"),
+            )
+            self._post_agent_tmux_job(
+                job,
+                f"Nurse paused: {decision.get('summary')}\n\n"
+                f"Reason: {decision.get('reason')}",
+            )
+            return
+        nudge_text = str(decision["nudge_text"])
+        try:
+            sent_state = send_agent_tmux_nudge(
+                self.config,
+                state.binding,
+                nudge_text,
+            )
+        except SlackbotError as exc:
+            self._complete_agent_tmux_job(
+                job,
+                state="paused",
+                summary=f"Unable to send nurse nudge: {exc}",
+            )
+            self._post_agent_tmux_job(job, f"Nurse paused: {exc}")
+            return
+        self._store_agent_tmux_watch_job(
+            route=route,
+            state=sent_state,
+            mode="nurse",
+            status="watching" if sent_state.working else "awaiting_start",
+            goal_text=job.get("goal_text"),
+            extra_context=job.get("extra_context"),
+            previous_job=job,
+            last_nudge_text=nudge_text,
+        )
+        self._post_agent_tmux_job(
+            job,
+            f"Next nurse nudge:\n> {nudge_text}\n\n"
+            f"Registration: {'working' if sent_state.working else 'sent'}",
+        )
+
     def _maybe_handle_agent_tmux(
         self,
         text: str,
@@ -6124,6 +7156,21 @@ class SlackSocketBot:
             return False
 
         command = tokens[0].lower()
+        job = get_agent_tmux_job(
+            self.config,
+            channel_id=route.channel_id,
+            thread_ts=route.thread_ts,
+        )
+        binding = query_agent_tmux_thread(
+            self.config.profile,
+            runtime_root=self.config.paths.runtime_root,
+            env_path=self.config.paths.env_path,
+            state_dir=self.config.paths.state_dir,
+            system_prompt_path=self.config.paths.system_prompt_path,
+            unit_name=self.config.paths.unit_name,
+            channel_id=route.channel_id,
+            thread_ts=route.thread_ts,
+        )
         if not prefixed:
             if command == "use":
                 if len(tokens) not in (3, 4):
@@ -6141,6 +7188,15 @@ class SlackSocketBot:
                     return False
             elif command in {"capture", "pipe", "tail"}:
                 if len(tokens) not in (1, 2):
+                    return False
+            elif command in {"c", "cancel", "n", "nurse", "p", "proceed"}:
+                if not binding and not job:
+                    return False
+                if command in {"c", "cancel"} and len(tokens) != 1:
+                    return False
+                if command in {"p", "proceed"} and len(tokens) < 1:
+                    return False
+                if command in {"n", "nurse"} and len(tokens) < 1:
                     return False
             else:
                 return False
@@ -6178,29 +7234,37 @@ class SlackSocketBot:
             )
             return True
         if command in ("st", "status", "u", "update") and len(tokens) == 1:
-            binding = query_agent_tmux_thread(
-                self.config.profile,
-                runtime_root=self.config.paths.runtime_root,
-                env_path=self.config.paths.env_path,
-                state_dir=self.config.paths.state_dir,
-                system_prompt_path=self.config.paths.system_prompt_path,
-                unit_name=self.config.paths.unit_name,
-                channel_id=route.channel_id,
-                thread_ts=route.thread_ts,
-            )
             if binding:
-                tmux_socket = str(
-                    binding.get("tmux_socket")
-                    or codex_tmux_socket(self.config)
-                )
-                body = (
-                    "Thread tmux binding: "
-                    f"`{binding.get('host')}:{binding.get('tmux_session')}` "
-                    f"on socket `{tmux_socket}`."
-                )
+                self._handle_agent_tmux_status(route, job)
+                return True
             else:
                 body = "No tmux session is bound to this Slack thread."
             post_slack_message(self.config, route, body)
+            return True
+        if command in ("c", "cancel") and len(tokens) == 1:
+            if not binding:
+                post_slack_message(
+                    self.config,
+                    route,
+                    "No tmux session is bound to this Slack thread.",
+                )
+                return True
+            self._handle_agent_tmux_cancel(route, job)
+            return True
+        if command in ("p", "proceed", "n", "nurse"):
+            if not binding:
+                post_slack_message(
+                    self.config,
+                    route,
+                    "No tmux session is bound to this Slack thread.",
+                )
+                return True
+            self._handle_agent_tmux_nudge_command(
+                route,
+                command=command,
+                text=" ".join(tokens[1:]).strip() or None,
+                job=job,
+            )
             return True
         if command in ("tail", "capture", "pipe") and len(tokens) in (1, 2):
             try:

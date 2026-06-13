@@ -61,6 +61,7 @@ from sneeze.slackbot import (
     slack_api_post,
     slackbot_working_text,
     static_response_text_from_profile,
+    store_agent_tmux_job,
     store_user_secret_token,
     strip_bot_mentions,
     trust_slack_channel,
@@ -1344,7 +1345,7 @@ def test_systemd_service_has_no_source_project_leaks(tmp_path):
     assert "--system-prompt-path=" in text
     assert "--unit-name=sample-slackbot.service" in text
     assert f"EnvironmentFile={config.paths.env_path}" in text
-    assert "EnvironmentFile=\"" not in text
+    assert 'EnvironmentFile="' not in text
     assert not any(
         word in text for word in ("legacy-internal-tool", "ticket-system")
     )
@@ -5928,6 +5929,240 @@ def test_agent_tmux_tail_command_posts_pane_capture(tmp_path, monkeypatch):
     ]
     assert "Last 3 lines" in posts[0]
     assert "worker line two" in posts[0]
+
+
+def test_agent_tmux_proceed_sends_explicit_next_point(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="C123",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    config = load_config(profile)
+    bot = SlackSocketBot(config)
+    route = SlackbotRoute(channel_id="C123", thread_ts="1.000001")
+    posts = []
+    calls = []
+
+    def fake_run(args, check, capture_output, text):
+        calls.append(args)
+        if "list-panes" in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"%1\t1\t{tmp_path}\n",
+                stderr="",
+            )
+        if "capture-pane" in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "Ready\n"
+                    "Next continuation point: inspect README\n"
+                    "›\n"
+                ),
+                stderr="",
+            )
+        if "send-keys" in args:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: posts.append(text),
+    )
+
+    assert bot._maybe_handle_agent_tmux("p", route)
+
+    send_calls = [call for call in calls if "send-keys" in call]
+    assert send_calls[0][-1] == "Inspect README."
+    assert send_calls[1][-1] == "Enter"
+    assert "Nudge sent" in posts[0]
+    job = read_json(config.paths.agent_tmux_jobs_path, {})["C123:1.000001"]
+    assert job["mode"] == "proceed"
+    assert job["state"] == "awaiting_start"
+    assert job["last_nudge_text"] == "Inspect README."
+
+
+def test_agent_tmux_proceed_text_is_not_hijacked_without_binding(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bot = SlackSocketBot(load_config(profile))
+    route = SlackbotRoute(channel_id="C123", thread_ts="1.000001")
+
+    assert not bot._maybe_handle_agent_tmux("proceed with the PR", route)
+
+
+def test_agent_tmux_awaiting_start_pauses_on_stale_prompt(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="C123",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    config = load_config(profile)
+    bot = SlackSocketBot(config)
+    posts = []
+    store_agent_tmux_job(
+        config,
+        channel_id="C123",
+        thread_ts="1.000001",
+        values={
+            "host": "localhost",
+            "tmux_session": "codex-work",
+            "tmux_socket": "codex",
+            "mode": "proceed",
+            "state": "awaiting_start",
+            "last_nudge_text": "Inspect README.",
+            "next_poll_at": 0,
+        },
+    )
+
+    def fake_run(args, check, capture_output, text):
+        if "list-panes" in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"%1\t1\t{tmp_path}\n",
+                stderr="",
+            )
+        if "capture-pane" in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="› Inspect README.\n",
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: posts.append(text),
+    )
+
+    bot._process_agent_tmux_job("C123:1.000001")
+
+    job = read_json(config.paths.agent_tmux_jobs_path, {})["C123:1.000001"]
+    assert job["state"] == "paused"
+    assert "still be sitting" in job["paused_reason"]
+    assert "Nudge paused" in posts[0]
+
+
+def test_agent_tmux_tick_processes_due_watch_jobs(tmp_path, monkeypatch):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    bot = SlackSocketBot(config)
+    bot.executor = InlineExecutor()
+    processed = []
+    store_agent_tmux_job(
+        config,
+        channel_id="C123",
+        thread_ts="1.000001",
+        values={
+            "host": "localhost",
+            "tmux_session": "codex-work",
+            "tmux_socket": "codex",
+            "mode": "nurse",
+            "state": "watching",
+            "goal_text": "finish",
+            "next_poll_at": 0,
+        },
+    )
+    monkeypatch.setattr(
+        bot,
+        "_process_agent_tmux_job_safe",
+        lambda key: processed.append(key),
+    )
+
+    bot._tick_agent_tmux_jobs()
+
+    assert processed == ["C123:1.000001"]
+
+
+def test_agent_tmux_nurse_sends_next_nudge_after_idle(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="C123",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    config = load_config(profile)
+    bot = SlackSocketBot(config)
+    posts = []
+    calls = []
+    store_agent_tmux_job(
+        config,
+        channel_id="C123",
+        thread_ts="1.000001",
+        values={
+            "host": "localhost",
+            "tmux_session": "codex-work",
+            "tmux_socket": "codex",
+            "mode": "nurse",
+            "state": "watching",
+            "goal_text": "finish",
+            "next_poll_at": 0,
+        },
+    )
+
+    def fake_run(args, check, capture_output, text):
+        calls.append(args)
+        if "list-panes" in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"%1\t1\t{tmp_path}\n",
+                stderr="",
+            )
+        if "capture-pane" in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "Done with previous chunk.\n"
+                    "Next continuation point: run tests\n"
+                    "›\n"
+                ),
+                stderr="",
+            )
+        if "send-keys" in args:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: posts.append(text),
+    )
+
+    bot._process_agent_tmux_job("C123:1.000001")
+
+    send_calls = [call for call in calls if "send-keys" in call]
+    assert send_calls[0][-1] == "Run tests."
+    assert "Completion snapshot" in posts[0]
+    assert "Next nurse nudge" in posts[1]
+    job = read_json(config.paths.agent_tmux_jobs_path, {})["C123:1.000001"]
+    assert job["last_nudge_text"] == "Run tests."
+    assert job["state"] == "awaiting_start"
 
 
 def test_user_config_trigger_words_require_exact_message():
