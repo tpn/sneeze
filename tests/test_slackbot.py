@@ -2241,7 +2241,10 @@ def test_codex_stop_hook_recovers_receipt_after_post_state_timeout(
     )
 
     try:
-        with pytest.raises(SlackbotError, match="Slackbot state lock"):
+        with pytest.raises(
+            slackbot_module.CodexHookRetryableError,
+            match="Slackbot state lock",
+        ):
             notify_codex_agent_stop(profile, payload)
         receipt_paths = list(Path(state_path).parent.glob(".*.receipt.json"))
         assert receipt_paths
@@ -2321,7 +2324,10 @@ def test_codex_stop_hook_receipt_does_not_cross_shared_tmux_sessions(
         )
 
     try:
-        with pytest.raises(SlackbotError, match="Slackbot state lock"):
+        with pytest.raises(
+            slackbot_module.CodexHookRetryableError,
+            match="Slackbot state lock",
+        ):
             notify_codex_agent_stop(
                 profile,
                 payload("codex-session-1"),
@@ -2709,7 +2715,9 @@ def test_agent_stop_hook_command_retries_before_soft_failure(
     def fake_notify(*args, **kwargs):
         calls.append((args, kwargs))
         if len(calls) == 1:
-            raise SlackbotError("state finalization timed out")
+            raise slackbot_module.CodexHookRetryableError(
+                "state finalization timed out"
+            )
         return {"status": "skipped", "reason": "delivery_receipt"}
 
     monkeypatch.setattr(
@@ -2727,6 +2735,40 @@ def test_agent_stop_hook_command_retries_before_soft_failure(
 
     assert len(calls) == 2
     assert estream.getvalue() == ""
+
+
+def test_agent_stop_hook_command_does_not_retry_unsafe_failure(
+    tmp_path,
+    monkeypatch,
+):
+    import io
+
+    from sneeze.slackbot_commands import SlackbotAgentStopHookBase
+
+    class SampleAgentStopHook(SlackbotAgentStopHookBase):
+        profile = make_profile(tmp_path)
+
+    calls = []
+
+    def fail_notify(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise SlackbotError("receipt write failed")
+
+    monkeypatch.setattr(
+        "sneeze.slackbot_commands.notify_codex_agent_stop",
+        fail_notify,
+    )
+    estream = io.StringIO()
+    command = SampleAgentStopHook(
+        io.StringIO('{"session_id":"codex-session-1"}'),
+        io.StringIO(),
+        estream,
+    )
+
+    command.run()
+
+    assert len(calls) == 1
+    assert "receipt write failed" in estream.getvalue()
 
 
 def test_agent_tmux_capture_bound_thread(tmp_path, monkeypatch):

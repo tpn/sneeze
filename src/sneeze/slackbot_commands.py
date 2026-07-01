@@ -18,6 +18,7 @@ from .invariant import (
 from .slackbot import (
     SLACK_APP_TOKEN_ENV,
     SLACK_BOT_TOKEN_ENV,
+    CodexHookRetryableError,
     SlackbotProfile,
     SlackbotRoute,
     bind_agent_tmux_thread,
@@ -1108,13 +1109,20 @@ class SlackbotAgentStopHookBase(ProfiledSlackbotCommand):
                     tmux_conf=self._tmux_conf or self.tmux_conf,
                 )
                 return
-            except Exception as exc:
+            except CodexHookRetryableError as exc:
                 if attempt == 0:
                     continue
                 self._err(
                     "slackbot-agent-stop-hook failed after retry; "
                     f"Codex will continue: {exc}"
                 )
+                return
+            except Exception as exc:
+                self._err(
+                    "slackbot-agent-stop-hook failed; Codex will continue: "
+                    f"{exc}"
+                )
+                return
 
 
 class SlackbotAgentHooksInstallBase(ProfiledSlackbotCommand):

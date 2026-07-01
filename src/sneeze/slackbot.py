@@ -44,6 +44,10 @@ class SlackbotError(RuntimeError):
     pass
 
 
+class CodexHookRetryableError(SlackbotError):
+    pass
+
+
 class SlackApiError(SlackbotError):
     def __init__(self, method: str, result: dict[str, Any]):
         self.method = method
@@ -5533,6 +5537,21 @@ def _locked_codex_hook_delivery(
             raise
 
 
+@contextmanager
+def _locked_codex_hook_finalization_state(state_path: str):
+    try:
+        with locked_agent_tmux_json_path(
+            state_path,
+            timeout_seconds=AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS,
+        ):
+            yield
+    except SlackbotError as exc:
+        raise CodexHookRetryableError(
+            "Codex hook delivery is durable but state finalization failed: "
+            f"{exc}"
+        ) from exc
+
+
 def _render_codex_stop_notification(
     payload: dict[str, Any],
     binding: dict[str, str] | None,
@@ -5803,10 +5822,7 @@ def notify_codex_agent_stop(
             }
             _write_codex_hook_delivery_receipts(receipt_paths, receipt)
 
-        with locked_agent_tmux_json_path(
-            state_path,
-            timeout_seconds=AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS,
-        ):
+        with _locked_codex_hook_finalization_state(state_path):
             state = read_json(state_path, {})
             state["version"] = 1
             sessions = state.setdefault("sessions", {})
@@ -5864,24 +5880,30 @@ def notify_codex_agent_stop(
         _remove_codex_hook_delivery_receipts(receipt_paths)
 
         if binding:
-            bind_agent_tmux_thread(
-                profile,
-                runtime_root=runtime_root,
-                env_path=env_path,
-                state_dir=state_dir,
-                system_prompt_path=system_prompt_path,
-                unit_name=unit_name,
-                channel_id=channel_id,
-                thread_ts=thread_ts,
-                host=binding["host"],
-                tmux_session=binding["tmux_session"],
-                tmux_socket=binding.get("tmux_socket"),
-                tmux_conf=binding.get("tmux_conf"),
-                tmux_pane=binding.get("tmux_pane"),
-                lock_timeout_seconds=(
-                    AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
-                ),
-            )
+            try:
+                bind_agent_tmux_thread(
+                    profile,
+                    runtime_root=runtime_root,
+                    env_path=env_path,
+                    state_dir=state_dir,
+                    system_prompt_path=system_prompt_path,
+                    unit_name=unit_name,
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    host=binding["host"],
+                    tmux_session=binding["tmux_session"],
+                    tmux_socket=binding.get("tmux_socket"),
+                    tmux_conf=binding.get("tmux_conf"),
+                    tmux_pane=binding.get("tmux_pane"),
+                    lock_timeout_seconds=(
+                        AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
+                    ),
+                )
+            except SlackbotError as exc:
+                raise CodexHookRetryableError(
+                    "Codex hook delivery is durable but tmux binding "
+                    f"failed: {exc}"
+                ) from exc
     return {
         "status": "skipped" if recovered_receipt else "notified",
         "reason": "delivery_receipt" if recovered_receipt else None,
