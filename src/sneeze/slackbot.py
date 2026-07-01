@@ -118,6 +118,9 @@ AGENT_CODEX_HOOK_STATE_FILENAME = "agent-codex-hooks.json"
 AGENT_CODEX_HOOK_NOTIFY_USER_KEY = "AGENT_NOTIFY_SLACK_USER_ID"
 AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS = 10.0
 AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS = 120.0
+AGENT_CODEX_HOOK_LEGACY_ROUTE_SCAN_ENTRIES = 256
+AGENT_CODEX_HOOK_LEGACY_ROUTE_SCAN_RECEIPTS = 64
+AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS = 600.0
 AGENT_CODEX_HOOK_COMMAND_TIMEOUT_SECONDS = 60
 AGENT_CODEX_HOOK_SLACK_REQUEST_TIMEOUT_SECONDS = 2.0
 AGENT_CODEX_HOOK_SLACK_REQUEST_ATTEMPTS = 2
@@ -5430,8 +5433,18 @@ def _write_codex_hook_delivery_receipts(
     receipt_paths: Iterable[str],
     receipt: dict[str, Any],
 ) -> None:
+    written = 0
     for receipt_path in receipt_paths:
-        write_json_atomic(receipt_path, receipt)
+        try:
+            write_json_atomic(receipt_path, receipt)
+        except Exception as exc:
+            if written:
+                raise CodexHookRetryableError(
+                    "Codex hook delivery has a partial durable receipt: "
+                    f"{exc}"
+                ) from exc
+            raise
+        written += 1
 
 
 def _remove_codex_hook_delivery_receipts(
@@ -5592,15 +5605,20 @@ def _locked_codex_hook_delivery(
                 delivery_locks.close()
                 continue
             if receipt:
-                route_receipt_path = _codex_hook_delivery_route_receipt_path(
-                    state_path,
-                    channel_id=str(receipt["channel_id"]),
-                    thread_ts=str(receipt["thread_ts"]),
-                    notify_user_id=notify_user_id,
-                )
-                cleanup_receipt_paths = tuple(
-                    sorted({*cleanup_receipt_paths, route_receipt_path})
-                )
+                receipt_channel_id = receipt.get("channel_id")
+                receipt_thread_ts = receipt.get("thread_ts")
+                if receipt_channel_id and receipt_thread_ts:
+                    route_receipt_path = (
+                        _codex_hook_delivery_route_receipt_path(
+                            state_path,
+                            channel_id=str(receipt_channel_id),
+                            thread_ts=str(receipt_thread_ts),
+                            notify_user_id=notify_user_id,
+                        )
+                    )
+                    cleanup_receipt_paths = tuple(
+                        sorted({*cleanup_receipt_paths, route_receipt_path})
+                    )
             try:
                 yield (
                     delivery_aliases,
@@ -5943,9 +5961,11 @@ def notify_codex_agent_stop(
                 thread_ts=str(thread_ts),
                 notify_user_id=notify_user_id,
             )
-            write_receipt_paths = tuple(
-                sorted({*write_receipt_paths, route_receipt_path})
-            )
+            if route_receipt_path not in write_receipt_paths:
+                write_receipt_paths = (
+                    *write_receipt_paths,
+                    route_receipt_path,
+                )
             receipt_paths = tuple(
                 sorted({*receipt_paths, route_receipt_path})
             )
@@ -6107,6 +6127,55 @@ def codex_hook_delivery_receipt_for_route(
         and receipt.get("notify_user_id") == notify_user_id
     ):
         return receipt
+
+    state_target = Path(state_path)
+    prefix = f".{state_target.name}."
+    candidates = []
+    scanned = 0
+    now = time.time()
+    try:
+        with os.scandir(state_target.parent) as entries:
+            for item in entries:
+                scanned += 1
+                if scanned > AGENT_CODEX_HOOK_LEGACY_ROUTE_SCAN_ENTRIES:
+                    break
+                if (
+                    not item.name.startswith(prefix)
+                    or not item.name.endswith(".receipt.json")
+                    or ".route." in item.name
+                ):
+                    continue
+                try:
+                    modified_at = item.stat().st_mtime
+                except OSError:
+                    continue
+                if (
+                    now - modified_at
+                    > AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS
+                ):
+                    continue
+                candidates.append((modified_at, item.path))
+    except OSError:
+        return None
+
+    candidates.sort(reverse=True)
+    for _, legacy_receipt_path in candidates[
+        :AGENT_CODEX_HOOK_LEGACY_ROUTE_SCAN_RECEIPTS
+    ]:
+        legacy_receipt = read_json(legacy_receipt_path, {})
+        if not isinstance(legacy_receipt, dict):
+            continue
+        if (
+            legacy_receipt.get("channel_id") != channel_id
+            or legacy_receipt.get("thread_ts") != thread_ts
+            or legacy_receipt.get("notify_user_id") != notify_user_id
+        ):
+            continue
+        try:
+            write_json_atomic(receipt_path, legacy_receipt)
+        except OSError:
+            pass
+        return legacy_receipt
     return None
 
 

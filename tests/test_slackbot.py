@@ -2396,6 +2396,15 @@ def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
     ):
         notify_codex_agent_stop(profile, payload)
 
+    route_receipt_path = (
+        slackbot_module._codex_hook_delivery_route_receipt_path(
+            state_path,
+            channel_id="D111",
+            thread_ts="1.000001",
+            notify_user_id="U111",
+        )
+    )
+    Path(route_receipt_path).unlink()
     route_posts = []
     monkeypatch.setattr(
         "sneeze.slackbot.post_slack_message",
@@ -2434,6 +2443,7 @@ def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
         "No tmux pane is bound to this notification thread. "
         "Replies are read-only."
     ]
+    assert Path(route_receipt_path).exists()
     monkeypatch.setattr(Path, "glob", original_glob)
 
     monkeypatch.setattr(
