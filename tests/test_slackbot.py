@@ -2282,6 +2282,74 @@ def test_codex_stop_hook_recovers_receipt_after_post_state_timeout(
     assert not list(Path(state_path).parent.glob(".*.receipt.json"))
 
 
+def test_codex_stop_hook_recovers_legacy_receipt_identity(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    message = "Ready for review."
+    message_hash = slackbot_module._codex_hook_message_hash(message)
+    legacy_receipt_path = slackbot_module._codex_hook_delivery_receipt_paths(
+        state_path,
+        {"session:codex-session-1"},
+        turn_id="turn-1",
+        message_hash=message_hash,
+        notify_user_id="U111",
+        transcript_path="/tmp/transcript.jsonl",
+        legacy_identity=True,
+    )[0]
+    slackbot_module.write_json_atomic(
+        legacy_receipt_path,
+        {
+            "version": 1,
+            "key": "session:codex-session-1",
+            "fallback_key": None,
+            "notify_user_id": "U111",
+            "channel_id": "D111",
+            "thread_ts": "1.000001",
+            "turn_id": "turn-1",
+            "message_sha256": message_hash,
+            "tmux_binding": None,
+            "notified_at": slackbot_module.utcnow_iso(),
+        },
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy receipt should prevent a second post")
+        ),
+    )
+
+    result = notify_codex_agent_stop(
+        profile,
+        json.dumps(
+            {
+                "session_id": "codex-session-1",
+                "turn_id": "turn-1",
+                "transcript_path": "/tmp/transcript.jsonl",
+                "last_assistant_message": message,
+            }
+        ),
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "delivery_receipt"
+    entry = query_codex_agent_threads(profile)["hook_state"]["sessions"][
+        "session:codex-session-1"
+    ]
+    assert entry["channel_id"] == "D111"
+    assert not Path(legacy_receipt_path).exists()
+
+
 def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
     tmp_path,
     monkeypatch,
@@ -2341,6 +2409,16 @@ def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
             AssertionError("receipt-backed reply should not start Codex")
         ),
     )
+    original_glob = Path.glob
+    monkeypatch.setattr(
+        Path,
+        "glob",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "receipt routing must not scan the state directory"
+            )
+        ),
+    )
     bot._handle_event(
         {
             "type": "message",
@@ -2356,6 +2434,7 @@ def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
         "No tmux pane is bound to this notification thread. "
         "Replies are read-only."
     ]
+    monkeypatch.setattr(Path, "glob", original_glob)
 
     monkeypatch.setattr(
         "sneeze.slackbot.write_json_atomic",

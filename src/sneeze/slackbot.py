@@ -5325,18 +5325,21 @@ def _codex_hook_delivery_receipt_paths(
     message_hash: str,
     notify_user_id: str,
     transcript_path: str | None,
+    legacy_identity: bool = False,
 ) -> tuple[str, ...]:
     target = Path(state_path)
     paths = set()
     for alias in aliases:
+        identity_values = {
+            "alias": alias,
+            "turn_id": turn_id,
+            "message_sha256": message_hash,
+            "notify_user_id": notify_user_id,
+        }
+        if not legacy_identity:
+            identity_values["transcript_path"] = transcript_path
         identity = json.dumps(
-            {
-                "alias": alias,
-                "turn_id": turn_id,
-                "message_sha256": message_hash,
-                "notify_user_id": notify_user_id,
-                "transcript_path": transcript_path,
-            },
+            identity_values,
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -5345,6 +5348,29 @@ def _codex_hook_delivery_receipt_paths(
             str(target.with_name(f".{target.name}.{digest}.receipt.json"))
         )
     return tuple(sorted(paths))
+
+
+def _codex_hook_delivery_route_receipt_path(
+    state_path: str,
+    *,
+    channel_id: str,
+    thread_ts: str,
+    notify_user_id: str,
+) -> str:
+    identity = json.dumps(
+        {
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "notify_user_id": notify_user_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    target = Path(state_path)
+    return str(
+        target.with_name(f".{target.name}.route.{digest}.receipt.json")
+    )
 
 
 def _codex_hook_delivery_receipt(
@@ -5368,8 +5394,20 @@ def _codex_hook_delivery_receipt(
         elif desired_key not in (receipt_key, receipt_fallback_key):
             continue
         if transcript_path:
-            if receipt.get("transcript_path") != transcript_path:
+            stored_transcript_path = receipt.get("transcript_path")
+            if stored_transcript_path not in (None, transcript_path):
                 continue
+            if stored_transcript_path is None and not desired_key.startswith(
+                "session:"
+            ):
+                elapsed = _agent_tmux_elapsed_since(
+                    receipt.get("notified_at")
+                )
+                if (
+                    elapsed is None
+                    or elapsed > AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS
+                ):
+                    continue
         elif not desired_key.startswith("session:"):
             elapsed = _agent_tmux_elapsed_since(receipt.get("notified_at"))
             if (
@@ -5513,7 +5551,7 @@ def _locked_codex_hook_delivery(
                     extra_aliases=extra_aliases,
                 )
             )
-            receipt_paths = _codex_hook_delivery_receipt_paths(
+            write_receipt_paths = _codex_hook_delivery_receipt_paths(
                 state_path,
                 delivery_aliases,
                 turn_id=turn_id,
@@ -5521,8 +5559,20 @@ def _locked_codex_hook_delivery(
                 notify_user_id=notify_user_id,
                 transcript_path=transcript_path,
             )
+            legacy_receipt_paths = _codex_hook_delivery_receipt_paths(
+                state_path,
+                delivery_aliases,
+                turn_id=turn_id,
+                message_hash=message_hash,
+                notify_user_id=notify_user_id,
+                transcript_path=transcript_path,
+                legacy_identity=True,
+            )
+            cleanup_receipt_paths = tuple(
+                sorted({*write_receipt_paths, *legacy_receipt_paths})
+            )
             receipt = _codex_hook_delivery_receipt(
-                receipt_paths,
+                cleanup_receipt_paths,
                 desired_key=desired_key,
                 turn_id=turn_id,
                 message_hash=message_hash,
@@ -5541,8 +5591,23 @@ def _locked_codex_hook_delivery(
                 extra_aliases.update(receipt_aliases)
                 delivery_locks.close()
                 continue
+            if receipt:
+                route_receipt_path = _codex_hook_delivery_route_receipt_path(
+                    state_path,
+                    channel_id=str(receipt["channel_id"]),
+                    thread_ts=str(receipt["thread_ts"]),
+                    notify_user_id=notify_user_id,
+                )
+                cleanup_receipt_paths = tuple(
+                    sorted({*cleanup_receipt_paths, route_receipt_path})
+                )
             try:
-                yield delivery_aliases, receipt_paths, receipt
+                yield (
+                    delivery_aliases,
+                    write_receipt_paths,
+                    cleanup_receipt_paths,
+                    receipt,
+                )
             finally:
                 delivery_locks.close()
             return
@@ -5698,7 +5763,7 @@ def notify_codex_agent_stop(
         message_hash=message_hash,
         notify_user_id=notify_user_id,
         transcript_path=transcript_path,
-    ) as (_, receipt_paths, receipt):
+    ) as (_, write_receipt_paths, receipt_paths, receipt):
         with locked_agent_tmux_json_path(
             state_path,
             timeout_seconds=AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS,
@@ -5764,6 +5829,18 @@ def notify_codex_agent_stop(
 
         if duplicate:
             try:
+                if channel_id and thread_ts:
+                    route_receipt_path = (
+                        _codex_hook_delivery_route_receipt_path(
+                            state_path,
+                            channel_id=str(channel_id),
+                            thread_ts=str(thread_ts),
+                            notify_user_id=notify_user_id,
+                        )
+                    )
+                    receipt_paths = tuple(
+                        sorted({*receipt_paths, route_receipt_path})
+                    )
                 _remove_codex_hook_delivery_receipts(receipt_paths)
                 if binding and channel_id and thread_ts:
                     current_binding = query_agent_tmux_thread(
@@ -5860,7 +5937,22 @@ def notify_codex_agent_stop(
                 "transcript_path": transcript_path,
                 "notified_at": utcnow_iso(),
             }
-            _write_codex_hook_delivery_receipts(receipt_paths, receipt)
+            route_receipt_path = _codex_hook_delivery_route_receipt_path(
+                state_path,
+                channel_id=str(channel_id),
+                thread_ts=str(thread_ts),
+                notify_user_id=notify_user_id,
+            )
+            write_receipt_paths = tuple(
+                sorted({*write_receipt_paths, route_receipt_path})
+            )
+            receipt_paths = tuple(
+                sorted({*receipt_paths, route_receipt_path})
+            )
+            _write_codex_hook_delivery_receipts(
+                write_receipt_paths,
+                receipt,
+            )
 
         with _locked_codex_hook_finalization_state(state_path):
             state = read_json(state_path, {})
@@ -5999,18 +6091,22 @@ def codex_hook_delivery_receipt_for_route(
     thread_ts: str,
     notify_user_id: str,
 ) -> dict[str, Any] | None:
-    state_path = Path(agent_codex_hook_state_path(paths))
-    pattern = f".{state_path.name}.*.receipt.json"
-    for receipt_path in state_path.parent.glob(pattern):
-        receipt = read_json(receipt_path, {})
-        if not isinstance(receipt, dict):
-            continue
-        if (
-            receipt.get("channel_id") == channel_id
-            and receipt.get("thread_ts") == thread_ts
-            and receipt.get("notify_user_id") == notify_user_id
-        ):
-            return receipt
+    state_path = agent_codex_hook_state_path(paths)
+    receipt_path = _codex_hook_delivery_route_receipt_path(
+        state_path,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        notify_user_id=notify_user_id,
+    )
+    receipt = read_json(receipt_path, {})
+    if not isinstance(receipt, dict):
+        return None
+    if (
+        receipt.get("channel_id") == channel_id
+        and receipt.get("thread_ts") == thread_ts
+        and receipt.get("notify_user_id") == notify_user_id
+    ):
+        return receipt
     return None
 
 
