@@ -2264,6 +2264,115 @@ def test_codex_stop_hook_recovers_receipt_after_post_state_timeout(
     assert not list(Path(state_path).parent.glob(".*.receipt.json"))
 
 
+def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    original_write_json = slackbot_module.write_json_atomic
+
+    def fail_state_write(path, data, *args, **kwargs):
+        if str(path) == state_path:
+            raise OSError("state disk error")
+        return original_write_json(path, data, *args, **kwargs)
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr(
+        "sneeze.slackbot.write_json_atomic",
+        fail_state_write,
+    )
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+
+    with pytest.raises(
+        slackbot_module.CodexHookRetryableError,
+        match="state disk error",
+    ):
+        notify_codex_agent_stop(profile, payload)
+
+    monkeypatch.setattr(
+        "sneeze.slackbot.write_json_atomic",
+        original_write_json,
+    )
+    retry = notify_codex_agent_stop(profile, payload)
+
+    assert retry["status"] == "skipped"
+    assert retry["reason"] == "delivery_receipt"
+    assert len(calls) == 1
+
+
+def test_codex_stop_hook_wraps_durable_receipt_cleanup_failure(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    original_remove_receipts = (
+        slackbot_module._remove_codex_hook_delivery_receipts
+    )
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr(
+        "sneeze.slackbot._remove_codex_hook_delivery_receipts",
+        lambda paths: (_ for _ in ()).throw(OSError("cleanup disk error")),
+    )
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+
+    with pytest.raises(
+        slackbot_module.CodexHookRetryableError,
+        match="cleanup disk error",
+    ):
+        notify_codex_agent_stop(profile, payload)
+
+    monkeypatch.setattr(
+        "sneeze.slackbot._remove_codex_hook_delivery_receipts",
+        original_remove_receipts,
+    )
+    retry = notify_codex_agent_stop(profile, payload)
+
+    assert retry["status"] == "skipped"
+    assert retry["reason"] == "duplicate"
+    assert len(calls) == 1
+
+
 def test_codex_stop_hook_receipt_does_not_cross_shared_tmux_sessions(
     tmp_path,
     monkeypatch,
@@ -2411,7 +2520,7 @@ def test_codex_stop_hook_recovers_binding_without_duplicate_post(
         return {"channel": "D111", "ts": "1.000001"}
 
     def fail_bind(*args, **kwargs):
-        raise SlackbotError("simulated binding failure")
+        raise OSError("simulated binding failure")
 
     monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
     monkeypatch.setattr("sneeze.slackbot.bind_agent_tmux_thread", fail_bind)
@@ -2423,7 +2532,10 @@ def test_codex_stop_hook_recovers_binding_without_duplicate_post(
         }
     )
 
-    with pytest.raises(SlackbotError, match="simulated binding failure"):
+    with pytest.raises(
+        slackbot_module.CodexHookRetryableError,
+        match="simulated binding failure",
+    ):
         notify_codex_agent_stop(
             profile,
             payload,

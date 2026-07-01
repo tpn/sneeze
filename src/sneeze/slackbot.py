@@ -5545,7 +5545,7 @@ def _locked_codex_hook_finalization_state(state_path: str):
             timeout_seconds=AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS,
         ):
             yield
-    except SlackbotError as exc:
+    except Exception as exc:
         raise CodexHookRetryableError(
             "Codex hook delivery is durable but state finalization failed: "
             f"{exc}"
@@ -5730,23 +5730,10 @@ def notify_codex_agent_stop(
                     binding = _codex_hook_entry_binding(receipt_binding)
 
         if duplicate:
-            _remove_codex_hook_delivery_receipts(receipt_paths)
-            if binding and channel_id and thread_ts:
-                current_binding = query_agent_tmux_thread(
-                    profile,
-                    runtime_root=runtime_root,
-                    env_path=env_path,
-                    state_dir=state_dir,
-                    system_prompt_path=system_prompt_path,
-                    unit_name=unit_name,
-                    channel_id=channel_id,
-                    thread_ts=thread_ts,
-                    lock_timeout_seconds=(
-                        AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
-                    ),
-                )
-                if not current_binding:
-                    bind_agent_tmux_thread(
+            try:
+                _remove_codex_hook_delivery_receipts(receipt_paths)
+                if binding and channel_id and thread_ts:
+                    current_binding = query_agent_tmux_thread(
                         profile,
                         runtime_root=runtime_root,
                         env_path=env_path,
@@ -5755,15 +5742,34 @@ def notify_codex_agent_stop(
                         unit_name=unit_name,
                         channel_id=channel_id,
                         thread_ts=thread_ts,
-                        host=binding["host"],
-                        tmux_session=binding["tmux_session"],
-                        tmux_socket=binding.get("tmux_socket"),
-                        tmux_conf=binding.get("tmux_conf"),
-                        tmux_pane=binding.get("tmux_pane"),
                         lock_timeout_seconds=(
                             AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
                         ),
                     )
+                    if not current_binding:
+                        bind_agent_tmux_thread(
+                            profile,
+                            runtime_root=runtime_root,
+                            env_path=env_path,
+                            state_dir=state_dir,
+                            system_prompt_path=system_prompt_path,
+                            unit_name=unit_name,
+                            channel_id=channel_id,
+                            thread_ts=thread_ts,
+                            host=binding["host"],
+                            tmux_session=binding["tmux_session"],
+                            tmux_socket=binding.get("tmux_socket"),
+                            tmux_conf=binding.get("tmux_conf"),
+                            tmux_pane=binding.get("tmux_pane"),
+                            lock_timeout_seconds=(
+                                AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
+                            ),
+                        )
+            except Exception as exc:
+                raise CodexHookRetryableError(
+                    "Codex hook delivery is durable but duplicate "
+                    f"finalization failed: {exc}"
+                ) from exc
             return {
                 "status": "skipped",
                 "reason": "duplicate",
@@ -5877,7 +5883,13 @@ def notify_codex_agent_stop(
                 entry.update(binding)
             sessions[key] = entry
             write_json_atomic(state_path, state)
-        _remove_codex_hook_delivery_receipts(receipt_paths)
+        try:
+            _remove_codex_hook_delivery_receipts(receipt_paths)
+        except Exception as exc:
+            raise CodexHookRetryableError(
+                "Codex hook delivery is durable but receipt cleanup "
+                f"failed: {exc}"
+            ) from exc
 
         if binding:
             try:
@@ -5899,7 +5911,7 @@ def notify_codex_agent_stop(
                         AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
                     ),
                 )
-            except SlackbotError as exc:
+            except Exception as exc:
                 raise CodexHookRetryableError(
                     "Codex hook delivery is durable but tmux binding "
                     f"failed: {exc}"
