@@ -4285,7 +4285,7 @@ def tmux_command_for_binding(
     tmux_conf = (
         str(tmux_conf_value) if tmux_conf_value else codex_tmux_conf(config)
     )
-    command = [codex_tmux_bin(config), "-L", tmux_socket]
+    command = [codex_tmux_bin(config), *_tmux_socket_args(tmux_socket)]
     if tmux_conf:
         command.extend(["-f", tmux_conf])
     return command, tmux_socket, tmux_conf
@@ -4959,6 +4959,26 @@ def _codex_hook_state_key(
     )
 
 
+def _codex_hook_existing_entry(
+    sessions: dict[str, Any],
+    key: str,
+    fallback_key: str | None,
+) -> tuple[str, dict[str, Any]]:
+    entry = sessions.get(key)
+    if isinstance(entry, dict):
+        return key, dict(entry)
+    if fallback_key:
+        for candidate_key, candidate in sessions.items():
+            if not isinstance(candidate, dict):
+                continue
+            if (
+                candidate_key == fallback_key
+                or candidate.get("fallback_key") == fallback_key
+            ):
+                return candidate_key, dict(candidate)
+    return key, {}
+
+
 def _render_codex_stop_notification(
     payload: dict[str, Any],
     binding: dict[str, str] | None,
@@ -5059,11 +5079,21 @@ def notify_codex_agent_stop(
     message = _codex_hook_message_text(payload)
     message_hash = _codex_hook_message_hash(message)
     state_path = agent_codex_hook_state_path(config.paths)
+    fallback_key = _codex_hook_state_key({}, binding) if binding else None
 
     with AGENT_TMUX_LOCK, locked_json_path(state_path):
         state = read_json(state_path, {})
+        state["version"] = 1
         sessions = state.setdefault("sessions", {})
-        entry = sessions.setdefault(key, {})
+        existing_key, entry = _codex_hook_existing_entry(
+            sessions,
+            key,
+            fallback_key,
+        )
+        if key.startswith("session:") and existing_key != key:
+            sessions.pop(existing_key, None)
+        else:
+            key = existing_key
         if _codex_hook_notification_seen(
             entry,
             turn_id=turn_id,
@@ -5077,52 +5107,31 @@ def notify_codex_agent_stop(
             }
         channel_id = entry.get("channel_id") or None
         thread_ts = entry.get("thread_ts") or None
-
-    first_message = not (channel_id and thread_ts)
-    route = (
-        SlackbotRoute(channel_id=channel_id, thread_ts=thread_ts)
-        if channel_id and thread_ts
-        else SlackbotRoute(dm_user_id=notify_user_id)
-    )
-    response = post_slack_message(
-        config,
-        route,
-        _render_codex_stop_notification(
-            payload,
-            binding,
-            message,
-            first_message=first_message,
-        ),
-    )
-    if response:
-        channel_id = channel_id or response.get("channel")
-        thread_ts = thread_ts or response.get("ts")
-    if not channel_id or not thread_ts:
-        raise SlackbotError(
-            "Slack notification did not return a channel and timestamp"
+        first_message = not (channel_id and thread_ts)
+        route = (
+            SlackbotRoute(channel_id=channel_id, thread_ts=thread_ts)
+            if channel_id and thread_ts
+            else SlackbotRoute(dm_user_id=notify_user_id)
         )
-    if binding:
-        bind_agent_tmux_thread(
-            profile,
-            runtime_root=runtime_root,
-            env_path=env_path,
-            state_dir=state_dir,
-            system_prompt_path=system_prompt_path,
-            unit_name=unit_name,
-            channel_id=channel_id,
-            thread_ts=thread_ts,
-            host=binding["host"],
-            tmux_session=binding["tmux_session"],
-            tmux_socket=binding.get("tmux_socket"),
-            tmux_conf=binding.get("tmux_conf"),
+        response = post_slack_message(
+            config,
+            route,
+            _render_codex_stop_notification(
+                payload,
+                binding,
+                message,
+                first_message=first_message,
+            ),
         )
+        if response:
+            channel_id = channel_id or response.get("channel")
+            thread_ts = thread_ts or response.get("ts")
+        if not channel_id or not thread_ts:
+            raise SlackbotError(
+                "Slack notification did not return a channel and timestamp"
+            )
 
-    now = utcnow_iso()
-    with AGENT_TMUX_LOCK, locked_json_path(state_path):
-        state = read_json(state_path, {})
-        state["version"] = 1
-        sessions = state.setdefault("sessions", {})
-        entry = dict(sessions.get(key) or {})
+        now = utcnow_iso()
         notifications = [
             item
             for item in entry.get("notifications", [])
@@ -5138,10 +5147,11 @@ def notify_codex_agent_stop(
         entry.update(
             {
                 "key": key,
-                "session_id": _codex_hook_text_value(payload, "session_id"),
-                "fallback_key": (
-                    _codex_hook_state_key({}, binding) if binding else None
+                "session_id": (
+                    _codex_hook_text_value(payload, "session_id")
+                    or entry.get("session_id")
                 ),
+                "fallback_key": fallback_key,
                 "channel_id": channel_id,
                 "thread_ts": thread_ts,
                 "updated_at": now,
@@ -5156,6 +5166,22 @@ def notify_codex_agent_stop(
             entry.update(binding)
         sessions[key] = entry
         write_json_atomic(state_path, state)
+
+    if binding:
+        bind_agent_tmux_thread(
+            profile,
+            runtime_root=runtime_root,
+            env_path=env_path,
+            state_dir=state_dir,
+            system_prompt_path=system_prompt_path,
+            unit_name=unit_name,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            host=binding["host"],
+            tmux_session=binding["tmux_session"],
+            tmux_socket=binding.get("tmux_socket"),
+            tmux_conf=binding.get("tmux_conf"),
+        )
     return {
         "status": "notified",
         "state_path": state_path,
@@ -6237,6 +6263,10 @@ class SlackSocketBot:
             dm_user_id=slack_user_id if channel_type == "im" else None,
             thread_ts=thread_ts,
         )
+        is_bound_notify_thread = (
+            channel_type == "im"
+            and self._is_agent_notify_tmux_thread(route, slack_user_id)
+        )
         if event_type == "message" and channel_type not in {"im", "mpim"}:
             if not thread_ts or not self._is_authorized(
                 slack_user_id,
@@ -6246,8 +6276,10 @@ class SlackSocketBot:
                 return
             self._maybe_handle_agent_tmux(text, route)
             return
-        if channel_type == "im" and not self._allows_early_dm_response(
-            slack_user_id
+        if (
+            channel_type == "im"
+            and not is_bound_notify_thread
+            and not self._allows_early_dm_response(slack_user_id)
         ):
             self._post_unauthorized(route)
             return
@@ -6261,10 +6293,8 @@ class SlackSocketBot:
             route,
         ):
             return
-        if not self._is_authorized(
-            slack_user_id,
-            channel,
-            channel_type=channel_type,
+        if not is_bound_notify_thread and not self._is_authorized(
+            slack_user_id, channel, channel_type=channel_type
         ):
             self._post_unauthorized(route)
             return
@@ -7865,6 +7895,20 @@ class SlackSocketBot:
                 thread_ts=route.thread_ts,
             )
         )
+
+    def _is_agent_notify_tmux_thread(
+        self,
+        route: SlackbotRoute,
+        slack_user_id: str | None,
+    ) -> bool:
+        notify_user_id = env_lookup(
+            self.config.profile,
+            self.config.env,
+            AGENT_CODEX_HOOK_NOTIFY_USER_KEY,
+        )
+        if not notify_user_id or slack_user_id != notify_user_id:
+            return False
+        return self._agent_tmux_binding_for_route(route) is not None
 
     def _maybe_mirror_agent_tmux_reply(
         self,

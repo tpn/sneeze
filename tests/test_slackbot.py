@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,6 +55,7 @@ from sneeze.slackbot import (
     render_launchd_service,
     render_slack_blocks,
     render_systemd_service,
+    resolve_codex_agent_tmux_binding,
     resolve_slack_mentions,
     route_from_dict,
     route_to_dict,
@@ -68,6 +70,7 @@ from sneeze.slackbot import (
     store_agent_tmux_job,
     store_user_secret_token,
     strip_bot_mentions,
+    tmux_command_for_binding,
     trust_slack_channel,
     untrust_slack_channel,
     update_slack_message,
@@ -1276,6 +1279,62 @@ def test_agent_tmux_binding_store(tmp_path):
     assert binding["tmux_conf"] == str(tmp_path / "codex.tmux.conf")
 
 
+def test_tmux_binding_uses_absolute_socket_path(tmp_path):
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    socket_path = str(tmp_path / "tmux.sock")
+
+    command, tmux_socket, _ = tmux_command_for_binding(
+        config,
+        {
+            "host": "localhost",
+            "tmux_session": "codex-work",
+            "tmux_socket": socket_path,
+        },
+    )
+
+    assert command[1:3] == ["-S", socket_path]
+    assert tmux_socket == socket_path
+
+
+def test_tmux_binding_resolves_pane_from_tmux_socket_env(
+    tmp_path,
+    monkeypatch,
+):
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    socket_path = str(tmp_path / "tmux.sock")
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    monkeypatch.setenv("TMUX", f"{socket_path},123,0")
+    calls = []
+
+    def fake_run(args, check, capture_output, text):
+        calls.append(args)
+        if args[1:3] == ["-S", socket_path]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="codex-work\n",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
+
+    binding = resolve_codex_agent_tmux_binding(config)
+
+    assert binding["tmux_session"] == "codex-work"
+    assert binding["tmux_socket"] == socket_path
+    assert any(call[1:3] == ["-S", socket_path] for call in calls)
+
+
 def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
     tmp_path,
     monkeypatch,
@@ -1329,11 +1388,21 @@ def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
         tmux_session="codex-work",
         tmux_socket="codex",
     )
+    payload.pop("session_id")
+    payload["turn_id"] = "turn-3"
+    payload["last_assistant_message"] = "Fallback stop."
+    fallback = notify_codex_agent_stop(
+        profile,
+        json.dumps(payload),
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
 
     assert result["status"] == "notified"
     assert duplicate["status"] == "skipped"
     assert second["thread_ts"] == "1.000001"
-    assert len(calls) == 2
+    assert fallback["key"] == "session:codex-session-1"
+    assert len(calls) == 3
     assert "Reply in this thread" in calls[0][1]
     assert "Second stop." in calls[1][1]
     binding = query_agent_tmux_thread(
@@ -1345,7 +1414,98 @@ def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
     status = query_codex_agent_threads(profile)
     entry = status["hook_state"]["sessions"]["session:codex-session-1"]
     assert entry["channel_id"] == "D111"
-    assert len(entry["notifications"]) == 2
+    assert entry["session_id"] == "codex-session-1"
+    assert len(entry["notifications"]) == 3
+
+
+def test_codex_stop_hook_suppresses_overlapping_duplicate(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        time.sleep(0.05)
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                notify_codex_agent_stop,
+                profile,
+                payload,
+                tmux_session="codex-work",
+                tmux_socket="codex",
+            )
+            for _ in range(2)
+        ]
+        results = [future.result() for future in futures]
+
+    assert len(calls) == 1
+    assert sorted(result["status"] for result in results) == [
+        "notified",
+        "skipped",
+    ]
+
+
+def test_codex_stop_hook_can_notify_without_tmux_binding(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    for env_name in (
+        "WEBMUX_AGENT_SESSION",
+        "CODEX_TMUX_SESSION_NAME",
+        "TMUX_PANE",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: {
+            "channel": "D111",
+            "ts": "1.000001",
+        },
+    )
+
+    result = notify_codex_agent_stop(
+        profile,
+        json.dumps(
+            {
+                "session_id": "codex-session-1",
+                "turn_id": "turn-1",
+                "last_assistant_message": "Ready for review.",
+            }
+        ),
+    )
+
+    assert result["status"] == "notified"
+    assert result["tmux_binding"] is None
+    assert query_codex_agent_threads(profile)["agent_tmux_bindings"] == {}
 
 
 def test_codex_agent_hooks_install_preserves_unrelated_hooks(tmp_path):
@@ -1451,6 +1611,33 @@ def test_codex_agent_hooks_install_preserves_unrelated_hooks(tmp_path):
         == 15
     )
     assert all(handler["timeout"] == 10 for handler in prompt_handlers)
+
+
+def test_codex_agent_hooks_install_can_skip_webmux(tmp_path):
+    hooks_path = tmp_path / "hooks.json"
+
+    result = install_codex_agent_hooks(
+        hooks_path=str(hooks_path),
+        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        include_webmux=False,
+    )
+
+    updated = json.loads(hooks_path.read_text(encoding="utf-8"))
+    stop_handlers = [
+        handler
+        for group in updated["hooks"]["Stop"]
+        for handler in group["hooks"]
+    ]
+    assert updated["hooks"]["UserPromptSubmit"] == []
+    assert stop_handlers == [
+        {
+            "type": "command",
+            "command": "trentn-bot slackbot-agent-stop-hook",
+            "timeout": 15,
+            "statusMessage": "Notifying Slack",
+        }
+    ]
+    assert result["installed"] == {"slack_stop": True, "webmux": False}
 
 
 def test_agent_tmux_capture_bound_thread(tmp_path, monkeypatch):
@@ -6122,7 +6309,8 @@ def test_bound_dm_reply_is_pasted_into_idle_tmux(
     env_path = Path(config.paths.env_path)
     env_path.write_text(
         env_path.read_text(encoding="utf-8")
-        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n"
+        + "SAMPLE_SLACKBOT_ALLOWED_DM_USER_IDS=U222\n",
         encoding="utf-8",
     )
     config = load_config(profile)
