@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import sys
 import threading
 import time
@@ -1388,6 +1389,12 @@ def test_tmux_binding_resolves_pane_from_tmux_socket_env(
                 stdout="codex-work\n",
                 stderr="",
             )
+        if args[1:3] == ["-L", "codex"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="wrong-session\n",
+                stderr="",
+            )
         return SimpleNamespace(returncode=1, stdout="", stderr="")
 
     monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
@@ -1397,7 +1404,7 @@ def test_tmux_binding_resolves_pane_from_tmux_socket_env(
     assert binding["tmux_session"] == "codex-work"
     assert binding["tmux_socket"] == socket_path
     assert binding["tmux_pane"] == "%7"
-    assert any(call[1:3] == ["-S", socket_path] for call in calls)
+    assert calls[0][1:3] == ["-S", socket_path]
 
 
 def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
@@ -2604,6 +2611,66 @@ def test_codex_agent_hooks_install_can_skip_webmux(tmp_path):
     assert result["installed"] == {"slack_stop": True, "webmux": False}
 
 
+def test_codex_agent_hooks_install_warns_without_webmux_path(tmp_path):
+    result = install_codex_agent_hooks(
+        hooks_path=str(tmp_path / "hooks.json"),
+        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        include_webmux=True,
+    )
+
+    assert result["installed"] == {"slack_stop": True, "webmux": False}
+    assert result["warnings"] == [
+        "WebMux hooks requested without a status script path"
+    ]
+
+
+def test_agent_hooks_install_command_builds_runtime_stop_command(tmp_path):
+    import io
+
+    from sneeze.slackbot_commands import SlackbotAgentHooksInstallBase
+
+    class SampleAgentHooksInstall(SlackbotAgentHooksInstallBase):
+        profile = make_profile(tmp_path)
+
+    cli_bin = tmp_path / "sample-bot"
+    cli_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    cli_bin.chmod(0o755)
+    hooks_path = tmp_path / "hooks.json"
+    runtime_root = tmp_path / "runtime-custom"
+    env_path = runtime_root / "bot.env"
+    state_dir = runtime_root / "state-custom"
+    prompt_path = runtime_root / "prompt.md"
+    command = SampleAgentHooksInstall(
+        io.StringIO(),
+        io.StringIO(),
+        io.StringIO(),
+    )
+    command._cli_bin = str(cli_bin)
+    command._hooks_path = str(hooks_path)
+    command._no_webmux = True
+    command._runtime_root = str(runtime_root)
+    command._env_path = str(env_path)
+    command._state_dir = str(state_dir)
+    command._system_prompt_path = str(prompt_path)
+    command._unit_name = "sample-custom.service"
+
+    command.run()
+
+    installed = json.loads(hooks_path.read_text(encoding="utf-8"))
+    stop_handler = installed["hooks"]["Stop"][0]["hooks"][0]
+    argv = shlex.split(stop_handler["command"])
+    assert argv == [
+        str(cli_bin),
+        "slackbot-agent-stop-hook",
+        f"--runtime-root={runtime_root}",
+        f"--env-path={env_path}",
+        f"--state-dir={state_dir}",
+        f"--system-prompt-path={prompt_path}",
+        "--unit-name=sample-custom.service",
+    ]
+    assert stop_handler["timeout"] == 60
+
+
 def test_agent_tmux_capture_bound_thread(tmp_path, monkeypatch):
     tmux_conf = tmp_path / "codex.tmux.conf"
     profile = replace(
@@ -2627,6 +2694,12 @@ def test_agent_tmux_capture_bound_thread(tmp_path, monkeypatch):
 
     def fake_run(args, check, capture_output, text):
         calls.append(args)
+        if "display-message" in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="codex-work\n",
+                stderr="",
+            )
         return SimpleNamespace(
             returncode=0,
             stdout="alpha\nbeta\n",
@@ -2644,8 +2717,9 @@ def test_agent_tmux_capture_bound_thread(tmp_path, monkeypatch):
 
     assert result["text"] == "alpha\nbeta"
     assert result["line_count"] == 5
-    assert Path(calls[0][0]).name == "tmux"
-    assert calls[0][1:] == [
+    capture_call = next(call for call in calls if "capture-pane" in call)
+    assert Path(capture_call[0]).name == "tmux"
+    assert capture_call[1:] == [
         "-L",
         "codex",
         "-f",
@@ -2670,6 +2744,12 @@ def test_agent_tmux_paste_targets_bound_pane(tmp_path, monkeypatch):
 
     def fake_run(args, **kwargs):
         calls.append((args, kwargs))
+        if "display-message" in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="codex-work\n",
+                stderr="",
+            )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
@@ -2685,10 +2765,48 @@ def test_agent_tmux_paste_targets_bound_pane(tmp_path, monkeypatch):
         "literal $HOME; -- text",
     )
 
-    assert calls[0][0][3:5] == ["load-buffer", "-b"]
-    assert calls[0][1]["input"] == "literal $HOME; -- text"
-    assert calls[1][0][-2:] == ["-t", "%7"]
-    assert calls[2][0][-2:] == ["%7", "Enter"]
+    assert calls[1][0][3:5] == ["load-buffer", "-b"]
+    assert calls[1][1]["input"] == "literal $HOME; -- text"
+    assert calls[2][0][-2:] == ["-t", "%7"]
+    assert calls[3][0][-2:] == ["%7", "Enter"]
+
+
+def test_agent_tmux_rejects_reused_pane_from_another_session(
+    tmp_path,
+    monkeypatch,
+):
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="different-session\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
+
+    with pytest.raises(SlackbotError, match="no longer belongs"):
+        paste_agent_tmux_text(
+            config,
+            {
+                "host": "localhost",
+                "tmux_session": "codex-work",
+                "tmux_socket": "codex",
+                "tmux_pane": "%7",
+            },
+            "do not paste",
+        )
+
+    assert len(calls) == 1
+    assert "display-message" in calls[0]
 
 
 def test_agent_tmux_sample_selects_bound_pane_cwd(tmp_path, monkeypatch):
@@ -2712,6 +2830,12 @@ def test_agent_tmux_sample_selects_bound_pane_cwd(tmp_path, monkeypatch):
 
     def fake_run(args, **kwargs):
         calls.append(args)
+        if "display-message" in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="codex-work\n",
+                stderr="",
+            )
         if "capture-pane" in args:
             return SimpleNamespace(
                 returncode=0, stdout="Ready\n›\n", stderr=""

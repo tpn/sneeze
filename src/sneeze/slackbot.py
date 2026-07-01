@@ -808,11 +808,6 @@ def locked_agent_tmux_json_path(
             try_locked_agent_tmux_json_path(path)
         )
         if acquired:
-            if time.monotonic() > deadline:
-                candidate_lock.close()
-                raise SlackbotError(
-                    f"Timed out waiting for Slackbot state lock: {path}"
-                )
             break
         candidate_lock.close()
         remaining = deadline - time.monotonic()
@@ -4435,13 +4430,31 @@ def tmux_command_for_binding(
     return command, tmux_socket, tmux_conf
 
 
-def agent_tmux_target(binding: dict[str, Any]) -> str:
-    tmux_pane = str(binding.get("tmux_pane") or "").strip()
-    if tmux_pane:
-        return tmux_pane
+def agent_tmux_target(
+    config: SlackbotConfig,
+    binding: dict[str, Any],
+) -> str:
     tmux_session = str(binding.get("tmux_session") or "").strip()
     if not tmux_session:
         raise SlackbotError("The tmux binding is missing a session name")
+    tmux_pane = str(binding.get("tmux_pane") or "").strip()
+    if tmux_pane:
+        tmux_command, tmux_socket, tmux_conf = tmux_command_for_binding(
+            config,
+            binding,
+        )
+        current_session = _tmux_session_from_pane(
+            tmux_command[0],
+            tmux_pane,
+            tmux_socket=tmux_socket,
+            tmux_conf=tmux_conf,
+        )
+        if current_session != tmux_session:
+            raise SlackbotError(
+                f"The bound tmux pane {tmux_pane} no longer belongs to "
+                f"session {tmux_session}"
+            )
+        return tmux_pane
     return tmux_session
 
 
@@ -4534,9 +4547,9 @@ def resolve_codex_agent_tmux_binding(
     )
     host = socket.gethostname()
     tmux_env_socket = _tmux_socket_path_from_env(os.environ.get("TMUX"))
-    pane_id = str(payload.get("tmux_pane") or "").strip() or os.environ.get(
-        "TMUX_PANE"
-    )
+    payload_pane_id = str(payload.get("tmux_pane") or "").strip()
+    environment_pane_id = os.environ.get("TMUX_PANE")
+    pane_id = payload_pane_id or environment_pane_id
     if explicit_session:
         session_socket = explicit_socket or tmux_env_socket or resolved_socket
         session_conf = explicit_conf
@@ -4564,6 +4577,8 @@ def resolve_codex_agent_tmux_binding(
         return None
     tmux_bin = codex_tmux_bin(config)
     attempts: list[tuple[str | None, str | None]] = []
+    if environment_pane_id and not payload_pane_id and tmux_env_socket:
+        attempts.append((tmux_env_socket, None))
     attempts.append((resolved_socket, resolved_conf))
     if tmux_env_socket:
         attempts.append((tmux_env_socket, None))
@@ -4826,7 +4841,7 @@ def capture_agent_tmux_thread(
     tmux_session = str(binding.get("tmux_session") or "")
     if not tmux_session:
         raise SlackbotError("The tmux binding is missing a session name")
-    tmux_target = agent_tmux_target(binding)
+    tmux_target = agent_tmux_target(config, binding)
     lines = agent_tmux_capture_line_count(line_count)
     tmux_command, tmux_socket, tmux_conf = tmux_command_for_binding(
         config,
@@ -4879,7 +4894,7 @@ def sample_agent_tmux_thread(
     )
     binding = dict(result["binding"])
     tmux_command, _, _ = tmux_command_for_binding(config, binding)
-    tmux_target = agent_tmux_target(binding)
+    tmux_target = agent_tmux_target(config, binding)
     tmux_pane = str(binding.get("tmux_pane") or "")
     panes = subprocess.run(
         [
@@ -4960,7 +4975,7 @@ def send_agent_tmux_keys(
     tmux_session = str(binding.get("tmux_session") or "")
     if not tmux_session:
         raise SlackbotError("The tmux binding is missing a session name")
-    tmux_target = agent_tmux_target(binding)
+    tmux_target = agent_tmux_target(config, binding)
     tmux_command, tmux_socket, _ = tmux_command_for_binding(config, binding)
     args = [*tmux_command, "send-keys", "-t", tmux_target]
     if interrupt:
@@ -5017,7 +5032,7 @@ def paste_agent_tmux_text(
     tmux_session = str(binding.get("tmux_session") or "")
     if not tmux_session:
         raise SlackbotError("The tmux binding is missing a session name")
-    tmux_target = agent_tmux_target(binding)
+    tmux_target = agent_tmux_target(config, binding)
     tmux_command, tmux_socket, _ = tmux_command_for_binding(config, binding)
     buffer_name = f"sneeze-agent-{uuid.uuid4().hex}"
     load_result = subprocess.run(
@@ -5899,17 +5914,6 @@ def query_codex_agent_threads(
     }
 
 
-def default_webmux_agent_status_script() -> str:
-    return str(
-        Path.home()
-        / "src"
-        / "webmux"
-        / "webmux"
-        / "scripts"
-        / "webmux-agent-status.js"
-    )
-
-
 def _codex_hook_command_handler(
     command: str,
     *,
@@ -6001,9 +6005,16 @@ def install_codex_agent_hooks(
     installed: dict[str, Any] = {"slack_stop": True, "webmux": False}
     commands = [slack_stop_command]
     resolved_webmux_script = (
-        webmux_script_path or default_webmux_agent_status_script()
+        str(Path(webmux_script_path).expanduser())
+        if webmux_script_path
+        else None
     )
-    if include_webmux and Path(resolved_webmux_script).exists():
+    warnings = []
+    if (
+        include_webmux
+        and resolved_webmux_script
+        and Path(resolved_webmux_script).exists()
+    ):
         installed["webmux"] = True
         working = _webmux_agent_status_command(
             resolved_webmux_script,
@@ -6040,6 +6051,16 @@ def install_codex_agent_hooks(
                 ]
             }
         )
+    elif include_webmux:
+        if resolved_webmux_script:
+            warnings.append(
+                "WebMux status script does not exist: "
+                f"{resolved_webmux_script}"
+            )
+        else:
+            warnings.append(
+                "WebMux hooks requested without a status script path"
+            )
     hooks["Stop"].append(
         {
             "hooks": [
@@ -6064,12 +6085,15 @@ def install_codex_agent_hooks(
         )
         backup_path = str(backup)
     write_json_atomic(target, config)
-    return {
+    result = {
         "hooks_path": str(target),
         "backup_path": backup_path,
         "installed": installed,
         "commands": commands,
     }
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 def get_agent_tmux_job(

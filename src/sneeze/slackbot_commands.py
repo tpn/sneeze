@@ -1107,7 +1107,10 @@ class SlackbotAgentStopHookBase(ProfiledSlackbotCommand):
                 tmux_conf=self._tmux_conf or self.tmux_conf,
             )
         except Exception as exc:
-            self._err(f"slackbot-agent-stop-hook: {exc}")
+            self._err(
+                "slackbot-agent-stop-hook failed; Codex will continue: "
+                f"{exc}"
+            )
 
 
 class SlackbotAgentHooksInstallBase(ProfiledSlackbotCommand):
