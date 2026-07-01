@@ -2809,6 +2809,35 @@ def test_agent_tmux_rejects_reused_pane_from_another_session(
     assert "display-message" in calls[0]
 
 
+def test_agent_tmux_reports_missing_bound_pane(tmp_path, monkeypatch):
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    monkeypatch.setattr(
+        "sneeze.slackbot.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="can't find pane: %7",
+        ),
+    )
+
+    with pytest.raises(SlackbotError, match="could not be found"):
+        paste_agent_tmux_text(
+            config,
+            {
+                "host": "localhost",
+                "tmux_session": "codex-work",
+                "tmux_socket": "codex",
+                "tmux_pane": "%7",
+            },
+            "do not paste",
+        )
+
+
 def test_agent_tmux_sample_selects_bound_pane_cwd(tmp_path, monkeypatch):
     profile = replace(
         make_profile(tmp_path),

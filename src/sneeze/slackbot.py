@@ -4449,6 +4449,11 @@ def agent_tmux_target(
             tmux_socket=tmux_socket,
             tmux_conf=tmux_conf,
         )
+        if current_session is None:
+            raise SlackbotError(
+                f"The bound tmux pane {tmux_pane} could not be found "
+                f"on socket {tmux_socket}"
+            )
         if current_session != tmux_session:
             raise SlackbotError(
                 f"The bound tmux pane {tmux_pane} no longer belongs to "
