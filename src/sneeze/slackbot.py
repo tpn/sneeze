@@ -5386,10 +5386,7 @@ def _remove_codex_hook_delivery_receipts(
     receipt_paths: Iterable[str],
 ) -> None:
     for receipt_path in receipt_paths:
-        try:
-            Path(receipt_path).unlink(missing_ok=True)
-        except OSError:
-            pass
+        Path(receipt_path).unlink(missing_ok=True)
 
 
 def _codex_hook_delivery_aliases(
@@ -5545,6 +5542,8 @@ def _locked_codex_hook_finalization_state(state_path: str):
             timeout_seconds=AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS,
         ):
             yield
+    except CodexHookRetryableError:
+        raise
     except Exception as exc:
         raise CodexHookRetryableError(
             "Codex hook delivery is durable but state finalization failed: "

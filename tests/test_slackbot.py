@@ -2340,14 +2340,15 @@ def test_codex_stop_hook_wraps_durable_receipt_cleanup_failure(
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
-    original_remove_receipts = (
-        slackbot_module._remove_codex_hook_delivery_receipts
-    )
+    original_unlink = Path.unlink
+
+    def fail_receipt_unlink(path, *args, **kwargs):
+        if path.name.endswith(".receipt.json"):
+            raise OSError("cleanup disk error")
+        return original_unlink(path, *args, **kwargs)
+
     monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
-    monkeypatch.setattr(
-        "sneeze.slackbot._remove_codex_hook_delivery_receipts",
-        lambda paths: (_ for _ in ()).throw(OSError("cleanup disk error")),
-    )
+    monkeypatch.setattr(Path, "unlink", fail_receipt_unlink)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -2362,12 +2363,59 @@ def test_codex_stop_hook_wraps_durable_receipt_cleanup_failure(
     ):
         notify_codex_agent_stop(profile, payload)
 
-    monkeypatch.setattr(
-        "sneeze.slackbot._remove_codex_hook_delivery_receipts",
-        original_remove_receipts,
-    )
+    monkeypatch.setattr(Path, "unlink", original_unlink)
     retry = notify_codex_agent_stop(profile, payload)
 
+    assert retry["status"] == "skipped"
+    assert retry["reason"] == "duplicate"
+    assert len(calls) == 1
+
+
+def test_codex_stop_hook_wraps_duplicate_receipt_cleanup_failure(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+    notify_codex_agent_stop(profile, payload)
+    original_unlink = Path.unlink
+
+    def fail_receipt_unlink(path, *args, **kwargs):
+        if path.name.endswith(".receipt.json"):
+            raise OSError("duplicate cleanup disk error")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_receipt_unlink)
+
+    with pytest.raises(
+        slackbot_module.CodexHookRetryableError,
+        match="duplicate cleanup disk error",
+    ):
+        notify_codex_agent_stop(profile, payload)
+
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    retry = notify_codex_agent_stop(profile, payload)
     assert retry["status"] == "skipped"
     assert retry["reason"] == "duplicate"
     assert len(calls) == 1
