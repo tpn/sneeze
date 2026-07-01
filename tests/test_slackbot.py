@@ -1366,6 +1366,28 @@ def test_tmux_binding_explicit_session_uses_active_socket(
     assert "tmux_conf" not in binding
 
 
+def test_tmux_binding_rejects_invalid_supplied_pane(
+    tmp_path,
+    monkeypatch,
+):
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    monkeypatch.setenv("WEBMUX_AGENT_SESSION", "codex-work")
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    monkeypatch.setattr(
+        "sneeze.slackbot._tmux_session_from_pane",
+        lambda *args, **kwargs: "different-session",
+    )
+
+    binding = resolve_codex_agent_tmux_binding(config)
+
+    assert binding is None
+
+
 def test_tmux_binding_resolves_pane_from_tmux_socket_env(
     tmp_path,
     monkeypatch,
@@ -2669,6 +2691,42 @@ def test_agent_hooks_install_command_builds_runtime_stop_command(tmp_path):
         "--unit-name=sample-custom.service",
     ]
     assert stop_handler["timeout"] == 60
+
+
+def test_agent_stop_hook_command_retries_before_soft_failure(
+    tmp_path,
+    monkeypatch,
+):
+    import io
+
+    from sneeze.slackbot_commands import SlackbotAgentStopHookBase
+
+    class SampleAgentStopHook(SlackbotAgentStopHookBase):
+        profile = make_profile(tmp_path)
+
+    calls = []
+
+    def fake_notify(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            raise SlackbotError("state finalization timed out")
+        return {"status": "skipped", "reason": "delivery_receipt"}
+
+    monkeypatch.setattr(
+        "sneeze.slackbot_commands.notify_codex_agent_stop",
+        fake_notify,
+    )
+    estream = io.StringIO()
+    command = SampleAgentStopHook(
+        io.StringIO('{"session_id":"codex-session-1"}'),
+        io.StringIO(),
+        estream,
+    )
+
+    command.run()
+
+    assert len(calls) == 2
+    assert estream.getvalue() == ""
 
 
 def test_agent_tmux_capture_bound_thread(tmp_path, monkeypatch):

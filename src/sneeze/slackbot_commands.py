@@ -1097,20 +1097,24 @@ class SlackbotAgentStopHookBase(ProfiledSlackbotCommand):
 
     def run(self):
         hook_input = self.istream.read() or ""
-        try:
-            notify_codex_agent_stop(
-                self._profile(),
-                hook_input,
-                **self._common(),
-                tmux_session=self._tmux_session or self.tmux_session,
-                tmux_socket=self._tmux_socket or self.tmux_socket,
-                tmux_conf=self._tmux_conf or self.tmux_conf,
-            )
-        except Exception as exc:
-            self._err(
-                "slackbot-agent-stop-hook failed; Codex will continue: "
-                f"{exc}"
-            )
+        for attempt in range(2):
+            try:
+                notify_codex_agent_stop(
+                    self._profile(),
+                    hook_input,
+                    **self._common(),
+                    tmux_session=self._tmux_session or self.tmux_session,
+                    tmux_socket=self._tmux_socket or self.tmux_socket,
+                    tmux_conf=self._tmux_conf or self.tmux_conf,
+                )
+                return
+            except Exception as exc:
+                if attempt == 0:
+                    continue
+                self._err(
+                    "slackbot-agent-stop-hook failed after retry; "
+                    f"Codex will continue: {exc}"
+                )
 
 
 class SlackbotAgentHooksInstallBase(ProfiledSlackbotCommand):

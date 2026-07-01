@@ -4576,6 +4576,8 @@ def resolve_codex_agent_tmux_binding(
             )
             if pane_session == explicit_session:
                 binding["tmux_pane"] = pane_id
+            else:
+                return None
         return binding
 
     if not pane_id:
@@ -5682,7 +5684,8 @@ def notify_codex_agent_stop(
                         "session_id": _codex_hook_text_value(
                             payload,
                             "session_id",
-                        ),
+                        )
+                        or entry.get("session_id"),
                         "fallback_key": fallback_key,
                         "notify_user_id": notify_user_id,
                     }
