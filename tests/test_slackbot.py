@@ -2003,6 +2003,74 @@ def test_codex_stop_hook_times_out_waiting_for_resolver_lock(
             notify_codex_agent_stop(profile, payload)
 
 
+def test_codex_stop_hook_recovers_receipt_after_post_state_timeout(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS",
+        0.05,
+    )
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    start_holder = threading.Event()
+    lock_held = threading.Event()
+    release_holder = threading.Event()
+    calls = []
+
+    def hold_state_lock():
+        start_holder.wait(timeout=1)
+        with slackbot_module.locked_agent_tmux_json_path(state_path):
+            lock_held.set()
+            release_holder.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_state_lock)
+    holder.start()
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        start_holder.set()
+        assert lock_held.wait(timeout=1)
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+
+    try:
+        with pytest.raises(SlackbotError, match="Slackbot state lock"):
+            notify_codex_agent_stop(profile, payload)
+        receipt_paths = list(Path(state_path).parent.glob(".*.receipt.json"))
+        assert receipt_paths
+    finally:
+        release_holder.set()
+        holder.join(timeout=1)
+
+    retry = notify_codex_agent_stop(profile, payload)
+
+    assert retry["status"] == "skipped"
+    assert retry["reason"] == "delivery_receipt"
+    assert len(calls) == 1
+    entry = query_codex_agent_threads(profile)["hook_state"]["sessions"][
+        "session:codex-session-1"
+    ]
+    assert len(entry["notifications"]) == 1
+    assert not list(Path(state_path).parent.glob(".*.receipt.json"))
+
+
 def test_codex_stop_hook_recovers_binding_without_duplicate_post(
     tmp_path,
     monkeypatch,

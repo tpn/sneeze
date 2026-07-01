@@ -5150,6 +5150,74 @@ def _codex_hook_delivery_lock_paths(
     )
 
 
+def _codex_hook_delivery_receipt_paths(
+    state_path: str,
+    aliases: Iterable[str],
+    *,
+    turn_id: str | None,
+    message_hash: str,
+    notify_user_id: str,
+) -> tuple[str, ...]:
+    target = Path(state_path)
+    paths = set()
+    for alias in aliases:
+        identity = json.dumps(
+            {
+                "alias": alias,
+                "turn_id": turn_id,
+                "message_sha256": message_hash,
+                "notify_user_id": notify_user_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        paths.add(
+            str(target.with_name(f".{target.name}.{digest}.receipt.json"))
+        )
+    return tuple(sorted(paths))
+
+
+def _codex_hook_delivery_receipt(
+    receipt_paths: Iterable[str],
+    *,
+    turn_id: str | None,
+    message_hash: str,
+    notify_user_id: str,
+) -> dict[str, Any] | None:
+    for receipt_path in receipt_paths:
+        receipt = read_json(receipt_path, {})
+        if not isinstance(receipt, dict):
+            continue
+        if (
+            receipt.get("turn_id") == turn_id
+            and receipt.get("message_sha256") == message_hash
+            and receipt.get("notify_user_id") == notify_user_id
+            and receipt.get("channel_id")
+            and receipt.get("thread_ts")
+        ):
+            return receipt
+    return None
+
+
+def _write_codex_hook_delivery_receipts(
+    receipt_paths: Iterable[str],
+    receipt: dict[str, Any],
+) -> None:
+    for receipt_path in receipt_paths:
+        write_json_atomic(receipt_path, receipt)
+
+
+def _remove_codex_hook_delivery_receipts(
+    receipt_paths: Iterable[str],
+) -> None:
+    for receipt_path in receipt_paths:
+        try:
+            Path(receipt_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _codex_hook_delivery_aliases(
     sessions: dict[str, Any],
     desired_key: str,
@@ -5231,7 +5299,7 @@ def _locked_codex_hook_delivery_aliases(
             )
         time.sleep(min(0.01, remaining))
     try:
-        yield
+        yield set(aliases or ())
     finally:
         candidate_locks.close()
 
@@ -5346,7 +5414,20 @@ def notify_codex_agent_stop(
         state_path,
         desired_key,
         fallback_key,
-    ):
+    ) as delivery_aliases:
+        receipt_paths = _codex_hook_delivery_receipt_paths(
+            state_path,
+            delivery_aliases,
+            turn_id=turn_id,
+            message_hash=message_hash,
+            notify_user_id=notify_user_id,
+        )
+        receipt = _codex_hook_delivery_receipt(
+            receipt_paths,
+            turn_id=turn_id,
+            message_hash=message_hash,
+            notify_user_id=notify_user_id,
+        )
         with locked_agent_tmux_json_path(
             state_path,
             timeout_seconds=AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS,
@@ -5393,6 +5474,7 @@ def notify_codex_agent_stop(
                 write_json_atomic(state_path, state)
 
         if duplicate:
+            _remove_codex_hook_delivery_receipts(receipt_paths)
             if binding and channel_id and thread_ts:
                 current_binding = query_agent_tmux_thread(
                     profile,
@@ -5432,29 +5514,58 @@ def notify_codex_agent_stop(
                 "key": key,
             }
 
-        first_message = not (channel_id and thread_ts)
-        route = (
-            SlackbotRoute(channel_id=channel_id, thread_ts=thread_ts)
-            if channel_id and thread_ts
-            else SlackbotRoute(dm_user_id=notify_user_id)
-        )
-        response = post_slack_message(
-            config,
-            route,
-            _render_codex_stop_notification(
-                payload,
-                binding,
-                message,
-                first_message=first_message,
-            ),
-        )
-        if response:
-            channel_id = channel_id or response.get("channel")
-            thread_ts = thread_ts or response.get("ts")
-        if not channel_id or not thread_ts:
-            raise SlackbotError(
-                "Slack notification did not return a channel and timestamp"
+        recovered_receipt = receipt is not None
+        if receipt:
+            channel_id = str(receipt["channel_id"])
+            thread_ts = str(receipt["thread_ts"])
+            receipt_key = str(receipt.get("key") or "")
+            if receipt_key.startswith("session:"):
+                desired_key = receipt_key
+            fallback_key = (
+                str(receipt.get("fallback_key") or "").strip() or fallback_key
             )
+            if not binding:
+                receipt_binding = receipt.get("tmux_binding")
+                if isinstance(receipt_binding, dict):
+                    binding = _codex_hook_entry_binding(receipt_binding)
+        else:
+            first_message = not (channel_id and thread_ts)
+            route = (
+                SlackbotRoute(channel_id=channel_id, thread_ts=thread_ts)
+                if channel_id and thread_ts
+                else SlackbotRoute(dm_user_id=notify_user_id)
+            )
+            response = post_slack_message(
+                config,
+                route,
+                _render_codex_stop_notification(
+                    payload,
+                    binding,
+                    message,
+                    first_message=first_message,
+                ),
+            )
+            if response:
+                channel_id = channel_id or response.get("channel")
+                thread_ts = thread_ts or response.get("ts")
+            if not channel_id or not thread_ts:
+                raise SlackbotError(
+                    "Slack notification did not return a channel and "
+                    "timestamp"
+                )
+            receipt = {
+                "version": 1,
+                "key": desired_key,
+                "fallback_key": fallback_key,
+                "notify_user_id": notify_user_id,
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+                "turn_id": turn_id,
+                "message_sha256": message_hash,
+                "tmux_binding": binding,
+                "notified_at": utcnow_iso(),
+            }
+            _write_codex_hook_delivery_receipts(receipt_paths, receipt)
 
         with locked_agent_tmux_json_path(
             state_path,
@@ -5514,6 +5625,7 @@ def notify_codex_agent_stop(
                 entry.update(binding)
             sessions[key] = entry
             write_json_atomic(state_path, state)
+        _remove_codex_hook_delivery_receipts(receipt_paths)
 
         if binding:
             bind_agent_tmux_thread(
@@ -5534,7 +5646,8 @@ def notify_codex_agent_stop(
                 ),
             )
     return {
-        "status": "notified",
+        "status": "skipped" if recovered_receipt else "notified",
+        "reason": "delivery_receipt" if recovered_receipt else None,
         "state_path": state_path,
         "key": key,
         "channel_id": channel_id,
