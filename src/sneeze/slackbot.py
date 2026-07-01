@@ -5042,6 +5042,28 @@ def _codex_hook_delivery_lock_paths(
     )
 
 
+def _codex_hook_delivery_aliases(
+    sessions: dict[str, Any],
+    desired_key: str,
+    fallback_key: str | None,
+) -> set[str]:
+    aliases = {desired_key}
+    if fallback_key:
+        aliases.add(fallback_key)
+    _, entry = _codex_hook_existing_entry(
+        sessions,
+        desired_key,
+        fallback_key,
+    )
+    session_id = str(entry.get("session_id") or "").strip()
+    if session_id:
+        aliases.add(f"session:{session_id}")
+    stored_fallback_key = str(entry.get("fallback_key") or "").strip()
+    if stored_fallback_key:
+        aliases.add(stored_fallback_key)
+    return aliases
+
+
 def _render_codex_stop_notification(
     payload: dict[str, Any],
     binding: dict[str, str] | None,
@@ -5143,15 +5165,28 @@ def notify_codex_agent_stop(
     message_hash = _codex_hook_message_hash(message)
     state_path = agent_codex_hook_state_path(config.paths)
     fallback_key = _codex_hook_state_key({}, binding) if binding else None
-    delivery_lock_paths = _codex_hook_delivery_lock_paths(
+    alias_resolution_lock_path = _codex_hook_delivery_lock_path(
         state_path,
-        desired_key,
-        fallback_key,
+        "internal:alias-resolution",
     )
 
     with ExitStack() as delivery_locks:
-        for delivery_lock_path in delivery_lock_paths:
-            delivery_locks.enter_context(locked_json_path(delivery_lock_path))
+        with locked_json_path(alias_resolution_lock_path):
+            with AGENT_TMUX_LOCK, locked_json_path(state_path):
+                state = read_json(state_path, {})
+                aliases = _codex_hook_delivery_aliases(
+                    state.get("sessions") or {},
+                    desired_key,
+                    fallback_key,
+                )
+            delivery_lock_paths = _codex_hook_delivery_lock_paths(
+                state_path,
+                *aliases,
+            )
+            for delivery_lock_path in delivery_lock_paths:
+                delivery_locks.enter_context(
+                    locked_json_path(delivery_lock_path)
+                )
         with AGENT_TMUX_LOCK, locked_json_path(state_path):
             state = read_json(state_path, {})
             sessions = state.setdefault("sessions", {})
@@ -5270,7 +5305,7 @@ def notify_codex_agent_stop(
                         _codex_hook_text_value(payload, "session_id")
                         or entry.get("session_id")
                     ),
-                    "fallback_key": fallback_key,
+                    "fallback_key": fallback_key or entry.get("fallback_key"),
                     "channel_id": channel_id,
                     "thread_ts": thread_ts,
                     "updated_at": now,
