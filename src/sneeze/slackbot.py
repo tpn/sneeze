@@ -5253,6 +5253,8 @@ def _locked_codex_hook_delivery_aliases(
     state_path: str,
     desired_key: str,
     fallback_key: str | None,
+    *,
+    extra_aliases: Iterable[str] = (),
 ):
     alias_resolution_lock_path = _codex_hook_delivery_lock_path(
         state_path,
@@ -5280,6 +5282,7 @@ def _locked_codex_hook_delivery_aliases(
                                 desired_key,
                                 fallback_key,
                             )
+                            aliases.update(extra_aliases)
                 if aliases is not None:
                     delivery_lock_paths = _codex_hook_delivery_lock_paths(
                         state_path,
@@ -5310,6 +5313,64 @@ def _locked_codex_hook_delivery_aliases(
         yield set(aliases or ())
     finally:
         candidate_locks.close()
+
+
+@contextmanager
+def _locked_codex_hook_delivery(
+    state_path: str,
+    desired_key: str,
+    fallback_key: str | None,
+    *,
+    turn_id: str | None,
+    message_hash: str,
+    notify_user_id: str,
+):
+    extra_aliases: set[str] = set()
+    while True:
+        delivery_locks = ExitStack()
+        try:
+            delivery_aliases = delivery_locks.enter_context(
+                _locked_codex_hook_delivery_aliases(
+                    state_path,
+                    desired_key,
+                    fallback_key,
+                    extra_aliases=extra_aliases,
+                )
+            )
+            receipt_paths = _codex_hook_delivery_receipt_paths(
+                state_path,
+                delivery_aliases,
+                turn_id=turn_id,
+                message_hash=message_hash,
+                notify_user_id=notify_user_id,
+            )
+            receipt = _codex_hook_delivery_receipt(
+                receipt_paths,
+                desired_key=desired_key,
+                turn_id=turn_id,
+                message_hash=message_hash,
+                notify_user_id=notify_user_id,
+            )
+            receipt_aliases = set(delivery_aliases)
+            if receipt:
+                for receipt_alias in (
+                    receipt.get("key"),
+                    receipt.get("fallback_key"),
+                ):
+                    if receipt_alias:
+                        receipt_aliases.add(str(receipt_alias))
+            if not receipt_aliases.issubset(delivery_aliases):
+                extra_aliases.update(receipt_aliases)
+                delivery_locks.close()
+                continue
+            try:
+                yield delivery_aliases, receipt_paths, receipt
+            finally:
+                delivery_locks.close()
+            return
+        except BaseException:
+            delivery_locks.close()
+            raise
 
 
 def _render_codex_stop_notification(
@@ -5418,40 +5479,14 @@ def notify_codex_agent_stop(
     state_path = agent_codex_hook_state_path(config.paths)
     fallback_key = _codex_hook_state_key({}, binding) if binding else None
 
-    with _locked_codex_hook_delivery_aliases(
+    with _locked_codex_hook_delivery(
         state_path,
         desired_key,
         fallback_key,
-    ) as delivery_aliases:
-        receipt_paths = _codex_hook_delivery_receipt_paths(
-            state_path,
-            delivery_aliases,
-            turn_id=turn_id,
-            message_hash=message_hash,
-            notify_user_id=notify_user_id,
-        )
-        receipt = _codex_hook_delivery_receipt(
-            receipt_paths,
-            desired_key=desired_key,
-            turn_id=turn_id,
-            message_hash=message_hash,
-            notify_user_id=notify_user_id,
-        )
-        if receipt:
-            receipt_aliases = set(delivery_aliases)
-            for receipt_alias in (
-                receipt.get("key"),
-                receipt.get("fallback_key"),
-            ):
-                if receipt_alias:
-                    receipt_aliases.add(str(receipt_alias))
-            receipt_paths = _codex_hook_delivery_receipt_paths(
-                state_path,
-                receipt_aliases,
-                turn_id=turn_id,
-                message_hash=message_hash,
-                notify_user_id=notify_user_id,
-            )
+        turn_id=turn_id,
+        message_hash=message_hash,
+        notify_user_id=notify_user_id,
+    ) as (_, receipt_paths, receipt):
         with locked_agent_tmux_json_path(
             state_path,
             timeout_seconds=AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS,

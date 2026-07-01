@@ -2142,16 +2142,45 @@ def test_codex_stop_hook_receipt_does_not_cross_shared_tmux_sessions(
         release_holder.set()
         holder.join(timeout=1)
 
-    second = notify_codex_agent_stop(
-        profile,
-        payload("codex-session-2"),
-        tmux_session="codex-work",
-        tmux_socket="codex",
+    monkeypatch.setattr(
+        "sneeze.slackbot.AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS",
+        1.0,
     )
-    first_retry = notify_codex_agent_stop(
-        profile,
-        payload("codex-session-1"),
+    original_write_receipts = (
+        slackbot_module._write_codex_hook_delivery_receipts
     )
+    second_receipt_written = threading.Event()
+    release_second_receipt = threading.Event()
+
+    def blocking_write_receipts(receipt_paths, receipt):
+        original_write_receipts(receipt_paths, receipt)
+        if receipt["key"] == "session:codex-session-2":
+            second_receipt_written.set()
+            release_second_receipt.wait(timeout=2)
+
+    monkeypatch.setattr(
+        "sneeze.slackbot._write_codex_hook_delivery_receipts",
+        blocking_write_receipts,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        second_future = executor.submit(
+            notify_codex_agent_stop,
+            profile,
+            payload("codex-session-2"),
+            tmux_session="codex-work",
+            tmux_socket="codex",
+        )
+        assert second_receipt_written.wait(timeout=1)
+        first_retry_future = executor.submit(
+            notify_codex_agent_stop,
+            profile,
+            payload("codex-session-1"),
+        )
+        time.sleep(0.05)
+        assert not first_retry_future.done()
+        release_second_receipt.set()
+        second = second_future.result()
+        first_retry = first_retry_future.result()
 
     assert second["status"] == "notified"
     assert first_retry["status"] == "skipped"
