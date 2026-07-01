@@ -2264,7 +2264,7 @@ def test_codex_stop_hook_recovers_receipt_after_post_state_timeout(
             match="Slackbot state lock",
         ):
             notify_codex_agent_stop(profile, payload)
-        receipt_paths = list(Path(state_path).parent.glob(".*.receipt.json"))
+        receipt_paths = list(Path(state_path).parent.rglob("*.receipt.json"))
         assert receipt_paths
     finally:
         release_holder.set()
@@ -2279,7 +2279,7 @@ def test_codex_stop_hook_recovers_receipt_after_post_state_timeout(
         "session:codex-session-1"
     ]
     assert len(entry["notifications"]) == 1
-    assert not list(Path(state_path).parent.glob(".*.receipt.json"))
+    assert not list(Path(state_path).parent.rglob("*.receipt.json"))
 
 
 def test_codex_stop_hook_recovers_legacy_receipt_identity(
@@ -2306,6 +2306,7 @@ def test_codex_stop_hook_recovers_legacy_receipt_identity(
         notify_user_id="U111",
         transcript_path="/tmp/transcript.jsonl",
         legacy_identity=True,
+        legacy_location=True,
     )[0]
     slackbot_module.write_json_atomic(
         legacy_receipt_path,
@@ -2348,6 +2349,58 @@ def test_codex_stop_hook_recovers_legacy_receipt_identity(
     ]
     assert entry["channel_id"] == "D111"
     assert not Path(legacy_receipt_path).exists()
+
+
+def test_codex_hook_migrates_legacy_receipt_among_unrelated_state_files(
+    tmp_path,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    legacy_receipt_path = slackbot_module._codex_hook_delivery_receipt_paths(
+        state_path,
+        {"session:codex-session-1"},
+        turn_id="turn-1",
+        message_hash="message-hash",
+        notify_user_id="U111",
+        transcript_path=None,
+        legacy_location=True,
+    )[0]
+    receipt = {
+        "version": 1,
+        "key": "session:codex-session-1",
+        "fallback_key": None,
+        "notify_user_id": "U111",
+        "channel_id": "D111",
+        "thread_ts": "1.000001",
+        "turn_id": "turn-1",
+        "message_sha256": "message-hash",
+        "tmux_binding": None,
+        "notified_at": slackbot_module.utcnow_iso(),
+    }
+    slackbot_module.write_json_atomic(legacy_receipt_path, receipt)
+    state_dir = Path(state_path).parent
+    for index in range(300):
+        (state_dir / f"unrelated-{index:03d}.lock").touch()
+
+    recovered = slackbot_module.codex_hook_delivery_receipt_for_route(
+        config.paths,
+        channel_id="D111",
+        thread_ts="1.000001",
+        notify_user_id="U111",
+    )
+
+    assert recovered == receipt
+    route_receipt_path = (
+        slackbot_module._codex_hook_delivery_route_receipt_path(
+            state_path,
+            channel_id="D111",
+            thread_ts="1.000001",
+            notify_user_id="U111",
+        )
+    )
+    assert Path(route_receipt_path).exists()
 
 
 def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
@@ -2418,15 +2471,20 @@ def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
             AssertionError("receipt-backed reply should not start Codex")
         ),
     )
-    original_glob = Path.glob
-    monkeypatch.setattr(
-        Path,
-        "glob",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError(
+    state_dir = Path(state_path).parent
+    original_iterdir = Path.iterdir
+
+    def reject_state_dir_scan(path):
+        if path == state_dir:
+            raise AssertionError(
                 "receipt routing must not scan the state directory"
             )
-        ),
+        return original_iterdir(path)
+
+    monkeypatch.setattr(
+        Path,
+        "iterdir",
+        reject_state_dir_scan,
     )
     bot._handle_event(
         {
@@ -2444,7 +2502,7 @@ def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
         "Replies are read-only."
     ]
     assert Path(route_receipt_path).exists()
-    monkeypatch.setattr(Path, "glob", original_glob)
+    monkeypatch.setattr(Path, "iterdir", original_iterdir)
 
     monkeypatch.setattr(
         "sneeze.slackbot.write_json_atomic",
@@ -2682,7 +2740,7 @@ def test_codex_stop_hook_receipt_does_not_cross_shared_tmux_sessions(
     }
     assert sessions["session:codex-session-1"]["channel_id"] == "D1"
     assert sessions["session:codex-session-2"]["channel_id"] == "D2"
-    assert not list(Path(state_path).parent.glob(".*.receipt.json"))
+    assert not list(Path(state_path).parent.rglob("*.receipt.json"))
 
 
 def test_codex_stop_hook_recovers_binding_without_duplicate_post(

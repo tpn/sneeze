@@ -118,8 +118,6 @@ AGENT_CODEX_HOOK_STATE_FILENAME = "agent-codex-hooks.json"
 AGENT_CODEX_HOOK_NOTIFY_USER_KEY = "AGENT_NOTIFY_SLACK_USER_ID"
 AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS = 10.0
 AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS = 120.0
-AGENT_CODEX_HOOK_LEGACY_ROUTE_SCAN_ENTRIES = 256
-AGENT_CODEX_HOOK_LEGACY_ROUTE_SCAN_RECEIPTS = 64
 AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS = 600.0
 AGENT_CODEX_HOOK_COMMAND_TIMEOUT_SECONDS = 60
 AGENT_CODEX_HOOK_SLACK_REQUEST_TIMEOUT_SECONDS = 2.0
@@ -5320,6 +5318,18 @@ def _codex_hook_delivery_lock_paths(
     )
 
 
+def _codex_hook_delivery_receipt_root(state_path: str) -> Path:
+    return Path(state_path).parent / "codex-hook-receipts"
+
+
+def _codex_hook_delivery_alias_receipt_dir(state_path: str) -> Path:
+    return _codex_hook_delivery_receipt_root(state_path) / "aliases"
+
+
+def _codex_hook_delivery_route_receipt_dir(state_path: str) -> Path:
+    return _codex_hook_delivery_receipt_root(state_path) / "routes"
+
+
 def _codex_hook_delivery_receipt_paths(
     state_path: str,
     aliases: Iterable[str],
@@ -5329,8 +5339,14 @@ def _codex_hook_delivery_receipt_paths(
     notify_user_id: str,
     transcript_path: str | None,
     legacy_identity: bool = False,
+    legacy_location: bool = False,
 ) -> tuple[str, ...]:
-    target = Path(state_path)
+    state_target = Path(state_path)
+    target_dir = (
+        state_target.parent
+        if legacy_location
+        else _codex_hook_delivery_alias_receipt_dir(state_path)
+    )
     paths = set()
     for alias in aliases:
         identity_values = {
@@ -5348,7 +5364,7 @@ def _codex_hook_delivery_receipt_paths(
         )
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
         paths.add(
-            str(target.with_name(f".{target.name}.{digest}.receipt.json"))
+            str(target_dir / f".{state_target.name}.{digest}.receipt.json")
         )
     return tuple(sorted(paths))
 
@@ -5370,9 +5386,10 @@ def _codex_hook_delivery_route_receipt_path(
         separators=(",", ":"),
     )
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
-    target = Path(state_path)
+    state_target = Path(state_path)
     return str(
-        target.with_name(f".{target.name}.route.{digest}.receipt.json")
+        _codex_hook_delivery_route_receipt_dir(state_path)
+        / f".{state_target.name}.route.{digest}.receipt.json"
     )
 
 
@@ -5572,6 +5589,15 @@ def _locked_codex_hook_delivery(
                 notify_user_id=notify_user_id,
                 transcript_path=transcript_path,
             )
+            prior_receipt_paths = _codex_hook_delivery_receipt_paths(
+                state_path,
+                delivery_aliases,
+                turn_id=turn_id,
+                message_hash=message_hash,
+                notify_user_id=notify_user_id,
+                transcript_path=transcript_path,
+                legacy_location=True,
+            )
             legacy_receipt_paths = _codex_hook_delivery_receipt_paths(
                 state_path,
                 delivery_aliases,
@@ -5580,9 +5606,16 @@ def _locked_codex_hook_delivery(
                 notify_user_id=notify_user_id,
                 transcript_path=transcript_path,
                 legacy_identity=True,
+                legacy_location=True,
             )
             cleanup_receipt_paths = tuple(
-                sorted({*write_receipt_paths, *legacy_receipt_paths})
+                sorted(
+                    {
+                        *write_receipt_paths,
+                        *prior_receipt_paths,
+                        *legacy_receipt_paths,
+                    }
+                )
             )
             receipt = _codex_hook_delivery_receipt(
                 cleanup_receipt_paths,
@@ -6104,6 +6137,65 @@ def query_codex_agent_threads(
     }
 
 
+def _codex_hook_receipt_matches_route(
+    receipt: Any,
+    *,
+    channel_id: str,
+    thread_ts: str,
+    notify_user_id: str,
+) -> bool:
+    return isinstance(receipt, dict) and (
+        receipt.get("channel_id") == channel_id
+        and receipt.get("thread_ts") == thread_ts
+        and receipt.get("notify_user_id") == notify_user_id
+    )
+
+
+def _index_codex_hook_receipt_route(
+    state_path: str,
+    receipt: dict[str, Any],
+) -> None:
+    channel_id = str(receipt.get("channel_id") or "")
+    thread_ts = str(receipt.get("thread_ts") or "")
+    notify_user_id = str(receipt.get("notify_user_id") or "")
+    if not channel_id or not thread_ts or not notify_user_id:
+        return
+    receipt_path = _codex_hook_delivery_route_receipt_path(
+        state_path,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        notify_user_id=notify_user_id,
+    )
+    write_json_atomic(receipt_path, receipt)
+
+
+def _migrate_legacy_codex_hook_receipt_routes(state_path: str) -> None:
+    state_target = Path(state_path)
+    receipt_root = _codex_hook_delivery_receipt_root(state_path)
+    marker_path = receipt_root / "legacy-route-index-v1.json"
+    if marker_path.exists():
+        return
+    with locked_json_path(marker_path):
+        if marker_path.exists():
+            return
+        prefix = f".{state_target.name}."
+        for legacy_path in state_target.parent.iterdir():
+            if (
+                not legacy_path.is_file()
+                or not legacy_path.name.startswith(prefix)
+                or not legacy_path.name.endswith(".receipt.json")
+            ):
+                continue
+            receipt = read_json(legacy_path, {})
+            if not isinstance(receipt, dict):
+                continue
+            _index_codex_hook_receipt_route(state_path, receipt)
+        write_json_atomic(
+            marker_path,
+            {"version": 1, "indexed_at": utcnow_iso()},
+        )
+
+
 def codex_hook_delivery_receipt_for_route(
     paths: SlackbotPaths,
     *,
@@ -6119,63 +6211,60 @@ def codex_hook_delivery_receipt_for_route(
         notify_user_id=notify_user_id,
     )
     receipt = read_json(receipt_path, {})
-    if not isinstance(receipt, dict):
-        return None
-    if (
-        receipt.get("channel_id") == channel_id
-        and receipt.get("thread_ts") == thread_ts
-        and receipt.get("notify_user_id") == notify_user_id
+    if _codex_hook_receipt_matches_route(
+        receipt,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        notify_user_id=notify_user_id,
     ):
         return receipt
 
-    state_target = Path(state_path)
-    prefix = f".{state_target.name}."
-    candidates = []
-    scanned = 0
-    now = time.time()
-    try:
-        with os.scandir(state_target.parent) as entries:
-            for item in entries:
-                scanned += 1
-                if scanned > AGENT_CODEX_HOOK_LEGACY_ROUTE_SCAN_ENTRIES:
-                    break
-                if (
-                    not item.name.startswith(prefix)
-                    or not item.name.endswith(".receipt.json")
-                    or ".route." in item.name
-                ):
-                    continue
+    alias_dir = _codex_hook_delivery_alias_receipt_dir(state_path)
+    if alias_dir.exists():
+        now = time.time()
+        try:
+            entries = tuple(alias_dir.iterdir())
+        except OSError:
+            entries = ()
+        for alias_path in entries:
+            if not alias_path.name.endswith(".receipt.json"):
+                continue
+            try:
+                age = now - alias_path.stat().st_mtime
+            except OSError:
+                continue
+            if age > AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS:
                 try:
-                    modified_at = item.stat().st_mtime
+                    alias_path.unlink(missing_ok=True)
                 except OSError:
-                    continue
-                if (
-                    now - modified_at
-                    > AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS
-                ):
-                    continue
-                candidates.append((modified_at, item.path))
+                    pass
+                continue
+            receipt = read_json(alias_path, {})
+            if not _codex_hook_receipt_matches_route(
+                receipt,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                notify_user_id=notify_user_id,
+            ):
+                continue
+            try:
+                _index_codex_hook_receipt_route(state_path, receipt)
+            except OSError:
+                pass
+            return receipt
+
+    try:
+        _migrate_legacy_codex_hook_receipt_routes(state_path)
     except OSError:
         return None
-
-    candidates.sort(reverse=True)
-    for _, legacy_receipt_path in candidates[
-        :AGENT_CODEX_HOOK_LEGACY_ROUTE_SCAN_RECEIPTS
-    ]:
-        legacy_receipt = read_json(legacy_receipt_path, {})
-        if not isinstance(legacy_receipt, dict):
-            continue
-        if (
-            legacy_receipt.get("channel_id") != channel_id
-            or legacy_receipt.get("thread_ts") != thread_ts
-            or legacy_receipt.get("notify_user_id") != notify_user_id
-        ):
-            continue
-        try:
-            write_json_atomic(receipt_path, legacy_receipt)
-        except OSError:
-            pass
-        return legacy_receipt
+    receipt = read_json(receipt_path, {})
+    if _codex_hook_receipt_matches_route(
+        receipt,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        notify_user_id=notify_user_id,
+    ):
+        return receipt
     return None
 
 
