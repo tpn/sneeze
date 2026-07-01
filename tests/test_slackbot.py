@@ -2071,6 +2071,102 @@ def test_codex_stop_hook_recovers_receipt_after_post_state_timeout(
     assert not list(Path(state_path).parent.glob(".*.receipt.json"))
 
 
+def test_codex_stop_hook_receipt_does_not_cross_shared_tmux_sessions(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    for env_name in (
+        "WEBMUX_AGENT_SESSION",
+        "CODEX_TMUX_SESSION_NAME",
+        "TMUX_PANE",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setattr(
+        "sneeze.slackbot.AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS",
+        0.05,
+    )
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    start_holder = threading.Event()
+    lock_held = threading.Event()
+    release_holder = threading.Event()
+    calls = []
+
+    def hold_state_lock():
+        start_holder.wait(timeout=1)
+        with slackbot_module.locked_agent_tmux_json_path(state_path):
+            lock_held.set()
+            release_holder.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_state_lock)
+    holder.start()
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        if len(calls) == 1:
+            start_holder.set()
+            assert lock_held.wait(timeout=1)
+        return {
+            "channel": f"D{len(calls)}",
+            "ts": f"{len(calls)}.000001",
+        }
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+
+    def payload(session_id):
+        return json.dumps(
+            {
+                "session_id": session_id,
+                "turn_id": "turn-1",
+                "last_assistant_message": "Identical stop.",
+            }
+        )
+
+    try:
+        with pytest.raises(SlackbotError, match="Slackbot state lock"):
+            notify_codex_agent_stop(
+                profile,
+                payload("codex-session-1"),
+                tmux_session="codex-work",
+                tmux_socket="codex",
+            )
+    finally:
+        release_holder.set()
+        holder.join(timeout=1)
+
+    second = notify_codex_agent_stop(
+        profile,
+        payload("codex-session-2"),
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    first_retry = notify_codex_agent_stop(
+        profile,
+        payload("codex-session-1"),
+    )
+
+    assert second["status"] == "notified"
+    assert first_retry["status"] == "skipped"
+    assert first_retry["reason"] == "delivery_receipt"
+    assert len(calls) == 2
+    sessions = query_codex_agent_threads(profile)["hook_state"]["sessions"]
+    assert set(sessions) == {
+        "session:codex-session-1",
+        "session:codex-session-2",
+    }
+    assert sessions["session:codex-session-1"]["channel_id"] == "D1"
+    assert sessions["session:codex-session-2"]["channel_id"] == "D2"
+    assert not list(Path(state_path).parent.glob(".*.receipt.json"))
+
+
 def test_codex_stop_hook_recovers_binding_without_duplicate_post(
     tmp_path,
     monkeypatch,

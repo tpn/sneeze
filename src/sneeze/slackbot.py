@@ -5181,6 +5181,7 @@ def _codex_hook_delivery_receipt_paths(
 def _codex_hook_delivery_receipt(
     receipt_paths: Iterable[str],
     *,
+    desired_key: str,
     turn_id: str | None,
     message_hash: str,
     notify_user_id: str,
@@ -5188,6 +5189,13 @@ def _codex_hook_delivery_receipt(
     for receipt_path in receipt_paths:
         receipt = read_json(receipt_path, {})
         if not isinstance(receipt, dict):
+            continue
+        receipt_key = str(receipt.get("key") or "")
+        receipt_fallback_key = str(receipt.get("fallback_key") or "")
+        if desired_key.startswith("session:"):
+            if receipt_key != desired_key:
+                continue
+        elif desired_key not in (receipt_key, receipt_fallback_key):
             continue
         if (
             receipt.get("turn_id") == turn_id
@@ -5424,10 +5432,26 @@ def notify_codex_agent_stop(
         )
         receipt = _codex_hook_delivery_receipt(
             receipt_paths,
+            desired_key=desired_key,
             turn_id=turn_id,
             message_hash=message_hash,
             notify_user_id=notify_user_id,
         )
+        if receipt:
+            receipt_aliases = set(delivery_aliases)
+            for receipt_alias in (
+                receipt.get("key"),
+                receipt.get("fallback_key"),
+            ):
+                if receipt_alias:
+                    receipt_aliases.add(str(receipt_alias))
+            receipt_paths = _codex_hook_delivery_receipt_paths(
+                state_path,
+                receipt_aliases,
+                turn_id=turn_id,
+                message_hash=message_hash,
+                notify_user_id=notify_user_id,
+            )
         with locked_agent_tmux_json_path(
             state_path,
             timeout_seconds=AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS,
@@ -5473,6 +5497,21 @@ def notify_codex_agent_stop(
                 sessions[key] = entry
                 write_json_atomic(state_path, state)
 
+        recovered_receipt = receipt is not None
+        if receipt:
+            channel_id = str(receipt["channel_id"])
+            thread_ts = str(receipt["thread_ts"])
+            receipt_key = str(receipt.get("key") or "")
+            if receipt_key.startswith("session:"):
+                desired_key = receipt_key
+            fallback_key = (
+                str(receipt.get("fallback_key") or "").strip() or fallback_key
+            )
+            if not binding:
+                receipt_binding = receipt.get("tmux_binding")
+                if isinstance(receipt_binding, dict):
+                    binding = _codex_hook_entry_binding(receipt_binding)
+
         if duplicate:
             _remove_codex_hook_delivery_receipts(receipt_paths)
             if binding and channel_id and thread_ts:
@@ -5514,21 +5553,7 @@ def notify_codex_agent_stop(
                 "key": key,
             }
 
-        recovered_receipt = receipt is not None
-        if receipt:
-            channel_id = str(receipt["channel_id"])
-            thread_ts = str(receipt["thread_ts"])
-            receipt_key = str(receipt.get("key") or "")
-            if receipt_key.startswith("session:"):
-                desired_key = receipt_key
-            fallback_key = (
-                str(receipt.get("fallback_key") or "").strip() or fallback_key
-            )
-            if not binding:
-                receipt_binding = receipt.get("tmux_binding")
-                if isinstance(receipt_binding, dict):
-                    binding = _codex_hook_entry_binding(receipt_binding)
-        else:
+        if not receipt:
             first_message = not (channel_id and thread_ts)
             route = (
                 SlackbotRoute(channel_id=channel_id, thread_ts=thread_ts)
