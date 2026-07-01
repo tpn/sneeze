@@ -2403,6 +2403,103 @@ def test_codex_hook_migrates_legacy_receipt_among_unrelated_state_files(
     assert Path(route_receipt_path).exists()
 
 
+def test_codex_hook_rechecks_legacy_receipts_after_state_dir_changes(
+    tmp_path,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    route = {
+        "channel_id": "D111",
+        "thread_ts": "1.000001",
+        "notify_user_id": "U111",
+    }
+    assert (
+        slackbot_module.codex_hook_delivery_receipt_for_route(
+            config.paths,
+            **route,
+        )
+        is None
+    )
+    legacy_receipt_path = slackbot_module._codex_hook_delivery_receipt_paths(
+        state_path,
+        {"session:codex-session-1"},
+        turn_id="turn-1",
+        message_hash="message-hash",
+        notify_user_id="U111",
+        transcript_path=None,
+        legacy_location=True,
+    )[0]
+    receipt = {
+        "version": 1,
+        "key": "session:codex-session-1",
+        "fallback_key": None,
+        **route,
+        "turn_id": "turn-1",
+        "message_sha256": "message-hash",
+        "tmux_binding": None,
+        "notified_at": slackbot_module.utcnow_iso(),
+    }
+    slackbot_module.write_json_atomic(legacy_receipt_path, receipt)
+
+    recovered = slackbot_module.codex_hook_delivery_receipt_for_route(
+        config.paths,
+        **route,
+    )
+
+    assert recovered == receipt
+
+
+def test_codex_hook_does_not_route_or_delete_stale_alias_receipts(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    route = {
+        "channel_id": "D111",
+        "thread_ts": "1.000001",
+        "notify_user_id": "U111",
+    }
+    receipt = {
+        "version": 1,
+        "key": "session:codex-session-1",
+        "fallback_key": None,
+        **route,
+        "turn_id": "turn-1",
+        "message_sha256": "message-hash",
+        "tmux_binding": None,
+        "notified_at": slackbot_module.utcnow_iso(),
+    }
+    receipt_paths = []
+    for legacy_location in (False, True):
+        receipt_path = slackbot_module._codex_hook_delivery_receipt_paths(
+            state_path,
+            {"session:codex-session-1"},
+            turn_id="turn-1",
+            message_hash="message-hash",
+            notify_user_id="U111",
+            transcript_path=None,
+            legacy_location=legacy_location,
+        )[0]
+        slackbot_module.write_json_atomic(receipt_path, receipt)
+        old_timestamp = (
+            time.time()
+            - slackbot_module.AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS
+            - 1
+        )
+        os.utime(receipt_path, (old_timestamp, old_timestamp))
+        receipt_paths.append(receipt_path)
+
+    recovered = slackbot_module.codex_hook_delivery_receipt_for_route(
+        config.paths,
+        **route,
+    )
+
+    assert recovered is None
+    assert all(Path(path).exists() for path in receipt_paths)
+
+
 def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
     tmp_path,
     monkeypatch,

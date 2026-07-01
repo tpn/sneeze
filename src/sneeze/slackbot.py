@@ -6171,28 +6171,41 @@ def _index_codex_hook_receipt_route(
 
 def _migrate_legacy_codex_hook_receipt_routes(state_path: str) -> None:
     state_target = Path(state_path)
+    state_dir = state_target.parent
     receipt_root = _codex_hook_delivery_receipt_root(state_path)
-    marker_path = receipt_root / "legacy-route-index-v1.json"
-    if marker_path.exists():
-        return
+    marker_path = receipt_root / "legacy-route-index-v2.json"
     with locked_json_path(marker_path):
-        if marker_path.exists():
+        state_dir_mtime_ns = state_dir.stat().st_mtime_ns
+        marker = read_json(marker_path, {})
+        if marker.get("state_dir_mtime_ns") == state_dir_mtime_ns:
             return
         prefix = f".{state_target.name}."
-        for legacy_path in state_target.parent.iterdir():
+        now = time.time()
+        for legacy_path in state_dir.iterdir():
             if (
                 not legacy_path.is_file()
                 or not legacy_path.name.startswith(prefix)
                 or not legacy_path.name.endswith(".receipt.json")
             ):
                 continue
+            if ".route." not in legacy_path.name:
+                try:
+                    age = now - legacy_path.stat().st_mtime
+                except OSError:
+                    continue
+                if age > AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS:
+                    continue
             receipt = read_json(legacy_path, {})
             if not isinstance(receipt, dict):
                 continue
             _index_codex_hook_receipt_route(state_path, receipt)
         write_json_atomic(
             marker_path,
-            {"version": 1, "indexed_at": utcnow_iso()},
+            {
+                "version": 2,
+                "state_dir_mtime_ns": state_dir_mtime_ns,
+                "indexed_at": utcnow_iso(),
+            },
         )
 
 
@@ -6234,10 +6247,6 @@ def codex_hook_delivery_receipt_for_route(
             except OSError:
                 continue
             if age > AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS:
-                try:
-                    alias_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
                 continue
             receipt = read_json(alias_path, {})
             if not _codex_hook_receipt_matches_route(
