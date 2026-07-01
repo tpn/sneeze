@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import sneeze.slackbot as slackbot_module
 from sneeze.slackbot import (
     CHILD_ENV_PASSTHROUGH,
     USER_CONFIG_DISPATCH_LIMIT,
@@ -1965,6 +1966,41 @@ def test_codex_stop_hook_times_out_waiting_for_busy_alias(
         finally:
             release_slow_post.set()
         assert slow.result()["status"] == "notified"
+
+
+def test_codex_stop_hook_times_out_waiting_for_resolver_lock(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS",
+        0.05,
+    )
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    resolver_lock_path = slackbot_module._codex_hook_delivery_lock_path(
+        state_path,
+        "internal:alias-resolution",
+    )
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+
+    with slackbot_module.locked_json_path(resolver_lock_path):
+        with pytest.raises(SlackbotError, match="Timed out waiting"):
+            notify_codex_agent_stop(profile, payload)
 
 
 def test_codex_stop_hook_recovers_binding_without_duplicate_post(

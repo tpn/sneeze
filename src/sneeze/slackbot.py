@@ -768,6 +768,56 @@ def try_locked_json_path(path: str | Path):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def try_locked_agent_tmux_json_path(path: str | Path):
+    acquired_thread_lock = AGENT_TMUX_LOCK.acquire(blocking=False)
+    if not acquired_thread_lock:
+        yield False
+        return
+    try:
+        with try_locked_json_path(path) as acquired_file_lock:
+            yield acquired_file_lock
+    finally:
+        AGENT_TMUX_LOCK.release()
+
+
+@contextmanager
+def locked_agent_tmux_json_path(
+    path: str | Path,
+    *,
+    timeout_seconds: float | None = None,
+):
+    if timeout_seconds is None:
+        with AGENT_TMUX_LOCK, locked_json_path(path):
+            yield
+        return
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        candidate_lock = ExitStack()
+        acquired = candidate_lock.enter_context(
+            try_locked_agent_tmux_json_path(path)
+        )
+        if acquired:
+            if time.monotonic() > deadline:
+                candidate_lock.close()
+                raise SlackbotError(
+                    f"Timed out waiting for Slackbot state lock: {path}"
+                )
+            break
+        candidate_lock.close()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SlackbotError(
+                f"Timed out waiting for Slackbot state lock: {path}"
+            )
+        time.sleep(min(0.01, remaining))
+    try:
+        yield
+    finally:
+        candidate_lock.close()
+
+
 def default_executable_path(name: str) -> str:
     resolved = shutil.which(name)
     if resolved:
@@ -5139,30 +5189,38 @@ def _locked_codex_hook_delivery_aliases(
         candidate_locks = ExitStack()
         acquired_all = False
         try:
-            with locked_json_path(alias_resolution_lock_path):
-                with AGENT_TMUX_LOCK, locked_json_path(state_path):
-                    state = read_json(state_path, {})
-                    aliases = _codex_hook_delivery_aliases(
-                        state.get("sessions") or {},
-                        desired_key,
-                        fallback_key,
+            with try_locked_json_path(
+                alias_resolution_lock_path
+            ) as acquired_resolution_lock:
+                aliases = None
+                if acquired_resolution_lock:
+                    with try_locked_agent_tmux_json_path(
+                        state_path
+                    ) as acquired_state_lock:
+                        if acquired_state_lock:
+                            state = read_json(state_path, {})
+                            aliases = _codex_hook_delivery_aliases(
+                                state.get("sessions") or {},
+                                desired_key,
+                                fallback_key,
+                            )
+                if aliases is not None:
+                    delivery_lock_paths = _codex_hook_delivery_lock_paths(
+                        state_path,
+                        *aliases,
                     )
-                delivery_lock_paths = _codex_hook_delivery_lock_paths(
-                    state_path,
-                    *aliases,
-                )
-                for delivery_lock_path in delivery_lock_paths:
-                    acquired = candidate_locks.enter_context(
-                        try_locked_json_path(delivery_lock_path)
-                    )
-                    if not acquired:
-                        break
-                else:
-                    acquired_all = True
+                    for delivery_lock_path in delivery_lock_paths:
+                        acquired = candidate_locks.enter_context(
+                            try_locked_json_path(delivery_lock_path)
+                        )
+                        if not acquired:
+                            break
+                    else:
+                        acquired_all = True
         except BaseException:
             candidate_locks.close()
             raise
-        if acquired_all:
+        if acquired_all and time.monotonic() <= deadline:
             break
         candidate_locks.close()
         remaining = deadline - time.monotonic()
@@ -5289,7 +5347,10 @@ def notify_codex_agent_stop(
         desired_key,
         fallback_key,
     ):
-        with AGENT_TMUX_LOCK, locked_json_path(state_path):
+        with locked_agent_tmux_json_path(
+            state_path,
+            timeout_seconds=AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS,
+        ):
             state = read_json(state_path, {})
             sessions = state.setdefault("sessions", {})
             key, entry, entry_migrated = _codex_hook_resolved_entry(
@@ -5342,6 +5403,9 @@ def notify_codex_agent_stop(
                     unit_name=unit_name,
                     channel_id=channel_id,
                     thread_ts=thread_ts,
+                    lock_timeout_seconds=(
+                        AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
+                    ),
                 )
                 if not current_binding:
                     bind_agent_tmux_thread(
@@ -5357,6 +5421,9 @@ def notify_codex_agent_stop(
                         tmux_session=binding["tmux_session"],
                         tmux_socket=binding.get("tmux_socket"),
                         tmux_conf=binding.get("tmux_conf"),
+                        lock_timeout_seconds=(
+                            AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
+                        ),
                     )
             return {
                 "status": "skipped",
@@ -5389,7 +5456,10 @@ def notify_codex_agent_stop(
                 "Slack notification did not return a channel and timestamp"
             )
 
-        with AGENT_TMUX_LOCK, locked_json_path(state_path):
+        with locked_agent_tmux_json_path(
+            state_path,
+            timeout_seconds=AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS,
+        ):
             state = read_json(state_path, {})
             state["version"] = 1
             sessions = state.setdefault("sessions", {})
@@ -5459,6 +5529,9 @@ def notify_codex_agent_stop(
                 tmux_session=binding["tmux_session"],
                 tmux_socket=binding.get("tmux_socket"),
                 tmux_conf=binding.get("tmux_conf"),
+                lock_timeout_seconds=(
+                    AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
+                ),
             )
     return {
         "status": "notified",
@@ -8760,6 +8833,7 @@ def bind_agent_tmux_thread(
     state_dir: str | None = None,
     system_prompt_path: str | None = None,
     unit_name: str | None = None,
+    lock_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     paths = resolve_paths(
         profile,
@@ -8770,7 +8844,10 @@ def bind_agent_tmux_thread(
         unit_name=unit_name,
     )
     key = f"{channel_id}:{thread_ts}"
-    with AGENT_TMUX_LOCK, locked_json_path(paths.agent_tmux_bindings_path):
+    with locked_agent_tmux_json_path(
+        paths.agent_tmux_bindings_path,
+        timeout_seconds=lock_timeout_seconds,
+    ):
         data = read_json(paths.agent_tmux_bindings_path, {})
         data[key] = {
             "channel_id": channel_id,
@@ -8797,6 +8874,7 @@ def query_agent_tmux_thread(
     state_dir: str | None = None,
     system_prompt_path: str | None = None,
     unit_name: str | None = None,
+    lock_timeout_seconds: float | None = None,
 ) -> dict[str, Any] | None:
     paths = resolve_paths(
         profile,
@@ -8806,7 +8884,10 @@ def query_agent_tmux_thread(
         system_prompt_path=system_prompt_path,
         unit_name=unit_name,
     )
-    with AGENT_TMUX_LOCK, locked_json_path(paths.agent_tmux_bindings_path):
+    with locked_agent_tmux_json_path(
+        paths.agent_tmux_bindings_path,
+        timeout_seconds=lock_timeout_seconds,
+    ):
         data = read_json(paths.agent_tmux_bindings_path, {})
         return data.get(f"{channel_id}:{thread_ts}")
 
