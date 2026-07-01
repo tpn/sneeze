@@ -1705,6 +1705,21 @@ def test_codex_stop_hook_keeps_sessionless_tmux_panes_separate(
         profile,
         hook_payload("%1", "turn-2"),
     )
+    immediate_duplicate = notify_codex_agent_stop(
+        profile,
+        hook_payload("%1", "turn-2"),
+    )
+    status = query_codex_agent_threads(profile)
+    entry = status["hook_state"]["sessions"][first["key"]]
+    entry["notifications"][-1]["notified_at"] = "2020-01-01T00:00:00Z"
+    Path(status["hook_state_path"]).write_text(
+        json.dumps(status["hook_state"]),
+        encoding="utf-8",
+    )
+    after_dedupe_window = notify_codex_agent_stop(
+        profile,
+        hook_payload("%1", "turn-2"),
+    )
 
     assert first["key"] != second["key"]
     assert first["key"].endswith(":%1")
@@ -1714,6 +1729,9 @@ def test_codex_stop_hook_keeps_sessionless_tmux_panes_separate(
     assert calls[2].channel_id == "D1"
     assert calls[2].thread_ts == "1.000001"
     assert first_again["key"] == first["key"]
+    assert immediate_duplicate["status"] == "skipped"
+    assert after_dedupe_window["status"] == "notified"
+    assert len(calls) == 4
     sessions = query_codex_agent_threads(profile)["hook_state"]["sessions"]
     assert sessions[first["key"]]["tmux_pane"] == "%1"
     assert sessions[second["key"]]["tmux_pane"] == "%2"
@@ -2309,6 +2327,35 @@ def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
         match="state disk error",
     ):
         notify_codex_agent_stop(profile, payload)
+
+    route_posts = []
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: route_posts.append(text),
+    )
+    bot = SlackSocketBot(load_config(profile))
+    monkeypatch.setattr(
+        bot,
+        "_run_codex_for_route",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("receipt-backed reply should not start Codex")
+        ),
+    )
+    bot._handle_event(
+        {
+            "type": "message",
+            "channel_type": "im",
+            "user": "U111",
+            "channel": "D111",
+            "thread_ts": "1.000001",
+            "ts": "2.000001",
+            "text": "continue",
+        }
+    )
+    assert route_posts == [
+        "No tmux pane is bound to this notification thread. "
+        "Replies are read-only."
+    ]
 
     monkeypatch.setattr(
         "sneeze.slackbot.write_json_atomic",

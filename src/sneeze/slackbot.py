@@ -117,6 +117,7 @@ AGENT_TMUX_STATUS_EXCERPT_CHARS = 1800
 AGENT_CODEX_HOOK_STATE_FILENAME = "agent-codex-hooks.json"
 AGENT_CODEX_HOOK_NOTIFY_USER_KEY = "AGENT_NOTIFY_SLACK_USER_ID"
 AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS = 10.0
+AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS = 120.0
 AGENT_CODEX_HOOK_COMMAND_TIMEOUT_SECONDS = 60
 AGENT_CODEX_HOOK_SLACK_REQUEST_TIMEOUT_SECONDS = 2.0
 AGENT_CODEX_HOOK_SLACK_REQUEST_ATTEMPTS = 2
@@ -5323,6 +5324,7 @@ def _codex_hook_delivery_receipt_paths(
     turn_id: str | None,
     message_hash: str,
     notify_user_id: str,
+    transcript_path: str | None,
 ) -> tuple[str, ...]:
     target = Path(state_path)
     paths = set()
@@ -5333,6 +5335,7 @@ def _codex_hook_delivery_receipt_paths(
                 "turn_id": turn_id,
                 "message_sha256": message_hash,
                 "notify_user_id": notify_user_id,
+                "transcript_path": transcript_path,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -5351,6 +5354,7 @@ def _codex_hook_delivery_receipt(
     turn_id: str | None,
     message_hash: str,
     notify_user_id: str,
+    transcript_path: str | None,
 ) -> dict[str, Any] | None:
     for receipt_path in receipt_paths:
         receipt = read_json(receipt_path, {})
@@ -5363,6 +5367,16 @@ def _codex_hook_delivery_receipt(
                 continue
         elif desired_key not in (receipt_key, receipt_fallback_key):
             continue
+        if transcript_path:
+            if receipt.get("transcript_path") != transcript_path:
+                continue
+        elif not desired_key.startswith("session:"):
+            elapsed = _agent_tmux_elapsed_since(receipt.get("notified_at"))
+            if (
+                elapsed is None
+                or elapsed > AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS
+            ):
+                continue
         if (
             receipt.get("turn_id") == turn_id
             and receipt.get("message_sha256") == message_hash
@@ -5485,6 +5499,7 @@ def _locked_codex_hook_delivery(
     turn_id: str | None,
     message_hash: str,
     notify_user_id: str,
+    transcript_path: str | None,
 ):
     extra_aliases: set[str] = set()
     while True:
@@ -5504,6 +5519,7 @@ def _locked_codex_hook_delivery(
                 turn_id=turn_id,
                 message_hash=message_hash,
                 notify_user_id=notify_user_id,
+                transcript_path=transcript_path,
             )
             receipt = _codex_hook_delivery_receipt(
                 receipt_paths,
@@ -5511,6 +5527,7 @@ def _locked_codex_hook_delivery(
                 turn_id=turn_id,
                 message_hash=message_hash,
                 notify_user_id=notify_user_id,
+                transcript_path=transcript_path,
             )
             receipt_aliases = set(delivery_aliases)
             if receipt:
@@ -5598,6 +5615,8 @@ def _render_codex_stop_notification(
 def _codex_hook_notification_seen(
     entry: dict[str, Any],
     *,
+    session_id: str | None,
+    transcript_path: str | None,
     turn_id: str | None,
     message_hash: str,
 ) -> bool:
@@ -5608,6 +5627,16 @@ def _codex_hook_notification_seen(
             item.get("turn_id") == turn_id
             and item.get("message_sha256") == message_hash
         ):
+            if transcript_path:
+                if item.get("transcript_path") != transcript_path:
+                    continue
+            elif not session_id:
+                elapsed = _agent_tmux_elapsed_since(item.get("notified_at"))
+                if (
+                    elapsed is None
+                    or elapsed > AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS
+                ):
+                    continue
             return True
     return False
 
@@ -5652,6 +5681,8 @@ def notify_codex_agent_stop(
         tmux_socket=tmux_socket,
         tmux_conf=tmux_conf,
     )
+    session_id = _codex_hook_text_value(payload, "session_id")
+    transcript_path = _codex_hook_text_value(payload, "transcript_path")
     desired_key = _codex_hook_state_key(payload, binding)
     turn_id = _codex_hook_text_value(payload, "turn_id")
     message = _codex_hook_message_text(payload)
@@ -5666,6 +5697,7 @@ def notify_codex_agent_stop(
         turn_id=turn_id,
         message_hash=message_hash,
         notify_user_id=notify_user_id,
+        transcript_path=transcript_path,
     ) as (_, receipt_paths, receipt):
         with locked_agent_tmux_json_path(
             state_path,
@@ -5686,6 +5718,8 @@ def notify_codex_agent_stop(
             )
             duplicate = recipient_matches and _codex_hook_notification_seen(
                 entry,
+                session_id=session_id,
+                transcript_path=transcript_path,
                 turn_id=turn_id,
                 message_hash=message_hash,
             )
@@ -5823,6 +5857,7 @@ def notify_codex_agent_stop(
                 "turn_id": turn_id,
                 "message_sha256": message_hash,
                 "tmux_binding": binding,
+                "transcript_path": transcript_path,
                 "notified_at": utcnow_iso(),
             }
             _write_codex_hook_delivery_receipts(receipt_paths, receipt)
@@ -5854,6 +5889,8 @@ def notify_codex_agent_stop(
                 {
                     "turn_id": turn_id,
                     "message_sha256": message_hash,
+                    "session_id": session_id,
+                    "transcript_path": transcript_path,
                     "notified_at": now,
                 }
             )
@@ -5953,6 +5990,28 @@ def query_codex_agent_threads(
             {},
         ),
     }
+
+
+def codex_hook_delivery_receipt_for_route(
+    paths: SlackbotPaths,
+    *,
+    channel_id: str,
+    thread_ts: str,
+    notify_user_id: str,
+) -> dict[str, Any] | None:
+    state_path = Path(agent_codex_hook_state_path(paths))
+    pattern = f".{state_path.name}.*.receipt.json"
+    for receipt_path in state_path.parent.glob(pattern):
+        receipt = read_json(receipt_path, {})
+        if not isinstance(receipt, dict):
+            continue
+        if (
+            receipt.get("channel_id") == channel_id
+            and receipt.get("thread_ts") == thread_ts
+            and receipt.get("notify_user_id") == notify_user_id
+        ):
+            return receipt
+    return None
 
 
 def _codex_hook_command_handler(
@@ -8682,7 +8741,15 @@ class SlackSocketBot:
                 and entry.get("notify_user_id") == notify_user_id
             ):
                 return True
-        return False
+        return (
+            codex_hook_delivery_receipt_for_route(
+                self.config.paths,
+                channel_id=route.channel_id,
+                thread_ts=route.thread_ts,
+                notify_user_id=notify_user_id,
+            )
+            is not None
+        )
 
     def _is_agent_notify_tmux_thread(
         self,
