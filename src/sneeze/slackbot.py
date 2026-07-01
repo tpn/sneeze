@@ -4968,6 +4968,11 @@ def _codex_hook_existing_entry(
     if isinstance(entry, dict):
         return key, dict(entry)
     if fallback_key:
+        requested_session_id = (
+            key.removeprefix("session:")
+            if key.startswith("session:")
+            else None
+        )
         for candidate_key, candidate in sessions.items():
             if not isinstance(candidate, dict):
                 continue
@@ -4975,8 +4980,40 @@ def _codex_hook_existing_entry(
                 candidate_key == fallback_key
                 or candidate.get("fallback_key") == fallback_key
             ):
+                candidate_session_id = candidate.get("session_id")
+                if (
+                    requested_session_id
+                    and candidate_session_id
+                    and candidate_session_id != requested_session_id
+                ):
+                    continue
                 return candidate_key, dict(candidate)
     return key, {}
+
+
+def _codex_hook_resolved_entry(
+    sessions: dict[str, Any],
+    key: str,
+    fallback_key: str | None,
+) -> tuple[str, dict[str, Any]]:
+    existing_key, entry = _codex_hook_existing_entry(
+        sessions,
+        key,
+        fallback_key,
+    )
+    if key.startswith("session:") and existing_key != key:
+        sessions.pop(existing_key, None)
+        return key, entry
+    return existing_key, entry
+
+
+def _codex_hook_delivery_lock_path(
+    state_path: str,
+    key: str,
+) -> str:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+    target = Path(state_path)
+    return str(target.with_name(f".{target.name}.{digest}.delivery"))
 
 
 def _render_codex_stop_notification(
@@ -5074,39 +5111,68 @@ def notify_codex_agent_stop(
         tmux_socket=tmux_socket,
         tmux_conf=tmux_conf,
     )
-    key = _codex_hook_state_key(payload, binding)
+    desired_key = _codex_hook_state_key(payload, binding)
     turn_id = _codex_hook_text_value(payload, "turn_id")
     message = _codex_hook_message_text(payload)
     message_hash = _codex_hook_message_hash(message)
     state_path = agent_codex_hook_state_path(config.paths)
     fallback_key = _codex_hook_state_key({}, binding) if binding else None
+    delivery_lock_path = _codex_hook_delivery_lock_path(
+        state_path,
+        fallback_key or desired_key,
+    )
 
-    with AGENT_TMUX_LOCK, locked_json_path(state_path):
-        state = read_json(state_path, {})
-        state["version"] = 1
-        sessions = state.setdefault("sessions", {})
-        existing_key, entry = _codex_hook_existing_entry(
-            sessions,
-            key,
-            fallback_key,
-        )
-        if key.startswith("session:") and existing_key != key:
-            sessions.pop(existing_key, None)
-        else:
-            key = existing_key
-        if _codex_hook_notification_seen(
-            entry,
-            turn_id=turn_id,
-            message_hash=message_hash,
-        ):
+    with locked_json_path(delivery_lock_path):
+        with AGENT_TMUX_LOCK, locked_json_path(state_path):
+            state = read_json(state_path, {})
+            sessions = state.setdefault("sessions", {})
+            key, entry = _codex_hook_resolved_entry(
+                sessions,
+                desired_key,
+                fallback_key,
+            )
+            duplicate = _codex_hook_notification_seen(
+                entry,
+                turn_id=turn_id,
+                message_hash=message_hash,
+            )
+            channel_id = entry.get("channel_id") or None
+            thread_ts = entry.get("thread_ts") or None
+
+        if duplicate:
+            if binding and channel_id and thread_ts:
+                current_binding = query_agent_tmux_thread(
+                    profile,
+                    runtime_root=runtime_root,
+                    env_path=env_path,
+                    state_dir=state_dir,
+                    system_prompt_path=system_prompt_path,
+                    unit_name=unit_name,
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                )
+                if not current_binding:
+                    bind_agent_tmux_thread(
+                        profile,
+                        runtime_root=runtime_root,
+                        env_path=env_path,
+                        state_dir=state_dir,
+                        system_prompt_path=system_prompt_path,
+                        unit_name=unit_name,
+                        channel_id=channel_id,
+                        thread_ts=thread_ts,
+                        host=binding["host"],
+                        tmux_session=binding["tmux_session"],
+                        tmux_socket=binding.get("tmux_socket"),
+                        tmux_conf=binding.get("tmux_conf"),
+                    )
             return {
                 "status": "skipped",
                 "reason": "duplicate",
                 "state_path": state_path,
                 "key": key,
             }
-        channel_id = entry.get("channel_id") or None
-        thread_ts = entry.get("thread_ts") or None
+
         first_message = not (channel_id and thread_ts)
         route = (
             SlackbotRoute(channel_id=channel_id, thread_ts=thread_ts)
@@ -5131,57 +5197,66 @@ def notify_codex_agent_stop(
                 "Slack notification did not return a channel and timestamp"
             )
 
-        now = utcnow_iso()
-        notifications = [
-            item
-            for item in entry.get("notifications", [])
-            if isinstance(item, dict)
-        ]
-        notifications.append(
-            {
-                "turn_id": turn_id,
-                "message_sha256": message_hash,
-                "notified_at": now,
-            }
-        )
-        entry.update(
-            {
-                "key": key,
-                "session_id": (
-                    _codex_hook_text_value(payload, "session_id")
-                    or entry.get("session_id")
-                ),
-                "fallback_key": fallback_key,
-                "channel_id": channel_id,
-                "thread_ts": thread_ts,
-                "updated_at": now,
-                "last_turn_id": turn_id,
-                "last_message_sha256": message_hash,
-                "notifications": notifications[-50:],
-            }
-        )
-        if "created_at" not in entry:
-            entry["created_at"] = now
         if binding:
-            entry.update(binding)
-        sessions[key] = entry
-        write_json_atomic(state_path, state)
+            bind_agent_tmux_thread(
+                profile,
+                runtime_root=runtime_root,
+                env_path=env_path,
+                state_dir=state_dir,
+                system_prompt_path=system_prompt_path,
+                unit_name=unit_name,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                host=binding["host"],
+                tmux_session=binding["tmux_session"],
+                tmux_socket=binding.get("tmux_socket"),
+                tmux_conf=binding.get("tmux_conf"),
+            )
 
-    if binding:
-        bind_agent_tmux_thread(
-            profile,
-            runtime_root=runtime_root,
-            env_path=env_path,
-            state_dir=state_dir,
-            system_prompt_path=system_prompt_path,
-            unit_name=unit_name,
-            channel_id=channel_id,
-            thread_ts=thread_ts,
-            host=binding["host"],
-            tmux_session=binding["tmux_session"],
-            tmux_socket=binding.get("tmux_socket"),
-            tmux_conf=binding.get("tmux_conf"),
-        )
+        with AGENT_TMUX_LOCK, locked_json_path(state_path):
+            state = read_json(state_path, {})
+            state["version"] = 1
+            sessions = state.setdefault("sessions", {})
+            key, entry = _codex_hook_resolved_entry(
+                sessions,
+                desired_key,
+                fallback_key,
+            )
+            now = utcnow_iso()
+            notifications = [
+                item
+                for item in entry.get("notifications", [])
+                if isinstance(item, dict)
+            ]
+            notifications.append(
+                {
+                    "turn_id": turn_id,
+                    "message_sha256": message_hash,
+                    "notified_at": now,
+                }
+            )
+            entry.update(
+                {
+                    "key": key,
+                    "session_id": (
+                        _codex_hook_text_value(payload, "session_id")
+                        or entry.get("session_id")
+                    ),
+                    "fallback_key": fallback_key,
+                    "channel_id": channel_id,
+                    "thread_ts": thread_ts,
+                    "updated_at": now,
+                    "last_turn_id": turn_id,
+                    "last_message_sha256": message_hash,
+                    "notifications": notifications[-50:],
+                }
+            )
+            if "created_at" not in entry:
+                entry["created_at"] = now
+            if binding:
+                entry.update(binding)
+            sessions[key] = entry
+            write_json_atomic(state_path, state)
     return {
         "status": "notified",
         "state_path": state_path,

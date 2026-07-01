@@ -1374,6 +1374,7 @@ def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
         tmux_session="codex-work",
         tmux_socket="codex",
     )
+    Path(load_config(profile).paths.agent_tmux_bindings_path).unlink()
     duplicate = notify_codex_agent_stop(
         profile,
         json.dumps(payload),
@@ -1416,6 +1417,51 @@ def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
     assert entry["channel_id"] == "D111"
     assert entry["session_id"] == "codex-session-1"
     assert len(entry["notifications"]) == 3
+
+
+def test_codex_stop_hook_keeps_distinct_sessions_on_same_tmux_separate(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append(route)
+        index = len(calls)
+        return {"channel": "D111", "ts": f"{index}.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+
+    for session_id in ("codex-session-1", "codex-session-2"):
+        notify_codex_agent_stop(
+            profile,
+            json.dumps(
+                {
+                    "session_id": session_id,
+                    "turn_id": "turn-1",
+                    "last_assistant_message": session_id,
+                }
+            ),
+            tmux_session="codex-work",
+            tmux_socket="codex",
+        )
+
+    assert len(calls) == 2
+    assert all(route.dm_user_id == "U111" for route in calls)
+    assert all(route.thread_ts is None for route in calls)
+    sessions = query_codex_agent_threads(profile)["hook_state"]["sessions"]
+    assert set(sessions) == {
+        "session:codex-session-1",
+        "session:codex-session-2",
+    }
 
 
 def test_codex_stop_hook_suppresses_overlapping_duplicate(
