@@ -15,6 +15,7 @@ from sneeze.slackbot import (
     USER_CONFIG_MODAL_CALLBACK_ID,
     USER_CONFIG_OPEN_ACTION_ID,
     WORK_QUEUE_DEPTH_PER_WORKER,
+    AgentTmuxState,
     CodexRunner,
     SlackApiError,
     SlackbotDiagnosticResult,
@@ -32,13 +33,16 @@ from sneeze.slackbot import (
     effective_codex_policy,
     enqueue_ingress,
     extract_codex_session_id,
+    install_codex_agent_hooks,
     list_schedules,
     load_config,
     merge_child_process_env,
+    notify_codex_agent_stop,
     parse_slack_thread_permalink,
     post_slack_blocks,
     post_slack_message,
     query_agent_tmux_thread,
+    query_codex_agent_threads,
     query_status,
     read_env_file,
     read_json,
@@ -1270,6 +1274,183 @@ def test_agent_tmux_binding_store(tmp_path):
     assert binding["tmux_session"] == "codex-work"
     assert binding["tmux_socket"] == "codex"
     assert binding["tmux_conf"] == str(tmp_path / "codex.tmux.conf")
+
+
+def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        if len(calls) == 1:
+            assert route.dm_user_id == "U111"
+            assert route.thread_ts is None
+            return {"channel": "D111", "ts": "1.000001"}
+        assert route.channel_id == "D111"
+        assert route.thread_ts == "1.000001"
+        return {"channel": "D111", "ts": f"{len(calls)}.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+
+    payload = {
+        "session_id": "codex-session-1",
+        "turn_id": "turn-1",
+        "cwd": str(tmp_path),
+        "hook_event_name": "Stop",
+        "last_assistant_message": "Ready for review.",
+    }
+    result = notify_codex_agent_stop(
+        profile,
+        json.dumps(payload),
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    duplicate = notify_codex_agent_stop(
+        profile,
+        json.dumps(payload),
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    payload["turn_id"] = "turn-2"
+    payload["last_assistant_message"] = "Second stop."
+    second = notify_codex_agent_stop(
+        profile,
+        json.dumps(payload),
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    assert result["status"] == "notified"
+    assert duplicate["status"] == "skipped"
+    assert second["thread_ts"] == "1.000001"
+    assert len(calls) == 2
+    assert "Reply in this thread" in calls[0][1]
+    assert "Second stop." in calls[1][1]
+    binding = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    assert binding["tmux_session"] == "codex-work"
+    status = query_codex_agent_threads(profile)
+    entry = status["hook_state"]["sessions"]["session:codex-session-1"]
+    assert entry["channel_id"] == "D111"
+    assert len(entry["notifications"]) == 2
+
+
+def test_codex_agent_hooks_install_preserves_unrelated_hooks(tmp_path):
+    hooks_path = tmp_path / "hooks.json"
+    webmux_script = tmp_path / "webmux-agent-status.js"
+    webmux_script.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python keep.py",
+                                },
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        "trentn-bot slackbot-agent-stop-hook"
+                                    ),
+                                },
+                            ]
+                        }
+                    ],
+                    "UserPromptSubmit": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        "node old/webmux-agent-status.js "
+                                        "--status working"
+                                    ),
+                                }
+                            ]
+                        }
+                    ],
+                    "PostToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python audit.py",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = install_codex_agent_hooks(
+        hooks_path=str(hooks_path),
+        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        webmux_script_path=str(webmux_script),
+    )
+
+    updated = json.loads(hooks_path.read_text(encoding="utf-8"))
+    stop_commands = [
+        handler["command"]
+        for group in updated["hooks"]["Stop"]
+        for handler in group["hooks"]
+    ]
+    prompt_commands = [
+        handler["command"]
+        for group in updated["hooks"]["UserPromptSubmit"]
+        for handler in group["hooks"]
+    ]
+    post_tool_commands = [
+        handler["command"]
+        for group in updated["hooks"]["PostToolUse"]
+        for handler in group["hooks"]
+    ]
+    stop_handlers = [
+        handler
+        for group in updated["hooks"]["Stop"]
+        for handler in group["hooks"]
+    ]
+    prompt_handlers = [
+        handler
+        for group in updated["hooks"]["UserPromptSubmit"]
+        for handler in group["hooks"]
+    ]
+
+    assert Path(result["backup_path"]).exists()
+    assert "python keep.py" in stop_commands
+    assert stop_commands.count("trentn-bot slackbot-agent-stop-hook") == 1
+    assert any(str(webmux_script) in command for command in stop_commands)
+    assert any(str(webmux_script) in command for command in prompt_commands)
+    assert post_tool_commands == ["python audit.py"]
+    assert result["installed"]["webmux"] is True
+    assert (
+        next(
+            handler["timeout"]
+            for handler in stop_handlers
+            if handler["command"] == "trentn-bot slackbot-agent-stop-hook"
+        )
+        == 15
+    )
+    assert all(handler["timeout"] == 10 for handler in prompt_handlers)
 
 
 def test_agent_tmux_capture_bound_thread(tmp_path, monkeypatch):
@@ -5929,6 +6110,254 @@ def test_agent_tmux_tail_command_posts_pane_capture(tmp_path, monkeypatch):
     ]
     assert "Last 3 lines" in posts[0]
     assert "worker line two" in posts[0]
+
+
+def test_bound_dm_reply_is_pasted_into_idle_tmux(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    config = load_config(profile)
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    bot = SlackSocketBot(config)
+    pasted = []
+    posts = []
+    idle_state = AgentTmuxState(
+        binding={
+            "host": "localhost",
+            "tmux_session": "codex-work",
+            "tmux_socket": "codex",
+        },
+        pane_cwd=str(tmp_path),
+        pane_text="Ready\n›",
+        pane_excerpt="Ready\n›",
+        prompt_line="›",
+        status_line="›",
+        context_remaining_percent=None,
+        working=False,
+    )
+
+    monkeypatch.setattr(
+        bot,
+        "_sample_agent_tmux_route",
+        lambda route: idle_state,
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.paste_agent_tmux_text",
+        lambda config, binding, text: pasted.append((binding, text)),
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: posts.append(text),
+    )
+    monkeypatch.setattr(
+        bot,
+        "_run_codex_for_route",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("should not start Codex")
+        ),
+    )
+
+    bot._handle_event(
+        {
+            "type": "message",
+            "channel_type": "im",
+            "user": "U111",
+            "channel": "D111",
+            "thread_ts": "1.000001",
+            "ts": "2.000001",
+            "text": "please continue exactly",
+        }
+    )
+
+    assert len(pasted) == 1
+    binding, text = pasted[0]
+    assert binding["channel_id"] == "D111"
+    assert binding["thread_ts"] == "1.000001"
+    assert binding["tmux_session"] == "codex-work"
+    assert binding["tmux_socket"] == "codex"
+    assert text == "please continue exactly"
+    assert posts == []
+
+
+def test_bound_dm_reply_refuses_busy_tmux(tmp_path, monkeypatch):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    config = load_config(profile)
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    bot = SlackSocketBot(config)
+    posts = []
+    busy_state = AgentTmuxState(
+        binding={},
+        pane_cwd=str(tmp_path),
+        pane_text="Working (1s)",
+        pane_excerpt="Working (1s)",
+        prompt_line=None,
+        status_line="Working (1s)",
+        context_remaining_percent=None,
+        working=True,
+    )
+
+    monkeypatch.setattr(
+        bot,
+        "_sample_agent_tmux_route",
+        lambda route: busy_state,
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.paste_agent_tmux_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("busy pane should not receive text")
+        ),
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: posts.append(text),
+    )
+
+    bot._handle_event(
+        {
+            "type": "message",
+            "channel_type": "im",
+            "user": "U111",
+            "channel": "D111",
+            "thread_ts": "1.000001",
+            "ts": "2.000001",
+            "text": "continue",
+        }
+    )
+
+    assert posts == [
+        "The bound tmux pane appears busy. I did not send that reply."
+    ]
+
+
+def test_public_thread_and_bot_messages_do_not_mirror_to_tmux(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    config = load_config(profile)
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="C123",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    bot = SlackSocketBot(config)
+    monkeypatch.setattr(
+        "sneeze.slackbot.paste_agent_tmux_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("message should not be mirrored")
+        ),
+    )
+
+    bot._handle_event(
+        {
+            "type": "message",
+            "channel_type": "channel",
+            "user": "U111",
+            "channel": "C123",
+            "thread_ts": "1.000001",
+            "ts": "2.000001",
+            "text": "public reply",
+        }
+    )
+    bot._handle_event(
+        {
+            "type": "message",
+            "channel_type": "im",
+            "user": "U111",
+            "bot_id": "B111",
+            "channel": "D111",
+            "thread_ts": "1.000001",
+            "ts": "2.000001",
+            "text": "bot reply",
+        }
+    )
+
+
+def test_bound_dm_status_uses_tmux_status_before_bot_policy(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    bot = SlackSocketBot(load_config(profile))
+    calls = []
+
+    monkeypatch.setattr(
+        bot,
+        "_handle_agent_tmux_status",
+        lambda route, job: calls.append((route, job)),
+    )
+    monkeypatch.setattr(
+        bot,
+        "_maybe_handle_control_command",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("tmux status should run first")
+        ),
+    )
+
+    bot._handle_event(
+        {
+            "type": "message",
+            "channel_type": "im",
+            "user": "U111",
+            "channel": "D111",
+            "thread_ts": "1.000001",
+            "ts": "2.000001",
+            "text": "status",
+        }
+    )
+
+    assert calls and calls[0][0].channel_id == "D111"
 
 
 def test_agent_tmux_proceed_sends_explicit_next_point(

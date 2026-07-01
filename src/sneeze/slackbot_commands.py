@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -23,11 +24,14 @@ from .slackbot import (
     capture_agent_tmux_thread,
     enqueue_ingress,
     env_lookup,
+    install_codex_agent_hooks,
     install_service,
     list_agent_tmux_jobs,
     list_schedules,
     load_config,
+    notify_codex_agent_stop,
     query_agent_tmux_thread,
+    query_codex_agent_threads,
     query_status,
     read_env_file,
     read_slack_thread,
@@ -38,6 +42,7 @@ from .slackbot import (
     resolve_paths,
     run_schedule,
     run_slackbot,
+    runtime_cli_args,
     scaffold_runtime,
     service_status,
     upsert_schedule,
@@ -1063,6 +1068,106 @@ class SlackbotThreadTailBase(ProfiledSlackbotCommand):
             line_count=self._lines or self.lines,
         )
         self._out(render_agent_tmux_capture(result))
+
+
+class SlackbotAgentStopHookBase(ProfiledSlackbotCommand):
+    tmux_session = None
+    _tmux_session = None
+
+    class TmuxSessionArg(StringInvariant):
+        _arg = "--tmux-session"
+        _help = "Explicit tmux session name for this Codex hook."
+        _mandatory = False
+
+    tmux_socket = None
+    _tmux_socket = None
+
+    class TmuxSocketArg(StringInvariant):
+        _arg = "--tmux-socket"
+        _help = "Explicit tmux socket name for this Codex hook."
+        _mandatory = False
+
+    tmux_conf = None
+    _tmux_conf = None
+
+    class TmuxConfArg(StringInvariant):
+        _arg = "--tmux-conf"
+        _help = "Explicit tmux config path for this Codex hook."
+        _mandatory = False
+
+    def run(self):
+        hook_input = self.istream.read() or ""
+        try:
+            notify_codex_agent_stop(
+                self._profile(),
+                hook_input,
+                **self._common(),
+                tmux_session=self._tmux_session or self.tmux_session,
+                tmux_socket=self._tmux_socket or self.tmux_socket,
+                tmux_conf=self._tmux_conf or self.tmux_conf,
+            )
+        except Exception as exc:
+            self._err(f"slackbot-agent-stop-hook: {exc}")
+
+
+class SlackbotAgentHooksInstallBase(ProfiledSlackbotCommand):
+    hooks_path = None
+    _hooks_path = None
+
+    class HooksPathArg(StringInvariant):
+        _arg = "--hooks-path"
+        _help = "Codex hooks.json path to edit."
+        _mandatory = False
+
+    cli_bin = None
+    _cli_bin = None
+
+    class CliBinArg(StringInvariant):
+        _arg = "--cli-bin"
+        _help = "CLI executable to place in the hook command."
+        _mandatory = False
+
+    webmux_script = None
+    _webmux_script = None
+
+    class WebmuxScriptArg(StringInvariant):
+        _arg = "--webmux-script"
+        _help = "Optional webmux-agent-status.js path."
+        _mandatory = False
+
+    no_webmux = False
+    _no_webmux = False
+
+    class NoWebmuxArg(BoolInvariant):
+        _arg = "--no-webmux"
+        _help = "Do not install optional WebMux status hooks."
+        _mandatory = False
+
+    def run(self):
+        paths = resolve_paths(self._profile(), **self._common())
+        cli_bin = self._resolved_cli_bin(self._cli_bin or self.cli_bin)
+        stop_command = shlex.join(
+            [
+                cli_bin,
+                "slackbot-agent-stop-hook",
+                *runtime_cli_args(paths),
+            ]
+        )
+        self._json(
+            install_codex_agent_hooks(
+                hooks_path=self._hooks_path or self.hooks_path,
+                slack_stop_command=stop_command,
+                webmux_script_path=self._webmux_script or self.webmux_script,
+                include_webmux=not (self._no_webmux or self.no_webmux),
+            )
+        )
+
+
+class SlackbotAgentThreadStatusBase(ProfiledSlackbotCommand):
+    def run(self):
+        self._json(
+            query_codex_agent_threads(self._profile(), **self._common())
+        )
 
 
 class SlackbotNurseJobsBase(ProfiledSlackbotCommand):
