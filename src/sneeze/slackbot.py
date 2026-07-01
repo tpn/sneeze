@@ -746,6 +746,27 @@ def locked_json_path(path: str | Path):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def try_locked_json_path(path: str | Path):
+    target = Path(path).expanduser()
+    lock_path = target.with_suffix(target.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a", encoding="utf-8") as handle:
+        acquired = False
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            acquired = True
+        try:
+            yield True
+        finally:
+            if acquired:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def default_executable_path(name: str) -> str:
     resolved = shutil.which(name)
     if resolved:
@@ -4959,6 +4980,20 @@ def _codex_hook_state_key(
     )
 
 
+def _codex_hook_entry_fallback_key(
+    entry: dict[str, Any],
+) -> str | None:
+    fallback_key = str(entry.get("fallback_key") or "").strip()
+    if fallback_key:
+        return fallback_key
+    host = str(entry.get("host") or "").strip()
+    tmux_session = str(entry.get("tmux_session") or "").strip()
+    if not host or not tmux_session:
+        return None
+    tmux_socket = str(entry.get("tmux_socket") or "").strip()
+    return "tmux:" + ":".join((host, tmux_socket, tmux_session))
+
+
 def _codex_hook_existing_entry(
     sessions: dict[str, Any],
     key: str,
@@ -4979,7 +5014,7 @@ def _codex_hook_existing_entry(
                 continue
             if (
                 candidate_key == fallback_key
-                or candidate.get("fallback_key") == fallback_key
+                or _codex_hook_entry_fallback_key(candidate) == fallback_key
             ):
                 candidate_session_id = candidate.get("session_id")
                 if (
@@ -5058,10 +5093,57 @@ def _codex_hook_delivery_aliases(
     session_id = str(entry.get("session_id") or "").strip()
     if session_id:
         aliases.add(f"session:{session_id}")
-    stored_fallback_key = str(entry.get("fallback_key") or "").strip()
+    stored_fallback_key = _codex_hook_entry_fallback_key(entry)
     if stored_fallback_key:
         aliases.add(stored_fallback_key)
     return aliases
+
+
+@contextmanager
+def _locked_codex_hook_delivery_aliases(
+    state_path: str,
+    desired_key: str,
+    fallback_key: str | None,
+):
+    alias_resolution_lock_path = _codex_hook_delivery_lock_path(
+        state_path,
+        "internal:alias-resolution",
+    )
+    while True:
+        candidate_locks = ExitStack()
+        acquired_all = False
+        try:
+            with locked_json_path(alias_resolution_lock_path):
+                with AGENT_TMUX_LOCK, locked_json_path(state_path):
+                    state = read_json(state_path, {})
+                    aliases = _codex_hook_delivery_aliases(
+                        state.get("sessions") or {},
+                        desired_key,
+                        fallback_key,
+                    )
+                delivery_lock_paths = _codex_hook_delivery_lock_paths(
+                    state_path,
+                    *aliases,
+                )
+                for delivery_lock_path in delivery_lock_paths:
+                    acquired = candidate_locks.enter_context(
+                        try_locked_json_path(delivery_lock_path)
+                    )
+                    if not acquired:
+                        break
+                else:
+                    acquired_all = True
+        except BaseException:
+            candidate_locks.close()
+            raise
+        if acquired_all:
+            break
+        candidate_locks.close()
+        time.sleep(0.01)
+    try:
+        yield
+    finally:
+        candidate_locks.close()
 
 
 def _render_codex_stop_notification(
@@ -5165,28 +5247,12 @@ def notify_codex_agent_stop(
     message_hash = _codex_hook_message_hash(message)
     state_path = agent_codex_hook_state_path(config.paths)
     fallback_key = _codex_hook_state_key({}, binding) if binding else None
-    alias_resolution_lock_path = _codex_hook_delivery_lock_path(
-        state_path,
-        "internal:alias-resolution",
-    )
 
-    with ExitStack() as delivery_locks:
-        with locked_json_path(alias_resolution_lock_path):
-            with AGENT_TMUX_LOCK, locked_json_path(state_path):
-                state = read_json(state_path, {})
-                aliases = _codex_hook_delivery_aliases(
-                    state.get("sessions") or {},
-                    desired_key,
-                    fallback_key,
-                )
-            delivery_lock_paths = _codex_hook_delivery_lock_paths(
-                state_path,
-                *aliases,
-            )
-            for delivery_lock_path in delivery_lock_paths:
-                delivery_locks.enter_context(
-                    locked_json_path(delivery_lock_path)
-                )
+    with _locked_codex_hook_delivery_aliases(
+        state_path,
+        desired_key,
+        fallback_key,
+    ):
         with AGENT_TMUX_LOCK, locked_json_path(state_path):
             state = read_json(state_path, {})
             sessions = state.setdefault("sessions", {})
@@ -5305,7 +5371,9 @@ def notify_codex_agent_stop(
                         _codex_hook_text_value(payload, "session_id")
                         or entry.get("session_id")
                     ),
-                    "fallback_key": fallback_key or entry.get("fallback_key"),
+                    "fallback_key": (
+                        fallback_key or _codex_hook_entry_fallback_key(entry)
+                    ),
                     "channel_id": channel_id,
                     "thread_ts": thread_ts,
                     "updated_at": now,

@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -1633,9 +1634,23 @@ def test_codex_stop_hook_serializes_persisted_aliases_without_binding(
         tmux_session="codex-work",
         tmux_socket="codex",
     )
-    next_payload = {
+    session_only_payload = {
         "session_id": "codex-session-1",
         "turn_id": "turn-2",
+        "last_assistant_message": "Session-only stop.",
+    }
+    notify_codex_agent_stop(
+        profile,
+        json.dumps(session_only_payload),
+    )
+    status = query_codex_agent_threads(profile)
+    entry = status["hook_state"]["sessions"]["session:codex-session-1"]
+    assert entry["fallback_key"].startswith("tmux:")
+    assert entry["tmux_session"] == "codex-work"
+
+    next_payload = {
+        "session_id": "codex-session-1",
+        "turn_id": "turn-3",
         "last_assistant_message": "Ready for review.",
     }
     session_payload = json.dumps(next_payload)
@@ -1663,14 +1678,148 @@ def test_codex_stop_hook_serializes_persisted_aliases_without_binding(
         ]
         results = [future.result() for future in futures]
 
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert sorted(result["status"] for result in results) == [
         "notified",
         "skipped",
     ]
     sessions = query_codex_agent_threads(profile)["hook_state"]["sessions"]
     entry = sessions["session:codex-session-1"]
-    assert len(entry["notifications"]) == 2
+    assert len(entry["notifications"]) == 3
+
+
+def test_codex_stop_hook_recovers_legacy_null_fallback_key(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    notify_codex_agent_stop(
+        profile,
+        json.dumps(
+            {
+                "session_id": "codex-session-1",
+                "turn_id": "turn-1",
+                "last_assistant_message": "Initial stop.",
+            }
+        ),
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    status = query_codex_agent_threads(profile)
+    entry = status["hook_state"]["sessions"]["session:codex-session-1"]
+    entry["fallback_key"] = None
+    Path(status["hook_state_path"]).write_text(
+        json.dumps(status["hook_state"]),
+        encoding="utf-8",
+    )
+
+    result = notify_codex_agent_stop(
+        profile,
+        json.dumps(
+            {
+                "turn_id": "turn-2",
+                "last_assistant_message": "Legacy fallback stop.",
+            }
+        ),
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    assert len(calls) == 2
+    assert calls[1][0].channel_id == "D111"
+    assert calls[1][0].thread_ts == "1.000001"
+    assert result["key"] == "session:codex-session-1"
+    sessions = query_codex_agent_threads(profile)["hook_state"]["sessions"]
+    entry = sessions["session:codex-session-1"]
+    assert entry["fallback_key"].startswith("tmux:")
+
+
+def test_codex_stop_hook_busy_alias_does_not_block_unrelated_session(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    for env_name in (
+        "WEBMUX_AGENT_SESSION",
+        "CODEX_TMUX_SESSION_NAME",
+        "TMUX_PANE",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    slow_post_started = threading.Event()
+    release_slow_post = threading.Event()
+    unrelated_posted = threading.Event()
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        if "Slow stop." in text:
+            slow_post_started.set()
+            release_slow_post.wait(timeout=2)
+        if "Unrelated stop." in text:
+            unrelated_posted.set()
+        return {"channel": "D111", "ts": f"{len(calls)}.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    slow_payload = json.dumps(
+        {
+            "session_id": "codex-session-slow",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Slow stop.",
+        }
+    )
+    unrelated_payload = json.dumps(
+        {
+            "session_id": "codex-session-unrelated",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Unrelated stop.",
+        }
+    )
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        slow = executor.submit(notify_codex_agent_stop, profile, slow_payload)
+        assert slow_post_started.wait(timeout=1)
+        waiter = executor.submit(
+            notify_codex_agent_stop, profile, slow_payload
+        )
+        time.sleep(0.05)
+        unrelated = executor.submit(
+            notify_codex_agent_stop,
+            profile,
+            unrelated_payload,
+        )
+        try:
+            assert unrelated_posted.wait(timeout=1)
+        finally:
+            release_slow_post.set()
+        results = [future.result() for future in (slow, waiter, unrelated)]
+
+    assert len(calls) == 2
+    assert sorted(result["status"] for result in results) == [
+        "notified",
+        "notified",
+        "skipped",
+    ]
 
 
 def test_codex_stop_hook_recovers_binding_without_duplicate_post(
