@@ -21,7 +21,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -5006,7 +5006,7 @@ def _codex_hook_resolved_entry(
     sessions: dict[str, Any],
     key: str,
     fallback_key: str | None,
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, dict[str, Any], bool]:
     existing_key, entry = _codex_hook_existing_entry(
         sessions,
         key,
@@ -5014,8 +5014,8 @@ def _codex_hook_resolved_entry(
     )
     if key.startswith("session:") and existing_key != key:
         sessions.pop(existing_key, None)
-        return key, entry
-    return existing_key, entry
+        return key, entry, True
+    return existing_key, entry, False
 
 
 def _codex_hook_delivery_lock_path(
@@ -5025,6 +5025,21 @@ def _codex_hook_delivery_lock_path(
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
     target = Path(state_path)
     return str(target.with_name(f".{target.name}.{digest}.delivery"))
+
+
+def _codex_hook_delivery_lock_paths(
+    state_path: str,
+    *keys: str | None,
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                _codex_hook_delivery_lock_path(state_path, key)
+                for key in keys
+                if key
+            }
+        )
+    )
 
 
 def _render_codex_stop_notification(
@@ -5128,21 +5143,19 @@ def notify_codex_agent_stop(
     message_hash = _codex_hook_message_hash(message)
     state_path = agent_codex_hook_state_path(config.paths)
     fallback_key = _codex_hook_state_key({}, binding) if binding else None
-    delivery_identity = (
-        desired_key
-        if desired_key.startswith("session:")
-        else fallback_key or desired_key
-    )
-    delivery_lock_path = _codex_hook_delivery_lock_path(
+    delivery_lock_paths = _codex_hook_delivery_lock_paths(
         state_path,
-        delivery_identity,
+        desired_key,
+        fallback_key,
     )
 
-    with locked_json_path(delivery_lock_path):
+    with ExitStack() as delivery_locks:
+        for delivery_lock_path in delivery_lock_paths:
+            delivery_locks.enter_context(locked_json_path(delivery_lock_path))
         with AGENT_TMUX_LOCK, locked_json_path(state_path):
             state = read_json(state_path, {})
             sessions = state.setdefault("sessions", {})
-            key, entry = _codex_hook_resolved_entry(
+            key, entry, entry_migrated = _codex_hook_resolved_entry(
                 sessions,
                 desired_key,
                 fallback_key,
@@ -5154,6 +5167,21 @@ def notify_codex_agent_stop(
             )
             channel_id = entry.get("channel_id") or None
             thread_ts = entry.get("thread_ts") or None
+            if duplicate and entry_migrated:
+                entry.update(
+                    {
+                        "key": key,
+                        "session_id": _codex_hook_text_value(
+                            payload,
+                            "session_id",
+                        ),
+                        "fallback_key": fallback_key,
+                    }
+                )
+                if binding:
+                    entry.update(binding)
+                sessions[key] = entry
+                write_json_atomic(state_path, state)
 
         if duplicate:
             if binding and channel_id and thread_ts:
@@ -5217,7 +5245,7 @@ def notify_codex_agent_stop(
             state = read_json(state_path, {})
             state["version"] = 1
             sessions = state.setdefault("sessions", {})
-            key, entry = _codex_hook_resolved_entry(
+            key, entry, _ = _codex_hook_resolved_entry(
                 sessions,
                 desired_key,
                 fallback_key,

@@ -1545,6 +1545,57 @@ def test_codex_stop_hook_suppresses_overlapping_duplicate(
     ]
 
 
+def test_codex_stop_hook_serializes_session_and_fallback_aliases(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        time.sleep(0.05)
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    payload = {
+        "session_id": "codex-session-1",
+        "turn_id": "turn-1",
+        "last_assistant_message": "Ready for review.",
+    }
+    session_payload = json.dumps(payload)
+    payload.pop("session_id")
+    fallback_payload = json.dumps(payload)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                notify_codex_agent_stop,
+                profile,
+                hook_input,
+                tmux_session="codex-work",
+                tmux_socket="codex",
+            )
+            for hook_input in (session_payload, fallback_payload)
+        ]
+        results = [future.result() for future in futures]
+
+    assert len(calls) == 1
+    assert sorted(result["status"] for result in results) == [
+        "notified",
+        "skipped",
+    ]
+    sessions = query_codex_agent_threads(profile)["hook_state"]["sessions"]
+    assert set(sessions) == {"session:codex-session-1"}
+
+
 def test_codex_stop_hook_recovers_binding_without_duplicate_post(
     tmp_path,
     monkeypatch,
