@@ -4973,6 +4973,7 @@ def _codex_hook_existing_entry(
             if key.startswith("session:")
             else None
         )
+        matches = []
         for candidate_key, candidate in sessions.items():
             if not isinstance(candidate, dict):
                 continue
@@ -4987,7 +4988,17 @@ def _codex_hook_existing_entry(
                     and candidate_session_id != requested_session_id
                 ):
                     continue
-                return candidate_key, dict(candidate)
+                matches.append((candidate_key, candidate))
+        if matches:
+            candidate_key, candidate = max(
+                matches,
+                key=lambda item: (
+                    str(item[1].get("updated_at") or ""),
+                    str(item[1].get("created_at") or ""),
+                    item[0],
+                ),
+            )
+            return candidate_key, dict(candidate)
     return key, {}
 
 
@@ -5117,9 +5128,14 @@ def notify_codex_agent_stop(
     message_hash = _codex_hook_message_hash(message)
     state_path = agent_codex_hook_state_path(config.paths)
     fallback_key = _codex_hook_state_key({}, binding) if binding else None
+    delivery_identity = (
+        desired_key
+        if desired_key.startswith("session:")
+        else fallback_key or desired_key
+    )
     delivery_lock_path = _codex_hook_delivery_lock_path(
         state_path,
-        fallback_key or desired_key,
+        delivery_identity,
     )
 
     with locked_json_path(delivery_lock_path):
@@ -5197,22 +5213,6 @@ def notify_codex_agent_stop(
                 "Slack notification did not return a channel and timestamp"
             )
 
-        if binding:
-            bind_agent_tmux_thread(
-                profile,
-                runtime_root=runtime_root,
-                env_path=env_path,
-                state_dir=state_dir,
-                system_prompt_path=system_prompt_path,
-                unit_name=unit_name,
-                channel_id=channel_id,
-                thread_ts=thread_ts,
-                host=binding["host"],
-                tmux_session=binding["tmux_session"],
-                tmux_socket=binding.get("tmux_socket"),
-                tmux_conf=binding.get("tmux_conf"),
-            )
-
         with AGENT_TMUX_LOCK, locked_json_path(state_path):
             state = read_json(state_path, {})
             state["version"] = 1
@@ -5257,6 +5257,22 @@ def notify_codex_agent_stop(
                 entry.update(binding)
             sessions[key] = entry
             write_json_atomic(state_path, state)
+
+        if binding:
+            bind_agent_tmux_thread(
+                profile,
+                runtime_root=runtime_root,
+                env_path=env_path,
+                state_dir=state_dir,
+                system_prompt_path=system_prompt_path,
+                unit_name=unit_name,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                host=binding["host"],
+                tmux_session=binding["tmux_session"],
+                tmux_socket=binding.get("tmux_socket"),
+                tmux_conf=binding.get("tmux_conf"),
+            )
     return {
         "status": "notified",
         "state_path": state_path,

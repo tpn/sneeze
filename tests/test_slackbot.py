@@ -1454,10 +1454,32 @@ def test_codex_stop_hook_keeps_distinct_sessions_on_same_tmux_separate(
             tmux_socket="codex",
         )
 
-    assert len(calls) == 2
-    assert all(route.dm_user_id == "U111" for route in calls)
-    assert all(route.thread_ts is None for route in calls)
-    sessions = query_codex_agent_threads(profile)["hook_state"]["sessions"]
+    status = query_codex_agent_threads(profile)
+    sessions = status["hook_state"]["sessions"]
+    sessions["session:codex-session-1"]["updated_at"] = "2026-07-01T10:00:00Z"
+    sessions["session:codex-session-2"]["updated_at"] = "2026-07-01T10:01:00Z"
+    Path(status["hook_state_path"]).write_text(
+        json.dumps(status["hook_state"]),
+        encoding="utf-8",
+    )
+    fallback = notify_codex_agent_stop(
+        profile,
+        json.dumps(
+            {
+                "turn_id": "turn-2",
+                "last_assistant_message": "session-less stop",
+            }
+        ),
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    assert len(calls) == 3
+    assert all(route.dm_user_id == "U111" for route in calls[:2])
+    assert all(route.thread_ts is None for route in calls[:2])
+    assert calls[2].channel_id == "D111"
+    assert calls[2].thread_ts == "2.000001"
+    assert fallback["key"] == "session:codex-session-2"
     assert set(sessions) == {
         "session:codex-session-1",
         "session:codex-session-2",
@@ -1484,6 +1506,12 @@ def test_codex_stop_hook_suppresses_overlapping_duplicate(
         return {"channel": "D111", "ts": "1.000001"}
 
     monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    for env_name in (
+        "WEBMUX_AGENT_SESSION",
+        "CODEX_TMUX_SESSION_NAME",
+        "TMUX_PANE",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -1498,10 +1526,15 @@ def test_codex_stop_hook_suppresses_overlapping_duplicate(
                 notify_codex_agent_stop,
                 profile,
                 payload,
-                tmux_session="codex-work",
-                tmux_socket="codex",
+                **kwargs,
             )
-            for _ in range(2)
+            for kwargs in (
+                {
+                    "tmux_session": "codex-work",
+                    "tmux_socket": "codex",
+                },
+                {},
+            )
         ]
         results = [future.result() for future in futures]
 
@@ -1510,6 +1543,71 @@ def test_codex_stop_hook_suppresses_overlapping_duplicate(
         "notified",
         "skipped",
     ]
+
+
+def test_codex_stop_hook_recovers_binding_without_duplicate_post(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    def fail_bind(*args, **kwargs):
+        raise SlackbotError("simulated binding failure")
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.bind_agent_tmux_thread", fail_bind)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+
+    with pytest.raises(SlackbotError, match="simulated binding failure"):
+        notify_codex_agent_stop(
+            profile,
+            payload,
+            tmux_session="codex-work",
+            tmux_socket="codex",
+        )
+
+    state = query_codex_agent_threads(profile)["hook_state"]
+    entry = state["sessions"]["session:codex-session-1"]
+    assert entry["channel_id"] == "D111"
+    assert len(entry["notifications"]) == 1
+
+    monkeypatch.setattr(
+        "sneeze.slackbot.bind_agent_tmux_thread",
+        bind_agent_tmux_thread,
+    )
+    retry = notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    assert retry["status"] == "skipped"
+    assert len(calls) == 1
+    binding = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    assert binding["tmux_session"] == "codex-work"
 
 
 def test_codex_stop_hook_can_notify_without_tmux_binding(
