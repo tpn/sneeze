@@ -1302,6 +1302,28 @@ def test_tmux_binding_uses_absolute_socket_path(tmp_path):
     assert tmux_socket == socket_path
 
 
+def test_tmux_binding_explicit_session_uses_active_socket(
+    tmp_path,
+    monkeypatch,
+):
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    socket_path = str(tmp_path / "active-tmux.sock")
+    monkeypatch.setenv("WEBMUX_AGENT_SESSION", "codex-work")
+    monkeypatch.setenv("TMUX", f"{socket_path},123,0")
+    monkeypatch.delenv("CODEX_TMUX_SOCKET", raising=False)
+
+    binding = resolve_codex_agent_tmux_binding(config)
+
+    assert binding["tmux_session"] == "codex-work"
+    assert binding["tmux_socket"] == socket_path
+    assert "tmux_conf" not in binding
+
+
 def test_tmux_binding_resolves_pane_from_tmux_socket_env(
     tmp_path,
     monkeypatch,
@@ -1418,6 +1440,79 @@ def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
     assert entry["channel_id"] == "D111"
     assert entry["session_id"] == "codex-session-1"
     assert len(entry["notifications"]) == 3
+
+
+def test_codex_stop_hook_starts_new_thread_when_recipient_changes(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    for env_name in (
+        "WEBMUX_AGENT_SESSION",
+        "CODEX_TMUX_SESSION_NAME",
+        "TMUX_PANE",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        if route.dm_user_id == "U111":
+            return {"channel": "D111", "ts": "1.000001"}
+        if route.dm_user_id == "U222":
+            return {"channel": "D222", "ts": "2.000001"}
+        return {"channel": route.channel_id, "ts": "3.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    payload = {
+        "session_id": "codex-session-1",
+        "turn_id": "turn-1",
+        "last_assistant_message": "First recipient.",
+    }
+    notify_codex_agent_stop(
+        profile,
+        json.dumps(payload),
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8").replace(
+            "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111",
+            "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U222",
+        ),
+        encoding="utf-8",
+    )
+    payload["turn_id"] = "turn-2"
+    payload["last_assistant_message"] = "Second recipient."
+    changed = notify_codex_agent_stop(profile, json.dumps(payload))
+    payload["turn_id"] = "turn-3"
+    payload["last_assistant_message"] = "Same second recipient."
+    notify_codex_agent_stop(profile, json.dumps(payload))
+
+    assert calls[0][0].dm_user_id == "U111"
+    assert calls[1][0].dm_user_id == "U222"
+    assert calls[1][0].thread_ts is None
+    assert calls[2][0].channel_id == "D222"
+    assert calls[2][0].thread_ts == "2.000001"
+    assert changed["tmux_binding"]["tmux_session"] == "codex-work"
+    state = query_codex_agent_threads(profile)["hook_state"]
+    entry = state["sessions"]["session:codex-session-1"]
+    assert entry["notify_user_id"] == "U222"
+    assert entry["channel_id"] == "D222"
+    assert len(entry["notifications"]) == 2
+    binding = query_agent_tmux_thread(
+        profile,
+        channel_id="D222",
+        thread_ts="2.000001",
+    )
+    assert binding["tmux_session"] == "codex-work"
 
 
 def test_codex_stop_hook_keeps_distinct_sessions_on_same_tmux_separate(
@@ -1822,6 +1917,56 @@ def test_codex_stop_hook_busy_alias_does_not_block_unrelated_session(
     ]
 
 
+def test_codex_stop_hook_times_out_waiting_for_busy_alias(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    for env_name in (
+        "WEBMUX_AGENT_SESSION",
+        "CODEX_TMUX_SESSION_NAME",
+        "TMUX_PANE",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setattr(
+        "sneeze.slackbot.AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS",
+        0.05,
+    )
+    slow_post_started = threading.Event()
+    release_slow_post = threading.Event()
+
+    def fake_post(config, route, text):
+        slow_post_started.set()
+        release_slow_post.wait(timeout=2)
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-slow",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Slow stop.",
+        }
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        slow = executor.submit(notify_codex_agent_stop, profile, payload)
+        assert slow_post_started.wait(timeout=1)
+        try:
+            with pytest.raises(SlackbotError, match="Timed out waiting"):
+                notify_codex_agent_stop(profile, payload)
+        finally:
+            release_slow_post.set()
+        assert slow.result()["status"] == "notified"
+
+
 def test_codex_stop_hook_recovers_binding_without_duplicate_post(
     tmp_path,
     monkeypatch,
@@ -1905,12 +2050,18 @@ def test_codex_stop_hook_can_notify_without_tmux_binding(
         "TMUX_PANE",
     ):
         monkeypatch.delenv(env_name, raising=False)
-    monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
-        lambda config, route, text: {
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {
             "channel": "D111",
             "ts": "1.000001",
-        },
+        }
+
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        fake_post,
     )
 
     result = notify_codex_agent_stop(
@@ -1926,6 +2077,8 @@ def test_codex_stop_hook_can_notify_without_tmux_binding(
 
     assert result["status"] == "notified"
     assert result["tmux_binding"] is None
+    assert "read-only" in calls[0][1]
+    assert "Reply in this thread" not in calls[0][1]
     assert query_codex_agent_threads(profile)["agent_tmux_bindings"] == {}
 
 
@@ -6802,6 +6955,70 @@ def test_bound_dm_reply_is_pasted_into_idle_tmux(
     assert binding["tmux_socket"] == "codex"
     assert text == "please continue exactly"
     assert posts == []
+
+
+def test_unbound_notification_thread_replies_are_read_only(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    for env_name in (
+        "WEBMUX_AGENT_SESSION",
+        "CODEX_TMUX_SESSION_NAME",
+        "TMUX_PANE",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    posts = []
+
+    def fake_post(config, route, text):
+        posts.append(text)
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    notify_codex_agent_stop(
+        profile,
+        json.dumps(
+            {
+                "session_id": "codex-session-1",
+                "turn_id": "turn-1",
+                "last_assistant_message": "Read-only stop.",
+            }
+        ),
+    )
+    posts.clear()
+    bot = SlackSocketBot(load_config(profile))
+    monkeypatch.setattr(
+        bot,
+        "_run_codex_for_route",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("read-only reply should not start Codex")
+        ),
+    )
+
+    bot._handle_event(
+        {
+            "type": "message",
+            "channel_type": "im",
+            "user": "U111",
+            "channel": "D111",
+            "thread_ts": "1.000001",
+            "ts": "2.000001",
+            "text": "please continue",
+        }
+    )
+
+    assert posts == [
+        "No tmux pane is bound to this notification thread. "
+        "Replies are read-only."
+    ]
 
 
 def test_bound_dm_reply_refuses_busy_tmux(tmp_path, monkeypatch):
