@@ -5129,11 +5129,14 @@ def _codex_hook_state_key(
     if session_id:
         return f"session:{session_id}"
     if binding:
-        parts = (
+        parts = [
             binding.get("host") or "",
             binding.get("tmux_socket") or "",
             binding.get("tmux_session") or "",
-        )
+        ]
+        tmux_pane = binding.get("tmux_pane") or ""
+        if tmux_pane:
+            parts.append(tmux_pane)
         return "tmux:" + ":".join(parts)
     raise SlackbotError(
         "Codex hook input is missing session_id and no tmux binding "
@@ -5141,18 +5144,42 @@ def _codex_hook_state_key(
     )
 
 
-def _codex_hook_entry_fallback_key(
+def _codex_hook_entry_fallback_keys(
     entry: dict[str, Any],
-) -> str | None:
+) -> set[str]:
+    fallback_keys = set()
     fallback_key = str(entry.get("fallback_key") or "").strip()
     if fallback_key:
-        return fallback_key
+        fallback_keys.add(fallback_key)
     host = str(entry.get("host") or "").strip()
     tmux_session = str(entry.get("tmux_session") or "").strip()
     if not host or not tmux_session:
-        return None
+        return fallback_keys
     tmux_socket = str(entry.get("tmux_socket") or "").strip()
-    return "tmux:" + ":".join((host, tmux_socket, tmux_session))
+    legacy_key = "tmux:" + ":".join((host, tmux_socket, tmux_session))
+    fallback_keys.add(legacy_key)
+    tmux_pane = str(entry.get("tmux_pane") or "").strip()
+    if tmux_pane:
+        fallback_keys.add(f"{legacy_key}:{tmux_pane}")
+    return fallback_keys
+
+
+def _codex_hook_entry_fallback_key(
+    entry: dict[str, Any],
+) -> str | None:
+    fallback_keys = _codex_hook_entry_fallback_keys(entry)
+    tmux_pane = str(entry.get("tmux_pane") or "").strip()
+    if tmux_pane:
+        pane_suffix = f":{tmux_pane}"
+        pane_keys = [
+            key for key in fallback_keys if key.endswith(pane_suffix)
+        ]
+        if pane_keys:
+            return sorted(pane_keys)[0]
+    configured_key = str(entry.get("fallback_key") or "").strip()
+    if configured_key:
+        return configured_key
+    return sorted(fallback_keys)[0] if fallback_keys else None
 
 
 def _codex_hook_entry_binding(
@@ -5193,7 +5220,7 @@ def _codex_hook_existing_entry(
                 continue
             if (
                 candidate_key == fallback_key
-                or _codex_hook_entry_fallback_key(candidate) == fallback_key
+                or fallback_key in _codex_hook_entry_fallback_keys(candidate)
             ):
                 candidate_session_id = candidate.get("session_id")
                 if (
@@ -5226,9 +5253,16 @@ def _codex_hook_resolved_entry(
         key,
         fallback_key,
     )
-    if key.startswith("session:") and existing_key != key:
-        sessions.pop(existing_key, None)
-        return key, entry, True
+    if existing_key != key:
+        canonical_fallback_key = _codex_hook_entry_fallback_key(entry)
+        migrate_fallback_key = (
+            key.startswith("tmux:")
+            and existing_key.startswith("tmux:")
+            and canonical_fallback_key == key
+        )
+        if key.startswith("session:") or migrate_fallback_key:
+            sessions.pop(existing_key, None)
+            return key, entry, True
     return existing_key, entry, False
 
 
@@ -5348,9 +5382,7 @@ def _codex_hook_delivery_aliases(
     session_id = str(entry.get("session_id") or "").strip()
     if session_id:
         aliases.add(f"session:{session_id}")
-    stored_fallback_key = _codex_hook_entry_fallback_key(entry)
-    if stored_fallback_key:
-        aliases.add(stored_fallback_key)
+    aliases.update(_codex_hook_entry_fallback_keys(entry))
     return aliases
 
 

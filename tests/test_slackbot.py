@@ -65,6 +65,7 @@ from sneeze.slackbot import (
     run_schedule,
     run_slackbot,
     safe_slack_storage_id,
+    sample_agent_tmux_thread,
     save_user_config_submission,
     scaffold_runtime,
     slack_api_post,
@@ -1628,6 +1629,121 @@ def test_codex_stop_hook_keeps_distinct_sessions_on_same_tmux_separate(
     }
 
 
+def test_codex_stop_hook_keeps_sessionless_tmux_panes_separate(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot._tmux_session_from_pane",
+        lambda *args, **kwargs: "codex-work",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append(route)
+        return {"channel": f"D{len(calls)}", "ts": f"{len(calls)}.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+
+    def hook_payload(pane, turn_id):
+        return json.dumps(
+            {
+                "turn_id": turn_id,
+                "last_assistant_message": f"Stop from {pane}",
+                "tmux_session": "codex-work",
+                "tmux_socket": "codex",
+                "tmux_pane": pane,
+            }
+        )
+
+    first = notify_codex_agent_stop(
+        profile,
+        hook_payload("%1", "turn-1"),
+    )
+    second = notify_codex_agent_stop(
+        profile,
+        hook_payload("%2", "turn-1"),
+    )
+    first_again = notify_codex_agent_stop(
+        profile,
+        hook_payload("%1", "turn-2"),
+    )
+
+    assert first["key"] != second["key"]
+    assert first["key"].endswith(":%1")
+    assert second["key"].endswith(":%2")
+    assert calls[0].dm_user_id == "U111"
+    assert calls[1].dm_user_id == "U111"
+    assert calls[2].channel_id == "D1"
+    assert calls[2].thread_ts == "1.000001"
+    assert first_again["key"] == first["key"]
+    sessions = query_codex_agent_threads(profile)["hook_state"]["sessions"]
+    assert sessions[first["key"]]["tmux_pane"] == "%1"
+    assert sessions[second["key"]]["tmux_pane"] == "%2"
+
+
+def test_codex_stop_hook_migrates_legacy_sessionless_pane_key(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot._tmux_session_from_pane",
+        lambda *args, **kwargs: "codex-work",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append(route)
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    payload = {
+        "turn_id": "turn-1",
+        "last_assistant_message": "First pane stop.",
+        "tmux_session": "codex-work",
+        "tmux_socket": "codex",
+        "tmux_pane": "%1",
+    }
+    first = notify_codex_agent_stop(profile, json.dumps(payload))
+    status = query_codex_agent_threads(profile)
+    entry = status["hook_state"]["sessions"].pop(first["key"])
+    legacy_key = first["key"].rsplit(":", 1)[0]
+    entry["key"] = legacy_key
+    entry["fallback_key"] = legacy_key
+    status["hook_state"]["sessions"][legacy_key] = entry
+    Path(status["hook_state_path"]).write_text(
+        json.dumps(status["hook_state"]),
+        encoding="utf-8",
+    )
+    payload["turn_id"] = "turn-2"
+    payload["last_assistant_message"] = "Second pane stop."
+
+    migrated = notify_codex_agent_stop(profile, json.dumps(payload))
+
+    assert migrated["key"] == first["key"]
+    assert calls[1].channel_id == "D111"
+    assert calls[1].thread_ts == "1.000001"
+    sessions = query_codex_agent_threads(profile)["hook_state"]["sessions"]
+    assert set(sessions) == {first["key"]}
+    assert sessions[first["key"]]["fallback_key"] == first["key"]
+
+
 def test_codex_stop_hook_suppresses_overlapping_duplicate(
     tmp_path,
     monkeypatch,
@@ -2573,6 +2689,61 @@ def test_agent_tmux_paste_targets_bound_pane(tmp_path, monkeypatch):
     assert calls[0][1]["input"] == "literal $HOME; -- text"
     assert calls[1][0][-2:] == ["-t", "%7"]
     assert calls[2][0][-2:] == ["%7", "Enter"]
+
+
+def test_agent_tmux_sample_selects_bound_pane_cwd(tmp_path, monkeypatch):
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_pane="%7",
+    )
+    config = load_config(profile)
+    calls = []
+    session_cwds = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "capture-pane" in args:
+            return SimpleNamespace(
+                returncode=0, stdout="Ready\n›\n", stderr=""
+            )
+        if "list-panes" in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="%8\t1\t/wrong\n%7\t0\t/right\n",
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    def fake_latest(cwd):
+        session_cwds.append(cwd)
+        return None, None, None, None
+
+    monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "sneeze.slackbot._agent_tmux_latest_codex_messages",
+        fake_latest,
+    )
+
+    state = sample_agent_tmux_thread(
+        config,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+
+    assert state.pane_cwd == "/right"
+    assert session_cwds == ["/right"]
+    list_panes = next(call for call in calls if "list-panes" in call)
+    assert list_panes[list_panes.index("-t") + 1] == "%7"
 
 
 def test_systemd_service_has_no_source_project_leaks(tmp_path):
