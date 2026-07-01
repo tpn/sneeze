@@ -22,6 +22,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -112,9 +113,17 @@ AGENT_TMUX_STATUS_EXCERPT_CHARS = 1800
 AGENT_CODEX_HOOK_STATE_FILENAME = "agent-codex-hooks.json"
 AGENT_CODEX_HOOK_NOTIFY_USER_KEY = "AGENT_NOTIFY_SLACK_USER_ID"
 AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS = 10.0
+AGENT_CODEX_HOOK_COMMAND_TIMEOUT_SECONDS = 60
+AGENT_CODEX_HOOK_SLACK_REQUEST_TIMEOUT_SECONDS = 2.0
+AGENT_CODEX_HOOK_SLACK_REQUEST_ATTEMPTS = 2
+AGENT_CODEX_HOOK_SLACK_RETRY_DELAY_SECONDS = 1.0
+AGENT_CODEX_HOOK_SLACK_TOTAL_TIMEOUT_SECONDS = 20.0
 AGENT_CODEX_HOOK_COMMAND_MARKERS = (
     "slackbot-agent-stop-hook",
     "webmux-agent-status.js",
+)
+SLACK_API_REQUEST_POLICY: ContextVar[dict[str, float | int] | None] = (
+    ContextVar("slack_api_request_policy", default=None)
 )
 USER_CONFIG_MODAL_CALLBACK_ID = "sneeze_user_config"
 USER_CONFIG_OPEN_ACTION_ID = "sneeze_open_user_config"
@@ -2062,11 +2071,40 @@ def enqueue_ingress(
     return str(path)
 
 
+@contextmanager
+def slack_api_request_policy(
+    *,
+    timeout_seconds: float,
+    attempts: int,
+    retry_delay_seconds: float,
+    total_timeout_seconds: float,
+):
+    token = SLACK_API_REQUEST_POLICY.set(
+        {
+            "timeout_seconds": timeout_seconds,
+            "attempts": attempts,
+            "retry_delay_seconds": retry_delay_seconds,
+            "deadline_monotonic": time.monotonic() + total_timeout_seconds,
+        }
+    )
+    try:
+        yield
+    finally:
+        SLACK_API_REQUEST_POLICY.reset(token)
+
+
 def slack_api_post(
     token: str,
     method: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
+    request_policy = SLACK_API_REQUEST_POLICY.get() or {}
+    request_timeout = float(request_policy.get("timeout_seconds") or 30.0)
+    request_attempts = int(request_policy.get("attempts") or 3)
+    retry_delay_cap = float(request_policy.get("retry_delay_seconds") or 30.0)
+    request_deadline = float(
+        request_policy.get("deadline_monotonic") or float("inf")
+    )
     url = f"https://slack.com/api/{method}"
     data = urllib.parse.urlencode(
         {key: _slack_form_value(value) for key, value in payload.items()}
@@ -2083,36 +2121,70 @@ def slack_api_post(
         method="POST",
     )
     body = ""
-    for attempt in range(3):
+    for attempt in range(request_attempts):
+        remaining = request_deadline - time.monotonic()
+        if remaining <= 0:
+            raise SlackbotError(
+                f"Slack API {method} request deadline exceeded"
+            )
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(
+                request,
+                timeout=min(request_timeout, remaining),
+            ) as response:
                 body = response.read().decode("utf-8")
             break
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             retry_after = exc.headers.get("Retry-After")
             retryable = exc.code == 429 or 500 <= exc.code < 600
-            if retryable and attempt < 2:
+            if retryable and attempt < request_attempts - 1:
                 try:
                     delay = float(retry_after or "")
                 except ValueError:
                     delay = 0.5 * (2**attempt)
                 if delay <= 0:
                     delay = 0.5 * (2**attempt)
-                delay = min(delay, 30.0)
+                delay = min(
+                    delay,
+                    retry_delay_cap,
+                    max(0.0, request_deadline - time.monotonic()),
+                )
+                if delay <= 0:
+                    raise SlackbotError(
+                        f"Slack API {method} request deadline exceeded"
+                    ) from exc
                 time.sleep(delay)
                 continue
             raise SlackbotError(f"Slack API HTTP {exc.code}: {body}") from exc
         except urllib.error.URLError as exc:
-            if attempt < 2:
-                time.sleep(0.5 * (2**attempt))
+            if attempt < request_attempts - 1:
+                delay = min(
+                    0.5 * (2**attempt),
+                    retry_delay_cap,
+                    max(0.0, request_deadline - time.monotonic()),
+                )
+                if delay <= 0:
+                    raise SlackbotError(
+                        f"Slack API {method} request deadline exceeded"
+                    ) from exc
+                time.sleep(delay)
                 continue
             raise SlackbotError(
                 f"Slack API {method} connection failed: {exc.reason}"
             ) from exc
         except OSError as exc:
-            if attempt < 2:
-                time.sleep(0.5 * (2**attempt))
+            if attempt < request_attempts - 1:
+                delay = min(
+                    0.5 * (2**attempt),
+                    retry_delay_cap,
+                    max(0.0, request_deadline - time.monotonic()),
+                )
+                if delay <= 0:
+                    raise SlackbotError(
+                        f"Slack API {method} request deadline exceeded"
+                    ) from exc
+                time.sleep(delay)
                 continue
             raise SlackbotError(
                 f"Slack API {method} connection failed: {exc}"
@@ -4363,6 +4435,16 @@ def tmux_command_for_binding(
     return command, tmux_socket, tmux_conf
 
 
+def agent_tmux_target(binding: dict[str, Any]) -> str:
+    tmux_pane = str(binding.get("tmux_pane") or "").strip()
+    if tmux_pane:
+        return tmux_pane
+    tmux_session = str(binding.get("tmux_session") or "").strip()
+    if not tmux_session:
+        raise SlackbotError("The tmux binding is missing a session name")
+    return tmux_session
+
+
 def agent_codex_hook_state_path(paths: SlackbotPaths) -> str:
     return str(Path(paths.state_dir) / AGENT_CODEX_HOOK_STATE_FILENAME)
 
@@ -4452,6 +4534,9 @@ def resolve_codex_agent_tmux_binding(
     )
     host = socket.gethostname()
     tmux_env_socket = _tmux_socket_path_from_env(os.environ.get("TMUX"))
+    pane_id = str(payload.get("tmux_pane") or "").strip() or os.environ.get(
+        "TMUX_PANE"
+    )
     if explicit_session:
         session_socket = explicit_socket or tmux_env_socket or resolved_socket
         session_conf = explicit_conf
@@ -4464,9 +4549,17 @@ def resolve_codex_agent_tmux_binding(
         }
         if session_conf:
             binding["tmux_conf"] = session_conf
+        if pane_id:
+            pane_session = _tmux_session_from_pane(
+                codex_tmux_bin(config),
+                pane_id,
+                tmux_socket=session_socket,
+                tmux_conf=session_conf,
+            )
+            if pane_session == explicit_session:
+                binding["tmux_pane"] = pane_id
         return binding
 
-    pane_id = os.environ.get("TMUX_PANE")
     if not pane_id:
         return None
     tmux_bin = codex_tmux_bin(config)
@@ -4493,6 +4586,7 @@ def resolve_codex_agent_tmux_binding(
             "host": host,
             "tmux_session": session,
             "tmux_socket": socket_value or resolved_socket,
+            "tmux_pane": pane_id,
         }
         if conf_value:
             binding["tmux_conf"] = conf_value
@@ -4732,6 +4826,7 @@ def capture_agent_tmux_thread(
     tmux_session = str(binding.get("tmux_session") or "")
     if not tmux_session:
         raise SlackbotError("The tmux binding is missing a session name")
+    tmux_target = agent_tmux_target(binding)
     lines = agent_tmux_capture_line_count(line_count)
     tmux_command, tmux_socket, tmux_conf = tmux_command_for_binding(
         config,
@@ -4743,7 +4838,7 @@ def capture_agent_tmux_thread(
             "capture-pane",
             "-p",
             "-t",
-            tmux_session,
+            tmux_target,
             "-S",
             f"-{lines}",
         ],
@@ -4784,13 +4879,14 @@ def sample_agent_tmux_thread(
     )
     binding = dict(result["binding"])
     tmux_command, _, _ = tmux_command_for_binding(config, binding)
-    tmux_session = str(binding.get("tmux_session") or "")
+    tmux_target = agent_tmux_target(binding)
+    tmux_pane = str(binding.get("tmux_pane") or "")
     panes = subprocess.run(
         [
             *tmux_command,
             "list-panes",
             "-t",
-            tmux_session,
+            tmux_target,
             "-F",
             "#{pane_id}\t#{pane_active}\t#{pane_current_path}",
         ],
@@ -4802,7 +4898,15 @@ def sample_agent_tmux_thread(
     if panes.returncode == 0:
         rows = [line.split("\t", 2) for line in panes.stdout.splitlines()]
         valid_rows = [row for row in rows if len(row) == 3]
-        active = next((row for row in valid_rows if row[1] == "1"), None)
+        active = next(
+            (row for row in valid_rows if tmux_pane and row[0] == tmux_pane),
+            None,
+        )
+        if active is None:
+            active = next(
+                (row for row in valid_rows if row[1] == "1"),
+                None,
+            )
         if active is None and valid_rows:
             active = valid_rows[0]
         if active is not None:
@@ -4856,8 +4960,9 @@ def send_agent_tmux_keys(
     tmux_session = str(binding.get("tmux_session") or "")
     if not tmux_session:
         raise SlackbotError("The tmux binding is missing a session name")
+    tmux_target = agent_tmux_target(binding)
     tmux_command, tmux_socket, _ = tmux_command_for_binding(config, binding)
-    args = [*tmux_command, "send-keys", "-t", tmux_session]
+    args = [*tmux_command, "send-keys", "-t", tmux_target]
     if interrupt:
         args.append("C-c")
     elif enter:
@@ -4912,6 +5017,7 @@ def paste_agent_tmux_text(
     tmux_session = str(binding.get("tmux_session") or "")
     if not tmux_session:
         raise SlackbotError("The tmux binding is missing a session name")
+    tmux_target = agent_tmux_target(binding)
     tmux_command, tmux_socket, _ = tmux_command_for_binding(config, binding)
     buffer_name = f"sneeze-agent-{uuid.uuid4().hex}"
     load_result = subprocess.run(
@@ -4936,7 +5042,7 @@ def paste_agent_tmux_text(
             "-b",
             buffer_name,
             "-t",
-            tmux_session,
+            tmux_target,
         ],
         check=False,
         capture_output=True,
@@ -4950,7 +5056,7 @@ def paste_agent_tmux_text(
             tmux_socket=tmux_socket,
         )
     enter_result = subprocess.run(
-        [*tmux_command, "send-keys", "-t", tmux_session, "Enter"],
+        [*tmux_command, "send-keys", "-t", tmux_target, "Enter"],
         check=False,
         capture_output=True,
         text=True,
@@ -5060,7 +5166,7 @@ def _codex_hook_entry_binding(
         "host": host,
         "tmux_session": tmux_session,
     }
-    for key in ("tmux_socket", "tmux_conf"):
+    for key in ("tmux_socket", "tmux_conf", "tmux_pane"):
         value = str(entry.get(key) or "").strip()
         if value:
             binding[key] = value
@@ -5393,10 +5499,12 @@ def _render_codex_stop_notification(
         details.append(f"cwd `{cwd}`")
     if binding:
         tmux_socket = binding.get("tmux_socket") or DEFAULT_TMUX_SOCKET
+        tmux_pane = binding.get("tmux_pane")
+        pane_detail = f" pane `{tmux_pane}`" if tmux_pane else ""
         details.append(
             "tmux "
             f"`{binding.get('host')}:{binding.get('tmux_session')}` "
-            f"socket `{tmux_socket}`"
+            f"socket `{tmux_socket}`{pane_detail}"
         )
     if details:
         lines.append(" | ".join(details))
@@ -5577,6 +5685,7 @@ def notify_codex_agent_stop(
                         tmux_session=binding["tmux_session"],
                         tmux_socket=binding.get("tmux_socket"),
                         tmux_conf=binding.get("tmux_conf"),
+                        tmux_pane=binding.get("tmux_pane"),
                         lock_timeout_seconds=(
                             AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
                         ),
@@ -5595,16 +5704,28 @@ def notify_codex_agent_stop(
                 if channel_id and thread_ts
                 else SlackbotRoute(dm_user_id=notify_user_id)
             )
-            response = post_slack_message(
-                config,
-                route,
-                _render_codex_stop_notification(
-                    payload,
-                    binding,
-                    message,
-                    first_message=first_message,
+            with slack_api_request_policy(
+                timeout_seconds=(
+                    AGENT_CODEX_HOOK_SLACK_REQUEST_TIMEOUT_SECONDS
                 ),
-            )
+                attempts=AGENT_CODEX_HOOK_SLACK_REQUEST_ATTEMPTS,
+                retry_delay_seconds=(
+                    AGENT_CODEX_HOOK_SLACK_RETRY_DELAY_SECONDS
+                ),
+                total_timeout_seconds=(
+                    AGENT_CODEX_HOOK_SLACK_TOTAL_TIMEOUT_SECONDS
+                ),
+            ):
+                response = post_slack_message(
+                    config,
+                    route,
+                    _render_codex_stop_notification(
+                        payload,
+                        binding,
+                        message,
+                        first_message=first_message,
+                    ),
+                )
             if response:
                 channel_id = channel_id or response.get("channel")
                 thread_ts = thread_ts or response.get("ts")
@@ -5701,6 +5822,7 @@ def notify_codex_agent_stop(
                 tmux_session=binding["tmux_session"],
                 tmux_socket=binding.get("tmux_socket"),
                 tmux_conf=binding.get("tmux_conf"),
+                tmux_pane=binding.get("tmux_pane"),
                 lock_timeout_seconds=(
                     AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
                 ),
@@ -5892,7 +6014,7 @@ def install_codex_agent_hooks(
                 {
                     **_codex_hook_command_handler(
                         slack_stop_command,
-                        timeout=15,
+                        timeout=AGENT_CODEX_HOOK_COMMAND_TIMEOUT_SECONDS,
                     ),
                     "statusMessage": "Notifying Slack",
                 }
@@ -5980,11 +6102,13 @@ def render_agent_tmux_capture(result: dict[str, Any]) -> str:
     host = str(binding.get("host") or "localhost")
     tmux_session = str(binding.get("tmux_session") or "(unknown)")
     tmux_socket = str(binding.get("tmux_socket") or DEFAULT_TMUX_SOCKET)
+    tmux_pane = str(binding.get("tmux_pane") or "")
+    pane_detail = f" pane `{tmux_pane}`" if tmux_pane else ""
     line_count = int(result.get("line_count") or 0)
     text = str(result.get("text") or "").rstrip() or "(pane is blank)"
     return (
         f"Last {line_count} lines from `{host}:{tmux_session}` "
-        f"on tmux socket `{tmux_socket}`:\n"
+        f"on tmux socket `{tmux_socket}`{pane_detail}:\n"
         f"```text\n{text}\n```"
     )
 
@@ -5995,10 +6119,13 @@ def render_agent_tmux_status(
     job: dict[str, Any] | None = None,
 ) -> str:
     binding = state.binding
+    tmux_pane = binding.get("tmux_pane")
+    pane_detail = f" pane `{tmux_pane}`" if tmux_pane else ""
     lines = [
         "Thread tmux binding: "
         f"`{binding.get('host')}:{binding.get('tmux_session')}` "
-        f"on socket `{binding.get('tmux_socket') or DEFAULT_TMUX_SOCKET}`.",
+        f"on socket `{binding.get('tmux_socket') or DEFAULT_TMUX_SOCKET}`"
+        f"{pane_detail}.",
         "State: " + ("working" if state.working else "idle / waiting"),
     ]
     if state.context_remaining_percent is not None:
@@ -7921,6 +8048,7 @@ class SlackSocketBot:
             "tmux_socket": state.binding.get("tmux_socket")
             or codex_tmux_socket(self.config),
             "tmux_conf": state.binding.get("tmux_conf"),
+            "tmux_pane": state.binding.get("tmux_pane"),
             "mode": mode,
             "state": status,
             "goal_text": goal_text,
@@ -9001,6 +9129,7 @@ def bind_agent_tmux_thread(
     tmux_session: str,
     tmux_socket: str | None = None,
     tmux_conf: str | None = None,
+    tmux_pane: str | None = None,
     runtime_root: str | None = None,
     env_path: str | None = None,
     state_dir: str | None = None,
@@ -9033,6 +9162,8 @@ def bind_agent_tmux_thread(
             data[key]["tmux_socket"] = tmux_socket
         if tmux_conf:
             data[key]["tmux_conf"] = tmux_conf
+        if tmux_pane:
+            data[key]["tmux_pane"] = tmux_pane
         write_json_atomic(paths.agent_tmux_bindings_path, data)
         return data[key]
 

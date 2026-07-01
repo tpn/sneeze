@@ -42,6 +42,7 @@ from sneeze.slackbot import (
     merge_child_process_env,
     notify_codex_agent_stop,
     parse_slack_thread_permalink,
+    paste_agent_tmux_text,
     post_slack_blocks,
     post_slack_message,
     query_agent_tmux_thread,
@@ -1214,6 +1215,36 @@ def test_slack_api_post_form_encodes_web_api_payloads(monkeypatch):
     )
 
 
+def test_slack_api_request_policy_bounds_retries(monkeypatch):
+    timeouts = []
+    sleeps = []
+
+    def fail_urlopen(request, timeout):
+        timeouts.append(timeout)
+        raise slackbot_module.urllib.error.URLError("offline")
+
+    monkeypatch.setattr(
+        "sneeze.slackbot.urllib.request.urlopen",
+        fail_urlopen,
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.time.sleep",
+        lambda delay: sleeps.append(delay),
+    )
+
+    with slackbot_module.slack_api_request_policy(
+        timeout_seconds=2.0,
+        attempts=2,
+        retry_delay_seconds=0.25,
+        total_timeout_seconds=10.0,
+    ):
+        with pytest.raises(SlackbotError, match="connection failed"):
+            slack_api_post("xoxb-test", "chat.postMessage", {"text": "hi"})
+
+    assert timeouts == [2.0, 2.0]
+    assert sleeps == [0.25]
+
+
 def test_extract_codex_session_id_ignores_event_id():
     jsonl = "\n".join(
         [
@@ -1268,6 +1299,7 @@ def test_agent_tmux_binding_store(tmp_path):
         tmux_session="codex-work",
         tmux_socket="codex",
         tmux_conf=str(tmp_path / "codex.tmux.conf"),
+        tmux_pane="%7",
     )
     binding = query_agent_tmux_thread(
         profile,
@@ -1278,6 +1310,7 @@ def test_agent_tmux_binding_store(tmp_path):
     assert binding["host"] == "dgx"
     assert binding["tmux_session"] == "codex-work"
     assert binding["tmux_socket"] == "codex"
+    assert binding["tmux_pane"] == "%7"
     assert binding["tmux_conf"] == str(tmp_path / "codex.tmux.conf")
 
 
@@ -1316,12 +1349,18 @@ def test_tmux_binding_explicit_session_uses_active_socket(
     socket_path = str(tmp_path / "active-tmux.sock")
     monkeypatch.setenv("WEBMUX_AGENT_SESSION", "codex-work")
     monkeypatch.setenv("TMUX", f"{socket_path},123,0")
+    monkeypatch.setenv("TMUX_PANE", "%7")
     monkeypatch.delenv("CODEX_TMUX_SOCKET", raising=False)
+    monkeypatch.setattr(
+        "sneeze.slackbot._tmux_session_from_pane",
+        lambda *args, **kwargs: "codex-work",
+    )
 
     binding = resolve_codex_agent_tmux_binding(config)
 
     assert binding["tmux_session"] == "codex-work"
     assert binding["tmux_socket"] == socket_path
+    assert binding["tmux_pane"] == "%7"
     assert "tmux_conf" not in binding
 
 
@@ -1356,6 +1395,7 @@ def test_tmux_binding_resolves_pane_from_tmux_socket_env(
 
     assert binding["tmux_session"] == "codex-work"
     assert binding["tmux_socket"] == socket_path
+    assert binding["tmux_pane"] == "%7"
     assert any(call[1:3] == ["-S", socket_path] for call in calls)
 
 
@@ -1374,6 +1414,11 @@ def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
     calls = []
 
     def fake_post(config, route, text):
+        policy = slackbot_module.SLACK_API_REQUEST_POLICY.get()
+        assert policy["timeout_seconds"] == 2.0
+        assert policy["attempts"] == 2
+        assert policy["retry_delay_seconds"] == 1.0
+        assert policy["deadline_monotonic"] > time.monotonic()
         calls.append((route, text))
         if len(calls) == 1:
             assert route.dm_user_id == "U111"
@@ -2411,7 +2456,7 @@ def test_codex_agent_hooks_install_preserves_unrelated_hooks(tmp_path):
             for handler in stop_handlers
             if handler["command"] == "trentn-bot slackbot-agent-stop-hook"
         )
-        == 15
+        == 60
     )
     assert all(handler["timeout"] == 10 for handler in prompt_handlers)
 
@@ -2436,7 +2481,7 @@ def test_codex_agent_hooks_install_can_skip_webmux(tmp_path):
         {
             "type": "command",
             "command": "trentn-bot slackbot-agent-stop-hook",
-            "timeout": 15,
+            "timeout": 60,
             "statusMessage": "Notifying Slack",
         }
     ]
@@ -2459,6 +2504,7 @@ def test_agent_tmux_capture_bound_thread(tmp_path, monkeypatch):
         tmux_session="codex-work",
         tmux_socket="codex",
         tmux_conf=str(tmux_conf),
+        tmux_pane="%7",
     )
     config = load_config(profile)
     calls = []
@@ -2491,10 +2537,42 @@ def test_agent_tmux_capture_bound_thread(tmp_path, monkeypatch):
         "capture-pane",
         "-p",
         "-t",
-        "codex-work",
+        "%7",
         "-S",
         "-5",
     ]
+
+
+def test_agent_tmux_paste_targets_bound_pane(tmp_path, monkeypatch):
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("sneeze.slackbot.subprocess.run", fake_run)
+
+    paste_agent_tmux_text(
+        config,
+        {
+            "host": "localhost",
+            "tmux_session": "codex-work",
+            "tmux_socket": "codex",
+            "tmux_pane": "%7",
+        },
+        "literal $HOME; -- text",
+    )
+
+    assert calls[0][0][3:5] == ["load-buffer", "-b"]
+    assert calls[0][1]["input"] == "literal $HOME; -- text"
+    assert calls[1][0][-2:] == ["-t", "%7"]
+    assert calls[2][0][-2:] == ["%7", "Enter"]
 
 
 def test_systemd_service_has_no_source_project_leaks(tmp_path):
