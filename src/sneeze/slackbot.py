@@ -84,6 +84,7 @@ EXECUTION_MODE_VALUES = ("raw", "tmux")
 CODEX_TMUX_LIFECYCLE_VALUES = ("ephemeral", "persistent")
 NOTIFY_KIND_VALUES = ("none", "slack_message", "codex_prompt")
 MAX_SLACK_TEXT_CHARS = 3500
+TMUX_DEFAULT_SERVER_SOCKET = "__default_tmux_server__"
 RECENT_EVENT_TTL_SECONDS = 300.0
 MAX_CONVERSATION_LOCKS = 1024
 INGRESS_PROCESSING_STALE_SECONDS = 3600.0
@@ -4567,7 +4568,7 @@ def agent_codex_hook_state_path(paths: SlackbotPaths) -> str:
 
 
 def _tmux_socket_args(socket_name: str | None) -> list[str]:
-    if not socket_name:
+    if not socket_name or socket_name == TMUX_DEFAULT_SERVER_SOCKET:
         return []
     if "/" in socket_name:
         return ["-S", socket_name]
@@ -4797,7 +4798,11 @@ def resolve_codex_agent_tmux_binding(
             continue
         binding = {
             "host": host,
-            "tmux_socket": socket_value or resolved_socket,
+            "tmux_socket": (
+                socket_value
+                if socket_value is not None
+                else TMUX_DEFAULT_SERVER_SOCKET
+            ),
             **pane_identity,
         }
         if conf_value:
@@ -4829,13 +4834,59 @@ def agent_tmux_thread_key(channel_id: str, thread_ts: str) -> str:
     return f"{channel_id}:{thread_ts}"
 
 
+def _agent_tmux_hosts_same(left: str, right: str) -> bool:
+    left = left.strip().lower()
+    right = right.strip().lower()
+    return left == right or {left, right}.issubset(local_host_aliases())
+
+
+def _agent_tmux_sockets_same(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if left == TMUX_DEFAULT_SERVER_SOCKET:
+        return Path(right).name == "default"
+    if right == TMUX_DEFAULT_SERVER_SOCKET:
+        return Path(left).name == "default"
+    if ("/" in left) != ("/" in right):
+        return Path(left).name == Path(right).name
+    return False
+
+
 def _agent_tmux_bindings_same_target(
     left: dict[str, Any],
     right: dict[str, Any],
 ) -> bool:
-    for key in ("host", "tmux_session", "tmux_socket"):
-        if str(left.get(key) or "") != str(right.get(key) or ""):
+    if not _agent_tmux_hosts_same(
+        str(left.get("host") or ""),
+        str(right.get("host") or ""),
+    ):
+        return False
+    left_server_pid = str(left.get("tmux_server_pid") or "")
+    right_server_pid = str(right.get("tmux_server_pid") or "")
+    left_pane_pid = str(left.get("tmux_pane_pid") or "")
+    right_pane_pid = str(right.get("tmux_pane_pid") or "")
+    if all(
+        (left_server_pid, right_server_pid, left_pane_pid, right_pane_pid)
+    ):
+        if (
+            left_server_pid != right_server_pid
+            or left_pane_pid != right_pane_pid
+        ):
             return False
+        left_created = str(left.get("tmux_session_created") or "")
+        right_created = str(right.get("tmux_session_created") or "")
+        return not (
+            left_created and right_created and left_created != right_created
+        )
+    if str(left.get("tmux_session") or "") != str(
+        right.get("tmux_session") or ""
+    ):
+        return False
+    if not _agent_tmux_sockets_same(
+        str(left.get("tmux_socket") or ""),
+        str(right.get("tmux_socket") or ""),
+    ):
+        return False
     left_pane = str(left.get("tmux_pane") or "")
     right_pane = str(right.get("tmux_pane") or "")
     if left_pane and right_pane and left_pane != right_pane:
@@ -5500,6 +5551,7 @@ def _codex_hook_requested_tmux_sockets(
     candidates.append(resolved_socket)
     if tmux_env_socket:
         candidates.append(tmux_env_socket)
+    candidates.append(TMUX_DEFAULT_SERVER_SOCKET)
     return tuple(OrderedDict.fromkeys(candidates))
 
 
@@ -7052,7 +7104,7 @@ def install_codex_agent_hooks(
 
     backup_path = None
     if target.exists():
-        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
         backup = target.with_name(f"{target.name}.{timestamp}.bak")
         write_text(
             backup,

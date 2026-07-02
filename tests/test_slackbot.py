@@ -1400,6 +1400,31 @@ def test_agent_tmux_target_overlap_checks_server_identity_without_pane():
     )
 
 
+def test_agent_tmux_target_overlap_canonicalizes_local_aliases(tmp_path):
+    assert slackbot_module._agent_tmux_sockets_same(
+        "codex",
+        str(tmp_path / "codex"),
+    )
+    assert slackbot_module._agent_tmux_bindings_same_target(
+        {
+            "host": "localhost",
+            "tmux_session": "old-session-name",
+            "tmux_socket": "codex",
+            "tmux_pane": "%1",
+            "tmux_pane_pid": "101",
+            "tmux_server_pid": "202",
+        },
+        {
+            "host": slackbot_module.socket.gethostname(),
+            "tmux_session": "new-session-name",
+            "tmux_socket": str(tmp_path / "codex"),
+            "tmux_pane": "%9",
+            "tmux_pane_pid": "101",
+            "tmux_server_pid": "202",
+        },
+    )
+
+
 def test_agent_tmux_claim_does_not_overwrite_existing_route(tmp_path):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile)
@@ -1631,6 +1656,49 @@ def test_tmux_binding_explicit_socket_precedes_ambient_tmux(
 
     assert binding["tmux_socket"] == explicit_socket
     assert calls == [explicit_socket]
+
+
+def test_tmux_binding_records_unqualified_default_server(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    for env_name in (
+        "WEBMUX_AGENT_SESSION",
+        "CODEX_TMUX_SESSION_NAME",
+        "CODEX_TMUX_SOCKET",
+        "TMUX",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    calls = []
+
+    def fake_pane_identity(tmux_bin, pane_id, **kwargs):
+        calls.append(kwargs["tmux_socket"])
+        if kwargs["tmux_socket"] is not None:
+            return None
+        return {
+            "tmux_session": "codex-work",
+            "tmux_pane": pane_id,
+        }
+
+    monkeypatch.setattr(
+        "sneeze.slackbot._resolve_tmux_pane_identity",
+        fake_pane_identity,
+    )
+
+    binding = resolve_codex_agent_tmux_binding(config)
+    command, tmux_socket, _ = tmux_command_for_binding(config, binding)
+
+    assert calls[-1] is None
+    assert (
+        binding["tmux_socket"] == slackbot_module.TMUX_DEFAULT_SERVER_SOCKET
+    )
+    assert tmux_socket == slackbot_module.TMUX_DEFAULT_SERVER_SOCKET
+    assert "-L" not in command
+    assert "-S" not in command
 
 
 def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
