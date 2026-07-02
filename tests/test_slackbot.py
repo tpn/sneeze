@@ -1400,14 +1400,14 @@ def test_agent_tmux_target_overlap_checks_server_identity_without_pane():
     )
 
 
-def test_agent_tmux_target_overlap_canonicalizes_local_aliases(tmp_path):
-    socket_root = (
-        Path(
-            os.environ.get("TMUX_TMPDIR")
-            or slackbot_module.tempfile.gettempdir()
-        )
-        / f"tmux-{os.getuid()}"
-    )
+def test_agent_tmux_target_overlap_canonicalizes_local_aliases(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delenv("TMUX_TMPDIR", raising=False)
+    uid = getattr(os, "getuid", lambda: 1000)()
+    socket_root = Path("/tmp") / f"tmux-{uid}"
     named_socket_path = socket_root / "codex"
     assert slackbot_module._agent_tmux_sockets_same(
         "codex",
@@ -1416,6 +1416,14 @@ def test_agent_tmux_target_overlap_canonicalizes_local_aliases(tmp_path):
     assert not slackbot_module._agent_tmux_sockets_same(
         "codex",
         str(tmp_path / "codex"),
+    )
+    assert slackbot_module._agent_tmux_sockets_same(
+        slackbot_module.TMUX_DEFAULT_SERVER_SOCKET,
+        str(socket_root / "default"),
+    )
+    assert not slackbot_module._agent_tmux_sockets_same(
+        "",
+        str(socket_root),
     )
     assert slackbot_module._agent_tmux_bindings_same_target(
         {
@@ -1434,6 +1442,16 @@ def test_agent_tmux_target_overlap_canonicalizes_local_aliases(tmp_path):
             "tmux_pane_pid": "101",
             "tmux_server_pid": "202",
         },
+    )
+
+
+def test_agent_tmux_socket_alias_has_non_posix_uid_fallback(monkeypatch):
+    monkeypatch.delenv("TMUX_TMPDIR", raising=False)
+    monkeypatch.delattr(slackbot_module.os, "getuid", raising=False)
+
+    assert slackbot_module._agent_tmux_sockets_same(
+        "codex",
+        "/tmp/tmux-1000/codex",
     )
 
 

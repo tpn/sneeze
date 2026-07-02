@@ -4841,13 +4841,16 @@ def _agent_tmux_hosts_same(left: str, right: str) -> bool:
 
 
 def _agent_tmux_sockets_same(left: str, right: str) -> bool:
+    if not left or not right:
+        return left == right
+
     def socket_path(value: str) -> Path:
         if value == TMUX_DEFAULT_SERVER_SOCKET:
             value = "default"
         if "/" not in value:
+            uid = getattr(os, "getuid", lambda: 1000)()
             socket_root = (
-                Path(os.environ.get("TMUX_TMPDIR") or tempfile.gettempdir())
-                / f"tmux-{os.getuid()}"
+                Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{uid}"
             )
             return socket_root / value
         return Path(value).expanduser().absolute()
