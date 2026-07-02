@@ -4833,9 +4833,15 @@ def _agent_tmux_bindings_same_target(
     left: dict[str, Any],
     right: dict[str, Any],
 ) -> bool:
-    for key in ("host", "tmux_session", "tmux_socket", "tmux_pane"):
+    for key in ("host", "tmux_session", "tmux_socket"):
         if str(left.get(key) or "") != str(right.get(key) or ""):
             return False
+    left_pane = str(left.get("tmux_pane") or "")
+    right_pane = str(right.get("tmux_pane") or "")
+    if left_pane and right_pane and left_pane != right_pane:
+        return False
+    if not (left_pane and right_pane):
+        return True
     for key in AGENT_TMUX_PANE_IDENTITY_KEYS:
         left_value = str(left.get(key) or "")
         right_value = str(right.get(key) or "")
@@ -6361,6 +6367,7 @@ def notify_codex_agent_stop(
                             ),
                             tmux_server_pid=binding.get("tmux_server_pid"),
                             exclusive_target=True,
+                            claim_target_if_unbound=True,
                             lock_timeout_seconds=(
                                 AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
                             ),
@@ -10169,13 +10176,14 @@ def bind_agent_tmux_thread(
     tmux_session_created: str | None = None,
     tmux_server_pid: str | None = None,
     exclusive_target: bool = False,
+    claim_target_if_unbound: bool = False,
     runtime_root: str | None = None,
     env_path: str | None = None,
     state_dir: str | None = None,
     system_prompt_path: str | None = None,
     unit_name: str | None = None,
     lock_timeout_seconds: float | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     paths = resolve_paths(
         profile,
         runtime_root=runtime_root,
@@ -10211,13 +10219,19 @@ def bind_agent_tmux_thread(
             if value:
                 binding[identity_key] = value
         if exclusive_target:
-            for candidate_key, candidate in tuple(data.items()):
+            target_routes = [
+                candidate_key
+                for candidate_key, candidate in data.items()
                 if (
                     candidate_key != key
                     and isinstance(candidate, dict)
                     and _agent_tmux_bindings_same_target(binding, candidate)
-                ):
-                    data.pop(candidate_key, None)
+                )
+            ]
+            if claim_target_if_unbound and target_routes:
+                return None
+            for candidate_key in target_routes:
+                data.pop(candidate_key, None)
         data[key] = binding
         write_json_atomic(paths.agent_tmux_bindings_path, data)
         return binding

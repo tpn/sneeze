@@ -1330,6 +1330,56 @@ def test_agent_tmux_binding_store(tmp_path):
     assert binding["tmux_conf"] == str(tmp_path / "codex.tmux.conf")
 
 
+@pytest.mark.parametrize(
+    ("first_pane", "second_pane"),
+    ((None, "%1"), ("%1", None)),
+)
+def test_agent_tmux_exclusive_binding_overlaps_session_and_pane_targets(
+    tmp_path,
+    first_pane,
+    second_pane,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_pane=first_pane,
+    )
+
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D222",
+        thread_ts="2.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_pane=second_pane,
+        exclusive_target=True,
+    )
+
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D222",
+            thread_ts="2.000001",
+        )["tmux_session"]
+        == "codex-work"
+    )
+
+
 def test_tmux_binding_uses_absolute_socket_path(tmp_path):
     profile = replace(
         make_profile(tmp_path),
@@ -2237,6 +2287,37 @@ def test_codex_stop_hook_keeps_distinct_sessions_on_same_tmux_separate(
             tmux_session="codex-work",
             tmux_socket="codex",
         )
+
+    replay = notify_codex_agent_stop(
+        profile,
+        json.dumps(
+            {
+                "session_id": "codex-session-1",
+                "turn_id": "turn-1",
+                "last_assistant_message": "codex-session-1",
+            }
+        ),
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    assert replay["status"] == "skipped"
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="2.000001",
+        )["tmux_session"]
+        == "codex-work"
+    )
 
     status = query_codex_agent_threads(profile)
     sessions = status["hook_state"]["sessions"]
