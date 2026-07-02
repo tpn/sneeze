@@ -1,12 +1,14 @@
+import ctypes
 import datetime as dt
 import errno
-import fcntl
 import getpass
 import json
 import math
 import os
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -15,6 +17,11 @@ from functools import lru_cache
 
 from .config import HOSTFQDN, HOSTNAME, SNEEZE_RUN_DIR
 from .path import find_repo_root, join_path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on non-POSIX platforms
+    fcntl = None
 
 
 def _float_env(name, default):
@@ -31,12 +38,23 @@ RUN_LOG_PREFIX = "sne-"
 RUN_LOG_SUFFIX = ".json"
 RUN_LOG_LOCK_SUFFIX = ".lock"
 _RUN_LOG_FLOCK_SUFFIX = ".lock.v2"
+_AT_FDCWD = -100
+# Linux RENAME_EXCHANGE and macOS RENAME_SWAP intentionally share this value.
+_RENAME_EXCHANGE = 2
+_LINUX_RENAMEAT2_SYSCALLS = {
+    "aarch64": 276,
+    "arm64": 276,
+    "armv7l": 382,
+    "i386": 353,
+    "i686": 353,
+    "ppc64": 357,
+    "ppc64le": 357,
+    "riscv64": 276,
+    "s390x": 347,
+    "x86_64": 316,
+}
 _LOCK_POLL_INTERVAL_S = 0.05
 _LOCK_TIMEOUT_S = _float_env("SNEEZE_RUN_LOG_LOCK_TIMEOUT", 30)
-_LEGACY_LOCK_STALE_S = _float_env(
-    "SNEEZE_LEGACY_RUN_LOG_LOCK_STALE",
-    300,
-)
 
 
 class RunLogError(Exception):
@@ -205,18 +223,93 @@ def _run_log_host_id():
     return f"{HOSTFQDN}:{machine_id}" if machine_id else HOSTFQDN
 
 
+def _linux_pid_namespace_id(pid):
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        namespace = os.readlink(f"/proc/{int(pid)}/ns/pid")
+    except (OSError, TypeError, ValueError):
+        return None
+    if not namespace.startswith("pid:[") or not namespace.endswith("]"):
+        return None
+    return f"linux-pid-ns:{namespace}"
+
+
+def _linux_process_start_id(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+            stat_text = handle.read()
+    except OSError:
+        return None
+    command_end = stat_text.rfind(")")
+    if command_end < 0:
+        return None
+    fields = stat_text[command_end + 1 :].split()
+    if len(fields) <= 19:
+        return None
+    return f"linux-proc:{fields[19]}"
+
+
+def _uncached_process_start_id(value):
+    linux_start_id = _linux_process_start_id(value)
+    if linux_start_id:
+        return linux_start_id
+    try:
+        result = subprocess.run(
+            ("ps", "-o", "lstart=", "-p", str(value)),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+            env={**os.environ, "LC_ALL": "C", "TZ": "UTC0"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    started_at = " ".join(result.stdout.split())
+    return f"ps-lstart:{started_at}" if started_at else None
+
+
+@lru_cache(maxsize=1)
+def _cached_self_process_start_id(pid):
+    return _uncached_process_start_id(pid)
+
+
+def _process_start_id(pid):
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    if value == os.getpid():
+        return _cached_self_process_start_id(value)
+    return _uncached_process_start_id(value)
+
+
+def _current_lock_state(owner_token):
+    pid = os.getpid()
+    payload = {
+        "lock_version": 2,
+        "pid": pid,
+        "hostname": HOSTNAME,
+        "host_fqdn": HOSTFQDN,
+        "host_id": _run_log_host_id(),
+        "owner_token": owner_token,
+        "acquired_at": dt.datetime.now(dt.UTC).isoformat(),
+    }
+    process_start_id = _process_start_id(pid)
+    if process_start_id:
+        payload["process_start_id"] = process_start_id
+    pid_namespace_id = _linux_pid_namespace_id(pid)
+    if pid_namespace_id:
+        payload["pid_namespace_id"] = pid_namespace_id
+    return payload
+
+
 def _current_lock_payload(owner_token):
-    return json.dumps(
-        {
-            "lock_version": 2,
-            "pid": os.getpid(),
-            "hostname": HOSTNAME,
-            "host_fqdn": HOSTFQDN,
-            "host_id": _run_log_host_id(),
-            "owner_token": owner_token,
-            "acquired_at": dt.datetime.now(dt.UTC).isoformat(),
-        }
-    )
+    return json.dumps(_current_lock_state(owner_token))
 
 
 def _open_run_log_lock(lock_path):
@@ -225,7 +318,7 @@ def _open_run_log_lock(lock_path):
         raise RunLogError(
             "secure run log locking requires O_NOFOLLOW support"
         )
-    flags = os.O_RDWR | nofollow
+    flags = os.O_RDWR | os.O_NONBLOCK | nofollow
     try:
         return os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
@@ -310,40 +403,113 @@ def _pid_is_alive(pid):
     return True
 
 
-def _legacy_compatibility_lock_is_reclaimable(payload, fd):
-    if (
-        not isinstance(payload, dict)
-        or payload.get("lock_version") is not None
-    ):
-        return False
-    pid = payload.get("pid")
-    if (
-        payload.get("hostname") != HOSTNAME
-        or not isinstance(pid, int)
-        or isinstance(pid, bool)
-        or pid <= 0
-        or _pid_is_alive(pid)
-    ):
-        return False
-    try:
-        age = time.time() - os.fstat(fd).st_mtime
-    except OSError:
-        return False
-    return age >= _LEGACY_LOCK_STALE_S
-
-
-def _write_run_log_lock_payload(fd, owner_token):
+def _write_run_log_lock_state(fd, payload):
     os.fchmod(fd, 0o600)
     os.ftruncate(fd, 0)
     os.lseek(fd, 0, os.SEEK_SET)
-    payload = _current_lock_payload(owner_token).encode("utf-8")
-    view = memoryview(payload)
+    encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+    view = memoryview(encoded)
     while view:
         written = os.write(fd, view)
         if written <= 0:
             raise OSError("failed to write run log lock payload")
         view = view[written:]
     os.fsync(fd)
+
+
+def _write_run_log_lock_payload(fd, owner_token):
+    _write_run_log_lock_state(fd, _current_lock_state(owner_token))
+
+
+def _mark_run_log_lock_rollback_blocked(fd, candidate_path):
+    _write_run_log_lock_state(
+        fd,
+        {
+            "lock_version": 2,
+            "rollback_blocked": True,
+            "parked_lock_path": candidate_path,
+            "blocked_at": dt.datetime.now(dt.UTC).isoformat(),
+        },
+    )
+
+
+def _fsync_parent_directory(path):
+    directory = os.path.dirname(path) or "."
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(directory, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _exchange_paths(path_a, path_b):
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        exchange = libc.renameat2
+    except AttributeError:
+        if sys.platform.startswith("linux"):
+            machine = os.uname().machine.lower()
+            syscall_number = _LINUX_RENAMEAT2_SYSCALLS.get(machine)
+            try:
+                syscall = libc.syscall
+            except AttributeError as err:
+                syscall = None
+                syscall_error = err
+            else:
+                syscall_error = None
+            if syscall_number is None or syscall is None:
+                raise OSError(
+                    errno.ENOSYS,
+                    "atomic path exchange is unavailable on this platform",
+                ) from syscall_error
+            syscall.restype = ctypes.c_long
+            result = syscall(
+                ctypes.c_long(syscall_number),
+                ctypes.c_int(_AT_FDCWD),
+                ctypes.c_char_p(os.fsencode(path_a)),
+                ctypes.c_int(_AT_FDCWD),
+                ctypes.c_char_p(os.fsencode(path_b)),
+                ctypes.c_uint(_RENAME_EXCHANGE),
+            )
+        else:
+            try:
+                exchange = libc.renamex_np
+            except AttributeError as err:
+                raise OSError(
+                    errno.ENOSYS,
+                    "atomic path exchange is unavailable on this platform",
+                ) from err
+            exchange.argtypes = (
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            exchange.restype = ctypes.c_int
+            result = exchange(
+                os.fsencode(path_a),
+                os.fsencode(path_b),
+                _RENAME_EXCHANGE,
+            )
+    else:
+        exchange.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        exchange.restype = ctypes.c_int
+        result = exchange(
+            _AT_FDCWD,
+            os.fsencode(path_a),
+            _AT_FDCWD,
+            os.fsencode(path_b),
+            _RENAME_EXCHANGE,
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
 
 
 def _unlink_run_log_lock_if_matches(lock_path, fd):
@@ -357,11 +523,20 @@ def _unlink_run_log_lock_if_matches(lock_path, fd):
         path_stat.st_ino,
     ):
         return False
-    os.unlink(lock_path)
+    try:
+        os.unlink(lock_path)
+    except FileNotFoundError:
+        return False
     return True
 
 
-def _compatibility_lock_is_reclaimable(lock_path, fd):
+def _compatibility_lock_is_reclaimable(
+    lock_path,
+    fd,
+    *,
+    allow_rollback_marker=True,
+    candidate_lock_path=None,
+):
     try:
         fd_stat = os.fstat(fd)
         path_stat = os.stat(lock_path, follow_symlinks=False)
@@ -383,6 +558,60 @@ def _compatibility_lock_is_reclaimable(lock_path, fd):
     ):
         return False
     payload = _read_run_log_lock_payload(fd)
+    rollback_blocked = bool(
+        isinstance(payload, dict)
+        and payload.get("lock_version") == 2
+        and payload.get("rollback_blocked") is True
+    )
+    if rollback_blocked:
+        if fd_stat.st_nlink != 1:
+            raise RunLogError(
+                "run log rollback marker has unexpected hard links: "
+                f"{lock_path}"
+            )
+        if not allow_rollback_marker:
+            return None
+        parked_path = payload.get("parked_lock_path")
+        if not (
+            isinstance(parked_path, str)
+            and parked_path.startswith(f"{lock_path}.")
+            and parked_path.endswith(".tmp")
+        ):
+            return False
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise RunLogError(
+                "secure run log locking requires O_NOFOLLOW support"
+            )
+        try:
+            parked_fd = os.open(
+                parked_path,
+                os.O_RDONLY | os.O_NONBLOCK | nofollow,
+            )
+        except FileNotFoundError:
+            return True
+        except OSError as err:
+            raise RunLogError(
+                f"failed to inspect parked run log lock: {err}"
+            ) from err
+        try:
+            parked_reclaimable = _compatibility_lock_is_reclaimable(
+                parked_path,
+                parked_fd,
+                allow_rollback_marker=False,
+                candidate_lock_path=lock_path,
+            )
+            if not parked_reclaimable:
+                return False
+            removed = _unlink_run_log_lock_if_matches(
+                parked_path,
+                parked_fd,
+            )
+        finally:
+            os.close(parked_fd)
+        if removed:
+            _fsync_parent_directory(parked_path)
+        return removed
     if not _is_current_run_log_lock_payload(payload):
         return None
     unexpected_links = (
@@ -391,7 +620,8 @@ def _compatibility_lock_is_reclaimable(lock_path, fd):
     )
     candidate_path = None
     if fd_stat.st_nlink == 2:
-        candidate_path = f"{lock_path}.{payload['owner_token']}.tmp"
+        candidate_base = candidate_lock_path or lock_path
+        candidate_path = f"{candidate_base}.{payload['owner_token']}.tmp"
         try:
             candidate_stat = os.stat(candidate_path, follow_symlinks=False)
         except OSError:
@@ -409,15 +639,46 @@ def _compatibility_lock_is_reclaimable(lock_path, fd):
     if payload["host_id"] != _run_log_host_id():
         return False
     pid = payload.get("pid")
-    if (
-        not isinstance(pid, int)
-        or isinstance(pid, bool)
-        or pid <= 0
-        or _pid_is_alive(pid)
-    ):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
+    if sys.platform.startswith("linux"):
+        stored_namespace_id = payload.get("pid_namespace_id")
+        current_namespace_id = _linux_pid_namespace_id(os.getpid())
+        if (
+            not isinstance(stored_namespace_id, str)
+            or not stored_namespace_id
+            or not current_namespace_id
+            or stored_namespace_id != current_namespace_id
+        ):
+            return False
+    if _pid_is_alive(pid):
+        stored_start_id = payload.get("process_start_id")
+        if not isinstance(stored_start_id, str) or not stored_start_id:
+            return False
+        observed_start_id = _process_start_id(pid)
+        if not observed_start_id:
+            return False
+        stored_scheme, separator, _ = stored_start_id.partition(":")
+        observed_scheme, observed_separator, _ = observed_start_id.partition(
+            ":"
+        )
+        if (
+            not separator
+            or not observed_separator
+            or stored_scheme != observed_scheme
+            or observed_start_id == stored_start_id
+        ):
+            return False
     if candidate_path is not None:
-        os.unlink(candidate_path)
+        try:
+            os.unlink(candidate_path)
+        except FileNotFoundError:
+            return False
+        if os.fstat(fd).st_nlink != 1:
+            raise RunLogError(
+                "interrupted run log compatibility publication has "
+                f"unexpected hard links: {lock_path}"
+            )
     return True
 
 
@@ -439,7 +700,7 @@ def _acquire_compatibility_run_log_lock(path, owner_token, deadline):
         raise RunLogError(
             f"failed to create run log compatibility lock: {err}"
         ) from err
-    installed = False
+    installed_fd = None
     try:
         _write_run_log_lock_payload(candidate_fd, owner_token)
         while True:
@@ -461,19 +722,146 @@ def _acquire_compatibility_run_log_lock(path, owner_token, deadline):
                     reclaimable = _compatibility_lock_is_reclaimable(
                         lock_path, existing_fd
                     )
-                    if reclaimable is None and _validate_run_log_lock_file(
+                    if reclaimable and _validate_run_log_lock_file(
                         lock_path, existing_fd
                     ):
-                        reclaimable = (
-                            _legacy_compatibility_lock_is_reclaimable(
-                                _read_run_log_lock_payload(existing_fd),
-                                existing_fd,
+                        # Exchange keeps the path occupied. The parked inode
+                        # proves that the inspected lock was still canonical.
+                        try:
+                            # Publish rollback intent before the exchange so
+                            # every post-exchange failure remains fail closed.
+                            _mark_run_log_lock_rollback_blocked(
+                                candidate_fd,
+                                candidate_path,
                             )
-                        )
-                    if reclaimable and _unlink_run_log_lock_if_matches(
-                        lock_path, existing_fd
-                    ):
-                        continue
+                            _exchange_paths(candidate_path, lock_path)
+                            parked_stat = os.stat(
+                                candidate_path, follow_symlinks=False
+                            )
+                            existing_stat = os.fstat(existing_fd)
+                            if (
+                                parked_stat.st_dev,
+                                parked_stat.st_ino,
+                            ) != (
+                                existing_stat.st_dev,
+                                existing_stat.st_ino,
+                            ):
+                                try:
+                                    _exchange_paths(candidate_path, lock_path)
+                                except OSError as rollback_error:
+                                    restore_error = rollback_error
+                                    restored = False
+                                    for _ in range(3):
+                                        if not _validate_run_log_lock_file(
+                                            lock_path, candidate_fd
+                                        ):
+                                            installed_fd = None
+                                            raise RunLogError(
+                                                "failed to restore a "
+                                                "concurrent run log lock"
+                                            ) from restore_error
+                                        parked_now = os.stat(
+                                            candidate_path,
+                                            follow_symlinks=False,
+                                        )
+                                        if (
+                                            parked_now.st_dev,
+                                            parked_now.st_ino,
+                                        ) != (
+                                            parked_stat.st_dev,
+                                            parked_stat.st_ino,
+                                        ):
+                                            installed_fd = None
+                                            raise RunLogError(
+                                                "parked run log lock changed "
+                                                "during rollback"
+                                            ) from restore_error
+                                        try:
+                                            _exchange_paths(
+                                                candidate_path, lock_path
+                                            )
+                                        except OSError as exchange_error:
+                                            restore_error = exchange_error
+                                            continue
+                                        restored_lock = os.stat(
+                                            lock_path, follow_symlinks=False
+                                        )
+                                        restored_candidate = os.stat(
+                                            candidate_path,
+                                            follow_symlinks=False,
+                                        )
+                                        candidate_stat = os.fstat(
+                                            candidate_fd
+                                        )
+                                        if (
+                                            restored_lock.st_dev,
+                                            restored_lock.st_ino,
+                                        ) != (
+                                            parked_stat.st_dev,
+                                            parked_stat.st_ino,
+                                        ) or (
+                                            restored_candidate.st_dev,
+                                            restored_candidate.st_ino,
+                                        ) != (
+                                            candidate_stat.st_dev,
+                                            candidate_stat.st_ino,
+                                        ):
+                                            installed_fd = None
+                                            raise RunLogError(
+                                                "run log lock rollback was "
+                                                "replaced concurrently"
+                                            ) from restore_error
+                                        restored = True
+                                        break
+                                    if not restored:
+                                        installed_fd = None
+                                        raise RunLogError(
+                                            "failed to restore a concurrent "
+                                            "run log compatibility lock"
+                                        ) from restore_error
+                                    _fsync_parent_directory(lock_path)
+                                installed_fd = None
+                                raise RunLogError(
+                                    "run log compatibility lock changed "
+                                    "during adoption"
+                                )
+                            if not _validate_run_log_lock_file(
+                                lock_path, candidate_fd
+                            ):
+                                if _unlink_run_log_lock_if_matches(
+                                    candidate_path, existing_fd
+                                ):
+                                    _fsync_parent_directory(lock_path)
+                                raise RunLogError(
+                                    "run log compatibility lock changed "
+                                    "during adoption"
+                                )
+                            os.unlink(candidate_path)
+                            _write_run_log_lock_payload(
+                                candidate_fd,
+                                owner_token,
+                            )
+                            installed_fd = candidate_fd
+                            _fsync_parent_directory(lock_path)
+                        except OSError as err:
+                            unsupported_exchange_errors = {
+                                errno.ENOSYS,
+                                errno.EINVAL,
+                                getattr(errno, "ENOTSUP", errno.ENOSYS),
+                                getattr(errno, "EOPNOTSUPP", errno.ENOSYS),
+                            }
+                            if err.errno in unsupported_exchange_errors:
+                                raise RunLogError(
+                                    "cannot safely reclaim stale lock; "
+                                    "atomic path exchange is unsupported; "
+                                    "remove this lock manually: "
+                                    f"{lock_path}"
+                                ) from err
+                            raise RunLogError(
+                                "failed to adopt run log compatibility lock: "
+                                f"{err}"
+                            ) from err
+                        return lock_path, candidate_fd
                 finally:
                     os.close(existing_fd)
                 if time.monotonic() >= deadline:
@@ -488,24 +876,29 @@ def _acquire_compatibility_run_log_lock(path, owner_token, deadline):
                 raise RunLogError(
                     f"failed to acquire run log compatibility lock: {err}"
                 ) from err
-            installed = True
+            installed_fd = candidate_fd
             os.unlink(candidate_path)
             return lock_path, candidate_fd
     except Exception:
-        if installed:
+        if installed_fd is not None:
             try:
-                _unlink_run_log_lock_if_matches(lock_path, candidate_fd)
+                _unlink_run_log_lock_if_matches(lock_path, installed_fd)
             except OSError:
                 pass
-        os.close(candidate_fd)
-        try:
-            os.unlink(candidate_path)
-        except FileNotFoundError:
-            pass
+        if candidate_fd is not None:
+            try:
+                _unlink_run_log_lock_if_matches(candidate_path, candidate_fd)
+            except OSError:
+                pass
+            os.close(candidate_fd)
         raise
 
 
 def _acquire_run_log_lock(path):
+    if fcntl is None:
+        raise RunLogError(
+            "run log locking requires POSIX fcntl support on this platform"
+        )
     flock_path = _run_log_flock_path(path)
     directory = os.path.dirname(flock_path)
     if directory:
@@ -624,6 +1017,7 @@ def _write_json_array_atomic(path, entry_jsons):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)
+        _fsync_parent_directory(path)
     except Exception:
         try:
             os.unlink(tmp_path)

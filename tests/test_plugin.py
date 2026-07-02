@@ -9,6 +9,7 @@ import pytest
 
 import sneeze
 from sneeze.plugin import (
+    PluginError,
     PluginSpec,
     github_shorthand_to_url,
     import_plugin_modules,
@@ -30,6 +31,20 @@ def test_github_shorthand_to_url():
     assert github_shorthand_to_url("gh:tpn/sneeze-plugin-tpn") == (
         "git+https://github.com/tpn/sneeze-plugin-tpn.git"
     )
+    assert github_shorthand_to_url("gh:tpn/sneeze-plugin-tpn@feature/x") == (
+        "git+https://github.com/tpn/sneeze-plugin-tpn.git@feature/x"
+    )
+    assert github_shorthand_to_url("gh:tpn/sneeze-plugin-tpn.git@v1") == (
+        "git+https://github.com/tpn/sneeze-plugin-tpn.git@v1"
+    )
+    assert github_shorthand_to_url("gh:tpn/sneeze-plugin-tpn.GIT@v1") == (
+        "git+https://github.com/tpn/sneeze-plugin-tpn.GIT@v1"
+    )
+
+
+def test_github_shorthand_rejects_empty_revision():
+    with pytest.raises(PluginError, match="revision must not be empty"):
+        github_shorthand_to_url("gh:tpn/sneeze-plugin-tpn@")
 
 
 def test_install_target_prefers_local_sibling(tmp_path):
@@ -79,7 +94,9 @@ def test_scaffold_plugin_writes_expected_files(tmp_path):
     assert (path / "pyproject.toml").exists()
     assert not (path / "src/sneeze/__init__.py").exists()
     assert (path / "src/sneeze/tpn/commands.py").exists()
-    assert "entry-points" not in pyproject["project"]
+    assert pyproject["project"]["entry-points"]["sneeze.plugins"] == {
+        "tpn": "sneeze.tpn"
+    }
     assert pyproject["tool"]["setuptools"]["packages"]["find"]["include"] == [
         "sneeze",
         "sneeze.*",
@@ -103,7 +120,9 @@ def test_scaffold_plugin_formats_underscore_username(tmp_path):
         encoding="utf-8"
     )
 
-    assert "entry-points" not in pyproject["project"]
+    assert pyproject["project"]["entry-points"]["sneeze.plugins"] == {
+        "trent_nelson": "sneeze.trent_nelson"
+    }
     assert "class TrentNelsonPluginInfo" in commands_py
 
 
@@ -144,6 +163,63 @@ def test_scaffolded_plugin_is_discovered_by_namespace(tmp_path):
         "username": "tpn",
         "package": "sneeze.tpn",
         "source": "namespace",
+    } in payload["plugins"]
+
+
+def test_scaffolded_plugin_is_discovered_after_pip_install(tmp_path):
+    path = scaffold_plugin(
+        "tpn",
+        output_dir=tmp_path / "sneeze-plugin-tpn",
+        init_git=False,
+    )
+    install_dir = tmp_path / "installed"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-build-isolation",
+            "--no-deps",
+            "--target",
+            str(install_dir),
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    core_src = Path(sneeze.__file__).resolve().parents[1]
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join((str(install_dir), str(core_src))),
+    }
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, sneeze;"
+                "from sneeze.plugin import discover_plugins;"
+                "print(json.dumps({"
+                "'version': sneeze.__version__,"
+                "'plugins': [p.__dict__ for p in discover_plugins()]"
+                "}))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["version"] == sneeze.__version__
+    assert {
+        "username": "tpn",
+        "package": "sneeze.tpn",
+        "source": "entry-point",
     } in payload["plugins"]
 
 

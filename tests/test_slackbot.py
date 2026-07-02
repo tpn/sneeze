@@ -1330,6 +1330,53 @@ def test_agent_tmux_binding_store(tmp_path):
     assert binding["tmux_conf"] == str(tmp_path / "codex.tmux.conf")
 
 
+def test_session_recovery_preserves_other_panes_in_same_tmux_session(
+    tmp_path,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    first = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_pane="%1",
+    )
+    second = bind_agent_tmux_thread(
+        profile,
+        channel_id="D222",
+        thread_ts="2.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_pane="%2",
+    )
+
+    recovered = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        exclusive_target=True,
+        require_existing_route=True,
+    )
+
+    assert recovered["tmux_pane"] == "%1"
+    assert recovered["binding_revision"] > first["binding_revision"]
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D222",
+            thread_ts="2.000001",
+        )
+        == second
+    )
+
+
 @pytest.mark.parametrize(
     ("first_pane", "second_pane"),
     ((None, "%1"), ("%1", None)),
@@ -1493,6 +1540,95 @@ def test_agent_tmux_socket_alias_has_non_posix_uid_fallback(monkeypatch):
     )
 
 
+def test_tmux_socket_identity_resolves_symlinked_components(
+    tmp_path,
+    monkeypatch,
+):
+    physical_root = tmp_path / "physical"
+    physical_root.mkdir()
+    linked_root = tmp_path / "linked"
+    linked_root.symlink_to(physical_root, target_is_directory=True)
+    configured_socket = linked_root / "codex.sock"
+    physical_socket = physical_root / "codex.sock"
+
+    assert slackbot_module.normalize_tmux_socket(str(configured_socket)) == (
+        str(physical_socket)
+    )
+    assert slackbot_module._agent_tmux_sockets_same(
+        str(configured_socket),
+        str(physical_socket),
+    )
+
+    monkeypatch.setenv("TMUX_TMPDIR", str(linked_root))
+    uid = getattr(os, "getuid", lambda: 1000)()
+    named_socket = physical_root / f"tmux-{uid}" / "codex"
+    assert slackbot_module._agent_tmux_sockets_same(
+        "codex",
+        str(named_socket),
+    )
+
+
+def test_relative_tmux_socket_is_persisted_as_absolute(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    hook_cwd = tmp_path / "hook-cwd"
+    service_cwd = tmp_path / "service-cwd"
+    hook_cwd.mkdir()
+    service_cwd.mkdir()
+    relative_socket = "../sockets/codex.sock"
+    monkeypatch.chdir(hook_cwd)
+
+    resolved = resolve_codex_agent_tmux_binding(
+        config,
+        tmux_session="codex-work",
+        tmux_socket=relative_socket,
+    )
+    binding = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket=relative_socket,
+    )
+    expected_socket = os.path.abspath(relative_socket)
+    monkeypatch.chdir(service_cwd)
+    stored = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    command, command_socket, _ = tmux_command_for_binding(config, stored)
+
+    assert resolved["tmux_socket"] == expected_socket
+    assert binding["tmux_socket"] == expected_socket
+    assert stored["tmux_socket"] == expected_socket
+    assert command_socket == expected_socket
+    assert command[1:] == ["-S", expected_socket]
+
+
+def test_codex_tmux_command_uses_path_socket_flag(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    socket_path = str(tmp_path / "sockets" / "codex.sock")
+    config = replace(
+        config,
+        env={**config.env, "SAMPLE_CODEX_TMUX_SOCKET": socket_path},
+    )
+
+    command = slackbot_module.codex_tmux_command(
+        config,
+        tmux_bin="/usr/bin/tmux",
+    )
+
+    assert command == ["/usr/bin/tmux", "-S", socket_path]
+
+
 def test_agent_tmux_claim_does_not_overwrite_existing_route(tmp_path):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile)
@@ -1528,6 +1664,1204 @@ def test_agent_tmux_claim_does_not_overwrite_existing_route(tmp_path):
     )
     assert binding["tmux_pane"] == "%2"
     assert binding["tmux_server_pid"] == "202"
+
+
+def test_agent_tmux_unbind_respects_updated_at_cutoff(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    binding = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    removed = slackbot_module.unbind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        only_if_older_than=binding["updated_at"],
+    )
+
+    assert removed is False
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        == binding
+    )
+    assert slackbot_module.unbind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        only_if_older_than="9999-01-01T00:00:00+00:00",
+    )
+
+
+def test_agent_tmux_unbind_requires_binding_snapshot_match(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    original = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_pane="%1",
+    )
+    rebound = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_pane="%1",
+    )
+
+    assert not slackbot_module.unbind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        only_if_matches=original,
+    )
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        == rebound
+    )
+    assert slackbot_module.unbind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        only_if_matches=rebound,
+    )
+
+
+def test_agent_tmux_binding_revision_survives_route_deletion(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    first = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="first-session",
+        tmux_socket="codex",
+    )
+    assert slackbot_module.unbind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+
+    observed = slackbot_module._observe_agent_tmux_binding_revision(paths)
+    second = bind_agent_tmux_thread(
+        profile,
+        channel_id="D222",
+        thread_ts="2.000001",
+        host="localhost",
+        tmux_session="second-session",
+        tmux_socket="codex",
+    )
+
+    assert observed > first["binding_revision"]
+    assert second["binding_revision"] > observed
+
+
+def test_agent_tmux_repeated_missing_unbind_does_not_write(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+
+    assert not slackbot_module.unbind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    first_state = read_json(revision_path, {})
+
+    def fail_write(*args, **kwargs):
+        raise AssertionError("repeated missing unbind must not write state")
+
+    monkeypatch.setattr(slackbot_module, "write_json_atomic", fail_write)
+    assert not slackbot_module.unbind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+
+    assert read_json(revision_path, {}) == first_state
+
+
+def test_agent_tmux_unbind_write_failure_reconciles_tombstoned_route(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    original = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    original_write_json = slackbot_module.write_json_atomic
+    failed = False
+
+    def fail_binding_deletion(path, data, *args, **kwargs):
+        nonlocal failed
+        if (
+            str(path) == paths.agent_tmux_bindings_path
+            and "D111:1.000001" not in data
+            and not failed
+        ):
+            failed = True
+            raise OSError("simulated binding deletion failure")
+        return original_write_json(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "write_json_atomic",
+        fail_binding_deletion,
+    )
+    with pytest.raises(OSError, match="simulated binding deletion failure"):
+        slackbot_module.unbind_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    revision_state = read_json(revision_path, {})
+    revision_state["route_tombstones"]["D111:1.000001"][
+        "updated_at"
+    ] = "2020-01-01T00:00:00Z"
+    original_write_json(revision_path, revision_state)
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+    tombstone_revision = read_json(revision_path, {})["route_tombstones"][
+        "D111:1.000001"
+    ]["binding_revision"]
+    assert tombstone_revision > original["binding_revision"]
+    monkeypatch.setattr(
+        slackbot_module,
+        "write_json_atomic",
+        original_write_json,
+    )
+    claimed = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        exclusive_target=True,
+        claim_target_if_unbound=True,
+        replace_route_if_mismatched=True,
+        replace_route_if_older_than="9999-01-01T00:00:00+00:00",
+        replace_route_if_revision_at_most=original["binding_revision"],
+    )
+    assert claimed is None
+
+
+def test_agent_tmux_observe_rejects_restored_unversioned_tombstoned_route(
+    tmp_path,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    original = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    assert slackbot_module.unbind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    restored = dict(original)
+    restored.pop("binding_revision")
+    slackbot_module.write_json_atomic(
+        paths.agent_tmux_bindings_path,
+        {"D111:1.000001": restored},
+    )
+
+    slackbot_module._observe_agent_tmux_binding_revision(paths)
+
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+    assert read_json(paths.agent_tmux_bindings_path, {}) == {}
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    assert "D111:1.000001" in read_json(revision_path, {})["route_tombstones"]
+
+
+def test_agent_tmux_missing_route_tombstone_survives_restore(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    stale_bindings = read_json(paths.agent_tmux_bindings_path, {})
+    slackbot_module.write_json_atomic(paths.agent_tmux_bindings_path, {})
+
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    assert "D111:1.000001" in read_json(revision_path, {})["route_tombstones"]
+
+    slackbot_module.write_json_atomic(
+        paths.agent_tmux_bindings_path,
+        stale_bindings,
+    )
+
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+    assert read_json(paths.agent_tmux_bindings_path, {}) == {}
+
+
+def test_agent_tmux_rebind_write_failure_suppresses_superseded_route(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    original = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="old-session",
+        tmux_socket="codex",
+    )
+    original_write_json = slackbot_module.write_json_atomic
+    failed = False
+
+    def fail_rebound_binding(path, data, *args, **kwargs):
+        nonlocal failed
+        candidate = data.get("D111:1.000001", {})
+        if (
+            str(path) == paths.agent_tmux_bindings_path
+            and candidate.get("tmux_session") == "new-session"
+            and not failed
+        ):
+            failed = True
+            raise OSError("simulated rebound binding failure")
+        return original_write_json(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "write_json_atomic",
+        fail_rebound_binding,
+    )
+    with pytest.raises(OSError, match="simulated rebound binding failure"):
+        bind_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+            host="localhost",
+            tmux_session="new-session",
+            tmux_socket="codex",
+        )
+
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    tombstone = read_json(revision_path, {})["route_tombstones"][
+        "D111:1.000001"
+    ]
+    assert tombstone["binding_revision"] > original["binding_revision"]
+
+
+def test_agent_tmux_guarded_bind_does_not_recreate_unbound_route(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    original = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    observed = slackbot_module._observe_agent_tmux_binding_revision(paths)
+    assert observed == original["binding_revision"]
+    assert slackbot_module.unbind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+
+    claimed = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        exclusive_target=True,
+        claim_target_if_unbound=True,
+        replace_route_if_mismatched=True,
+        replace_route_if_older_than="9999-01-01T00:00:00+00:00",
+        replace_route_if_revision_at_most=observed,
+    )
+
+    assert claimed is None
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+
+
+def test_agent_tmux_guarded_bind_detects_legacy_route_deletion(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    original = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    observed = slackbot_module._observe_agent_tmux_binding_revision(paths)
+    assert observed == original["binding_revision"]
+    bindings = read_json(paths.agent_tmux_bindings_path, {})
+    bindings.pop("D111:1.000001")
+    slackbot_module.write_json_atomic(
+        paths.agent_tmux_bindings_path, bindings
+    )
+
+    for _ in range(2):
+        claimed = bind_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+            host="localhost",
+            tmux_session="codex-work",
+            tmux_socket="codex",
+            exclusive_target=True,
+            claim_target_if_unbound=True,
+            replace_route_if_mismatched=True,
+            replace_route_if_older_than="9999-01-01T00:00:00+00:00",
+            replace_route_if_revision_at_most=observed,
+        )
+        assert claimed is None
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+
+
+def test_agent_tmux_route_tombstones_are_bounded_and_cleared_on_rebind(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    monkeypatch.setattr(
+        slackbot_module,
+        "AGENT_TMUX_ROUTE_TOMBSTONE_MAX_ENTRIES",
+        2,
+    )
+    for index in range(3):
+        channel_id = f"D{index}"
+        thread_ts = f"{index}.000001"
+        bind_agent_tmux_thread(
+            profile,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            host="localhost",
+            tmux_session=f"codex-work-{index}",
+            tmux_socket="codex",
+        )
+        assert slackbot_module.unbind_agent_tmux_thread(
+            profile,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+        )
+
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    revision_state = read_json(revision_path, {})
+    assert set(revision_state["route_tombstones"]) == {
+        "D1:1.000001",
+        "D2:2.000001",
+    }
+
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D1",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work-1",
+        tmux_socket="codex",
+    )
+    revision_state = read_json(revision_path, {})
+    assert "D1:1.000001" not in revision_state["route_tombstones"]
+
+
+def test_agent_tmux_bulk_tombstone_eviction_sets_restore_floor(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    monkeypatch.setattr(
+        slackbot_module,
+        "AGENT_TMUX_ROUTE_TOMBSTONE_MAX_ENTRIES",
+        2,
+    )
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    slackbot_module.write_json_atomic(
+        revision_path,
+        {
+            "version": 2,
+            "binding_revision": 1,
+            "route_tombstones": {},
+            "active_routes": {
+                "D0:0.000001": 1,
+                "D1:1.000001": 1,
+                "D2:2.000001": 1,
+            },
+        },
+    )
+
+    revision = slackbot_module._observe_agent_tmux_binding_revision(paths)
+    revision_state = read_json(revision_path, {})
+
+    assert revision == 2
+    assert revision_state["restore_floor_revision"] == 2
+    assert len(revision_state["route_tombstones"]) == 2
+    assert "D0:0.000001" not in revision_state["route_tombstones"]
+    claimed = bind_agent_tmux_thread(
+        profile,
+        channel_id="D0",
+        thread_ts="0.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        exclusive_target=True,
+        claim_target_if_unbound=True,
+        replace_route_if_mismatched=True,
+        replace_route_if_older_than="9999-01-01T00:00:00+00:00",
+        replace_route_if_revision_at_most=1,
+    )
+    assert claimed is None
+
+
+def test_agent_tmux_corrupt_revision_state_recovers_with_restore_floor(
+    tmp_path,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    revision_path.write_text("{not-json", encoding="utf-8")
+
+    revision = slackbot_module._observe_agent_tmux_binding_revision(paths)
+    revision_state = read_json(revision_path, {})
+
+    assert revision_state["binding_revision"] == revision
+    assert revision_state["restore_floor_revision"] == revision
+    assert list(revision_path.parent.glob(f"{revision_path.name}.corrupt.*"))
+
+
+def test_agent_tmux_corrupt_revision_survives_recovery_write_failure(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    revision_path.write_text("{not-json", encoding="utf-8")
+    original_write_json = slackbot_module.write_json_atomic
+
+    def fail_recovery_write(path, data, *args, **kwargs):
+        if Path(path) == revision_path:
+            raise OSError("simulated recovery write failure")
+        return original_write_json(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "write_json_atomic",
+        fail_recovery_write,
+    )
+
+    with pytest.raises(OSError, match="simulated recovery write failure"):
+        slackbot_module._observe_agent_tmux_binding_revision(paths)
+
+    assert revision_path.read_text(encoding="utf-8") == "{not-json"
+    backups = list(
+        revision_path.parent.glob(f"{revision_path.name}.corrupt.*")
+    )
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "{not-json"
+    assert backups[0].stat().st_mode & 0o777 == 0o600
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "write_json_atomic",
+        original_write_json,
+    )
+    revision = slackbot_module._observe_agent_tmux_binding_revision(paths)
+
+    assert read_json(revision_path, {})["restore_floor_revision"] == revision
+
+
+def test_agent_tmux_invalid_utf8_revision_state_is_quarantined(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    revision_path.write_bytes(b"\xff\xfe")
+
+    revision = slackbot_module._observe_agent_tmux_binding_revision(paths)
+    revision_state = read_json(revision_path, {})
+    corrupt_paths = list(
+        revision_path.parent.glob(f"{revision_path.name}.corrupt.*")
+    )
+
+    assert revision_state["binding_revision"] == revision
+    assert revision_state["restore_floor_revision"] == revision
+    assert len(corrupt_paths) == 1
+    assert corrupt_paths[0].read_bytes() == b"\xff\xfe"
+
+
+def test_agent_tmux_invalid_tombstone_time_advances_restore_floor(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    slackbot_module.write_json_atomic(
+        revision_path,
+        {
+            "version": 3,
+            "binding_revision": 2,
+            "route_tombstones": {
+                "D111:1.000001": {
+                    "binding_revision": 2,
+                    "updated_at": "not-a-timestamp",
+                }
+            },
+            "active_routes": {},
+            "restore_floor_revision": 0,
+        },
+    )
+
+    slackbot_module._observe_agent_tmux_binding_revision(paths)
+    revision_state = read_json(revision_path, {})
+
+    assert revision_state["route_tombstones"] == {}
+    assert revision_state["restore_floor_revision"] == 2
+
+
+def test_agent_tmux_revision_guard_ignores_wall_clock_rollback(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    observed = slackbot_module._observe_agent_tmux_binding_revision(paths)
+    monkeypatch.setattr(
+        slackbot_module,
+        "_utcnow_precise_iso",
+        lambda: "2000-01-01T00:00:00.000001+00:00",
+    )
+    newer = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="newer-session",
+        tmux_socket="codex",
+    )
+
+    claimed = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="older-session",
+        tmux_socket="codex",
+        exclusive_target=True,
+        claim_target_if_unbound=True,
+        replace_route_if_mismatched=True,
+        replace_route_if_older_than="9999-01-01T00:00:00+00:00",
+        replace_route_if_revision_at_most=observed,
+    )
+
+    assert newer["binding_revision"] > observed
+    assert claimed is None
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )["tmux_session"]
+        == "newer-session"
+    )
+
+
+def test_agent_tmux_revision_guard_rejects_late_unversioned_write(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    observed = slackbot_module._observe_agent_tmux_binding_revision(paths)
+    slackbot_module.write_json_atomic(
+        paths.agent_tmux_bindings_path,
+        {
+            "D111:1.000001": {
+                "channel_id": "D111",
+                "thread_ts": "1.000001",
+                "host": "localhost",
+                "tmux_session": "late-legacy-session",
+                "tmux_socket": "codex",
+                "updated_at": "2000-01-01T00:00:00+00:00",
+            }
+        },
+    )
+
+    claimed = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="observed-session",
+        tmux_socket="codex",
+        exclusive_target=True,
+        claim_target_if_unbound=True,
+        replace_route_if_mismatched=True,
+        replace_route_if_older_than="9999-01-01T00:00:00+00:00",
+        replace_route_if_revision_at_most=observed,
+    )
+
+    assert claimed is None
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+
+
+def test_agent_tmux_query_migrates_initial_unversioned_route(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    slackbot_module.write_json_atomic(
+        paths.agent_tmux_bindings_path,
+        {
+            "D111:1.000001": {
+                "channel_id": "D111",
+                "thread_ts": "1.000001",
+                "host": "localhost",
+                "tmux_session": "legacy-session",
+                "tmux_socket": "codex",
+                "updated_at": "2000-01-01T00:00:00+00:00",
+            }
+        },
+    )
+
+    binding = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+
+    assert binding["tmux_session"] == "legacy-session"
+    assert binding["binding_revision"] > 0
+    assert (
+        read_json(paths.agent_tmux_bindings_path, {})["D111:1.000001"]
+        == binding
+    )
+
+
+def test_agent_tmux_migration_survives_revision_state_write_failure(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    slackbot_module.write_json_atomic(
+        paths.agent_tmux_bindings_path,
+        {
+            "D111:1.000001": {
+                "channel_id": "D111",
+                "thread_ts": "1.000001",
+                "host": "localhost",
+                "tmux_session": "legacy-session",
+                "tmux_socket": "codex",
+                "updated_at": "2000-01-01T00:00:00+00:00",
+            }
+        },
+    )
+    original_write_json = slackbot_module.write_json_atomic
+    writes = []
+
+    def fail_revision_write(path, data, *args, **kwargs):
+        writes.append(str(path))
+        if Path(path) == revision_path:
+            raise OSError("simulated revision write failure")
+        return original_write_json(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "write_json_atomic",
+        fail_revision_write,
+    )
+
+    with pytest.raises(
+        slackbot_module.AgentTmuxStateError,
+        match="simulated revision write failure",
+    ):
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+    stored = read_json(paths.agent_tmux_bindings_path, {})["D111:1.000001"]
+    assert stored["binding_revision"] > 0
+    assert writes == [paths.agent_tmux_bindings_path, str(revision_path)]
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "write_json_atomic",
+        original_write_json,
+    )
+    recovered = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+
+    assert recovered == stored
+    assert (
+        "D111:1.000001"
+        not in read_json(revision_path, {})["route_tombstones"]
+    )
+
+
+def test_agent_tmux_consistent_queries_do_not_write_state(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    def fail_write(*args, **kwargs):
+        raise AssertionError("consistent queries must not write state")
+
+    monkeypatch.setattr(slackbot_module, "write_json_atomic", fail_write)
+
+    binding = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    status = query_codex_agent_threads(profile)
+
+    assert binding["tmux_session"] == "codex-work"
+    assert "D111:1.000001" in status["agent_tmux_bindings"]
+
+
+def test_agent_tmux_public_queries_fail_closed_for_invalid_revision_state(
+    tmp_path,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    slackbot_module.write_json_atomic(
+        revision_path,
+        {"binding_revision": "invalid"},
+    )
+
+    with pytest.raises(
+        slackbot_module.AgentTmuxStateError,
+        match="Invalid agent tmux binding revision",
+    ):
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+    status = query_codex_agent_threads(profile)
+
+    assert status["agent_tmux_bindings"] == {}
+    assert (
+        "Invalid agent tmux binding revision"
+        in status["agent_tmux_bindings_error"]
+    )
+    assert "D111:1.000001" in read_json(
+        paths.agent_tmux_bindings_path,
+        {},
+    )
+
+
+@pytest.mark.parametrize("invalid_bindings", ("{", "[]", '"bindings"'))
+def test_agent_tmux_queries_preserve_invalid_bindings_state(
+    tmp_path,
+    invalid_bindings,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        paths.agent_tmux_bindings_path
+    )
+    original_revision_state = revision_path.read_text(encoding="utf-8")
+    Path(paths.agent_tmux_bindings_path).write_text(
+        invalid_bindings,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(slackbot_module.AgentTmuxStateError):
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+    status = query_codex_agent_threads(profile)
+
+    assert status["agent_tmux_bindings"] == {}
+    assert status["agent_tmux_bindings_error"]
+    assert (
+        revision_path.read_text(encoding="utf-8") == original_revision_state
+    )
+    assert (
+        Path(paths.agent_tmux_bindings_path).read_text(encoding="utf-8")
+        == invalid_bindings
+    )
+
+
+def test_agent_tmux_binding_timestamp_is_captured_under_lock(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    paths = load_config(profile, allow_missing_tokens=True).paths
+    timestamp_called = threading.Event()
+
+    def timestamp():
+        timestamp_called.set()
+        return "2026-07-02T00:00:00.123456+00:00"
+
+    monkeypatch.setattr(slackbot_module, "_utcnow_precise_iso", timestamp)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with slackbot_module.locked_agent_tmux_json_path(
+            paths.agent_tmux_bindings_path
+        ):
+            future = executor.submit(
+                bind_agent_tmux_thread,
+                profile,
+                channel_id="D111",
+                thread_ts="1.000001",
+                host="localhost",
+                tmux_session="codex-work",
+                tmux_socket="codex",
+            )
+            assert not timestamp_called.wait(timeout=0.05)
+        binding = future.result(timeout=1)
+
+    assert timestamp_called.is_set()
+    assert binding["updated_at"] == "2026-07-02T00:00:00.123456+00:00"
+
+
+def test_agent_tmux_claim_removes_duplicate_target_routes(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    for channel_id, thread_ts in (("D111", "1.000001"), ("D222", "2.000001")):
+        bind_agent_tmux_thread(
+            profile,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            host="localhost",
+            tmux_session="codex-work",
+            tmux_socket="codex",
+        )
+
+    claimed = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        exclusive_target=True,
+        claim_target_if_unbound=True,
+        replace_route_if_mismatched=True,
+        replace_route_if_older_than="9999-01-01T00:00:00+00:00",
+    )
+
+    assert claimed["tmux_session"] == "codex-work"
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D222",
+            thread_ts="2.000001",
+        )
+        is None
+    )
+
+
+def test_agent_tmux_claim_can_replace_mismatched_route(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="stale-session",
+        tmux_socket="codex",
+        tmux_pane="%7",
+        tmux_pane_pid="101",
+        tmux_session_created="202",
+        tmux_server_pid="303",
+    )
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D222",
+        thread_ts="2.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_pane="%7",
+        tmux_pane_pid="101",
+        tmux_session_created="202",
+        tmux_server_pid="303",
+    )
+
+    claimed = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_pane="%7",
+        tmux_pane_pid="101",
+        tmux_session_created="202",
+        tmux_server_pid="303",
+        exclusive_target=True,
+        claim_target_if_unbound=True,
+        replace_route_if_mismatched=True,
+        replace_route_if_older_than="9999-01-01T00:00:00+00:00",
+    )
+
+    assert claimed["tmux_session"] == "codex-work"
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )["tmux_session"]
+        == "codex-work"
+    )
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D222",
+            thread_ts="2.000001",
+        )
+        is None
+    )
+
+
+def test_agent_tmux_claim_preserves_newer_mismatched_route(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="newer-session",
+        tmux_socket="codex",
+    )
+
+    claimed = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="older-session",
+        tmux_socket="codex",
+        exclusive_target=True,
+        claim_target_if_unbound=True,
+        replace_route_if_mismatched=True,
+        replace_route_if_older_than="2020-01-01T00:00:00+00:00",
+    )
+
+    assert claimed is None
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )["tmux_session"]
+        == "newer-session"
+    )
+
+
+def test_agent_tmux_claim_without_cutoff_preserves_mismatched_route(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="existing-session",
+        tmux_socket="codex",
+    )
+
+    claimed = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="replacement-session",
+        tmux_socket="codex",
+        exclusive_target=True,
+        claim_target_if_unbound=True,
+        replace_route_if_mismatched=True,
+    )
+
+    assert claimed is None
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )["tmux_session"]
+        == "existing-session"
+    )
 
 
 def test_tmux_binding_uses_absolute_socket_path(tmp_path):
@@ -1713,6 +3047,169 @@ def test_tmux_binding_rejects_reused_pane_identity(tmp_path, monkeypatch):
         slackbot_module.agent_tmux_target(config, binding)
 
 
+def test_tmux_binding_rejects_pane_without_stable_identity(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    monkeypatch.setattr(
+        slackbot_module,
+        "_tmux_pane_identity",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("incomplete bindings must fail before tmux lookup")
+        ),
+    )
+
+    with pytest.raises(SlackbotError, match="lacks stable identity"):
+        slackbot_module.agent_tmux_target(
+            config,
+            {
+                "host": "localhost",
+                "tmux_session": "codex-work",
+                "tmux_socket": "codex",
+                "tmux_pane": "%7",
+            },
+        )
+
+
+def test_tmux_binding_upgrades_legacy_pane_identity(tmp_path, monkeypatch):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    binding = {
+        "channel_id": "D111",
+        "thread_ts": "1.000001",
+        "host": "localhost",
+        "tmux_session": "codex-work",
+        "tmux_socket": "codex",
+        "tmux_pane": "%7",
+    }
+    slackbot_module.write_json_atomic(
+        config.paths.agent_tmux_bindings_path,
+        {"D111:1.000001": binding},
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "_tmux_pane_identity",
+        lambda *args, **kwargs: {
+            "tmux_session": "codex-work",
+            "tmux_pane": "%7",
+            "tmux_pane_pid": "101",
+            "tmux_session_created": "202",
+            "tmux_server_pid": "303",
+        },
+    )
+
+    assert slackbot_module.agent_tmux_target(config, binding) == "%7"
+
+    upgraded = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    assert upgraded["tmux_pane_pid"] == "101"
+    assert upgraded["tmux_session_created"] == "202"
+    assert upgraded["tmux_server_pid"] == "303"
+    assert upgraded["binding_revision"] > 0
+
+
+def test_tmux_sample_uses_upgraded_legacy_pane_binding(
+    tmp_path,
+    monkeypatch,
+):
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_pane="%7",
+    )
+    config = load_config(profile)
+    identity_calls = []
+
+    def fake_identity(*args, **kwargs):
+        identity_calls.append((args, kwargs))
+        return {
+            "tmux_session": "codex-work",
+            "tmux_pane": "%7",
+            "tmux_pane_pid": "101",
+            "tmux_session_created": "202",
+            "tmux_server_pid": "303",
+        }
+
+    def fake_run(args, **kwargs):
+        if "capture-pane" in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="Ready\n>\n",
+                stderr="",
+            )
+        if "list-panes" in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"%7\t1\t{tmp_path}\n",
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr(slackbot_module, "_tmux_pane_identity", fake_identity)
+    monkeypatch.setattr(slackbot_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        slackbot_module,
+        "_agent_tmux_latest_codex_messages",
+        lambda cwd: (None, None, None, None),
+    )
+
+    state = sample_agent_tmux_thread(
+        config,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+
+    assert state.binding["tmux_pane_pid"] == "101"
+    assert state.binding["tmux_session_created"] == "202"
+    assert state.binding["tmux_server_pid"] == "303"
+    assert len(identity_calls) == 3
+
+
+def test_tmux_pane_resolution_rejects_incomplete_identity(monkeypatch):
+    monkeypatch.setattr(
+        slackbot_module,
+        "_tmux_pane_identity",
+        lambda *args, **kwargs: {
+            "tmux_session": "codex-work",
+            "tmux_pane": "%7",
+        },
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "_tmux_session_from_pane",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "session-only fallback must not create a pane route"
+            )
+        ),
+    )
+
+    assert (
+        slackbot_module._resolve_tmux_pane_identity(
+            "tmux",
+            "%7",
+            tmux_socket="codex",
+        )
+        is None
+    )
+
+
 def test_tmux_binding_resolves_pane_from_tmux_socket_env(
     tmp_path,
     monkeypatch,
@@ -1733,13 +3230,13 @@ def test_tmux_binding_resolves_pane_from_tmux_socket_env(
         if args[1:3] == ["-S", socket_path]:
             return SimpleNamespace(
                 returncode=0,
-                stdout="codex-work\n",
+                stdout="codex-work\t%7\t101\t202\t303\n",
                 stderr="",
             )
         if args[1:3] == ["-L", "codex"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout="wrong-session\n",
+                stdout="wrong-session\t%7\t101\t202\t303\n",
                 stderr="",
             )
         return SimpleNamespace(returncode=1, stdout="", stderr="")
@@ -1983,7 +3480,6 @@ def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
         tmux_session="codex-work",
         tmux_socket="codex",
     )
-    Path(load_config(profile).paths.agent_tmux_bindings_path).unlink()
     duplicate = notify_codex_agent_stop(
         profile,
         json.dumps(payload),
@@ -2026,6 +3522,55 @@ def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
     assert entry["channel_id"] == "D111"
     assert entry["session_id"] == "codex-session-1"
     assert len(entry["notifications"]) == 3
+
+
+def test_codex_stop_hook_repairs_invalid_sessions_state(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    config = load_config(profile)
+    state_path = Path(
+        slackbot_module.agent_codex_hook_state_path(config.paths)
+    )
+    slackbot_module.write_json_atomic(
+        state_path,
+        {"sessions": ["invalid"], "preserved": True},
+    )
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: {
+            "channel": "D111",
+            "ts": "1.000001",
+        },
+    )
+
+    result = notify_codex_agent_stop(
+        profile,
+        json.dumps(
+            {
+                "session_id": "codex-session-repair",
+                "turn_id": "turn-1",
+                "last_assistant_message": "Recovered state.",
+            }
+        ),
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    repaired = read_json(state_path, {})
+    assert result["status"] == "notified"
+    assert repaired["preserved"] is True
+    assert isinstance(repaired["sessions"], dict)
+    assert "session:codex-session-repair" in repaired["sessions"]
 
 
 def test_codex_stop_hook_posts_long_notification_once(tmp_path, monkeypatch):
@@ -2082,9 +3627,11 @@ def test_codex_stop_hook_posts_long_notification_once(tmp_path, monkeypatch):
     assert "`" not in calls[0]["text"]
 
 
-def test_codex_stop_hook_rejected_pane_clears_stale_binding(
+@pytest.mark.parametrize("manual_session", (None, "manual-session"))
+def test_codex_stop_hook_rejected_pane_clears_only_stale_binding(
     tmp_path,
     monkeypatch,
+    manual_session,
 ):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
@@ -2140,20 +3687,30 @@ def test_codex_stop_hook_rejected_pane_clears_stale_binding(
             "tmux_pane": "%2",
         }
     )
+    if manual_session:
+        bind_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+            host="localhost",
+            tmux_session=manual_session,
+            tmux_socket="codex",
+        )
 
     rejected = notify_codex_agent_stop(profile, json.dumps(payload))
 
     assert rejected["tmux_binding"] is None
     assert calls[1].channel_id == "D111"
     assert calls[1].thread_ts == "1.000001"
-    assert (
-        query_agent_tmux_thread(
-            profile,
-            channel_id="D111",
-            thread_ts="1.000001",
-        )
-        is None
+    remaining_binding = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
     )
+    if manual_session:
+        assert remaining_binding["tmux_session"] == manual_session
+    else:
+        assert remaining_binding is None
     entry = query_codex_agent_threads(profile)["hook_state"]["sessions"][
         "session:codex-session-1"
     ]
@@ -2756,7 +4313,7 @@ def test_codex_stop_hook_bounds_dedupe_without_turn_id(tmp_path, monkeypatch):
     assert calls[1].thread_ts == "1.000001"
 
 
-def test_codex_stop_hook_reuses_pending_turnless_client_id_across_bucket(
+def test_codex_stop_hook_refuses_to_repeat_ambiguous_sessionless_post(
     tmp_path,
     monkeypatch,
 ):
@@ -2773,6 +4330,7 @@ def test_codex_stop_hook_reuses_pending_turnless_client_id_across_bucket(
     client_msg_ids = []
 
     def fake_post(config, route, text):
+        slackbot_module._mark_slack_delivery_stage("posting")
         client_msg_ids.append(slackbot_module.SLACK_CLIENT_MSG_ID.get())
         if len(client_msg_ids) == 1:
             raise SlackbotError("Slack response was lost")
@@ -2794,17 +4352,337 @@ def test_codex_stop_hook_reuses_pending_turnless_client_id_across_bucket(
     pending_paths = list(Path(state_path).parent.rglob("*.receipt.json"))
     assert pending_paths
     assert all(
-        read_json(path, {}).get("delivery_state") == "pending"
+        read_json(path, {}).get("delivery_state") == "posting"
         for path in pending_paths
     )
 
     clock[0] = 120.1
+    with pytest.raises(
+        slackbot_module.CodexHookRetryableError,
+        match="ambiguous outcome",
+    ):
+        notify_codex_agent_stop(profile, payload)
+
+    assert len(client_msg_ids) == 1
+    receipts = list(Path(state_path).parent.rglob("*.receipt.json"))
+    assert receipts
+    assert all(
+        read_json(path, {}).get("delivery_state") == "posting"
+        for path in receipts
+    )
+
+
+def test_codex_stop_hook_retries_ambiguous_conversations_open(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    methods = []
+    open_attempts = 0
+
+    def fake_slack_api_post(token, method, payload):
+        nonlocal open_attempts
+        methods.append(method)
+        if method == "conversations.open":
+            open_attempts += 1
+            if open_attempts == 1:
+                raise SlackbotError("conversations.open response was lost")
+            return {"ok": True, "channel": {"id": "D111"}}
+        assert method == "chat.postMessage"
+        return {"ok": True, "channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr(
+        slackbot_module, "slack_api_post", fake_slack_api_post
+    )
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "transcript_path": "/tmp/codex-session-1.jsonl",
+            "last_assistant_message": "Waiting for input.",
+        }
+    )
+
+    with pytest.raises(SlackbotError, match="response was lost"):
+        notify_codex_agent_stop(profile, payload)
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    receipt_paths = list(Path(state_path).parent.rglob("*.receipt.json"))
+    assert receipt_paths
+    assert all(
+        read_json(path, {}).get("delivery_state") == "pending"
+        for path in receipt_paths
+    )
+
     result = notify_codex_agent_stop(profile, payload)
 
     assert result["status"] == "notified"
-    assert len(client_msg_ids) == 2
-    assert client_msg_ids[0] == client_msg_ids[1]
+    assert methods == [
+        "conversations.open",
+        "conversations.open",
+        "chat.postMessage",
+    ]
     assert not list(Path(state_path).parent.rglob("*.receipt.json"))
+
+
+def test_codex_stop_hook_retries_ambiguous_conversations_join(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    methods = []
+    post_client_msg_ids = []
+
+    def fake_slack_api_post(token, method, payload):
+        methods.append(method)
+        if method == "conversations.open":
+            return {"ok": True, "channel": {"id": "D111"}}
+        if method == "chat.postMessage":
+            post_client_msg_ids.append(payload["client_msg_id"])
+            if len(post_client_msg_ids) == 1:
+                raise SlackApiError(
+                    method,
+                    {"ok": False, "error": "not_in_channel"},
+                )
+            return {"ok": True, "channel": "D111", "ts": "1.000001"}
+        assert method == "conversations.join"
+        raise SlackbotError("conversations.join response was lost")
+
+    monkeypatch.setattr(
+        slackbot_module, "slack_api_post", fake_slack_api_post
+    )
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "transcript_path": "/tmp/codex-session-1.jsonl",
+            "last_assistant_message": "Waiting for input.",
+        }
+    )
+
+    with pytest.raises(SlackbotError, match="response was lost"):
+        notify_codex_agent_stop(profile, payload)
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    receipt_paths = list(Path(state_path).parent.rglob("*.receipt.json"))
+    assert receipt_paths
+    assert all(
+        read_json(path, {}).get("delivery_state") == "pending"
+        for path in receipt_paths
+    )
+
+    result = notify_codex_agent_stop(profile, payload)
+
+    assert result["status"] == "notified"
+    assert post_client_msg_ids[0] == post_client_msg_ids[1]
+    assert methods == [
+        "conversations.open",
+        "chat.postMessage",
+        "conversations.join",
+        "conversations.open",
+        "chat.postMessage",
+    ]
+    assert not list(Path(state_path).parent.rglob("*.receipt.json"))
+
+
+def test_codex_stop_hook_retries_after_definitive_slack_rejection(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append(route)
+        if len(calls) == 1:
+            raise SlackApiError(
+                "chat.postMessage",
+                {"ok": False, "error": "invalid_auth"},
+            )
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "transcript_path": "/tmp/codex-session-1.jsonl",
+            "last_assistant_message": "Waiting for input.",
+        }
+    )
+
+    with pytest.raises(SlackApiError, match="invalid_auth"):
+        notify_codex_agent_stop(profile, payload)
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    assert not list(Path(state_path).parent.rglob("*.receipt.json"))
+
+    retry = notify_codex_agent_stop(profile, payload)
+
+    assert retry["status"] == "notified"
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "error_code", ("internal_error", "service_unavailable")
+)
+def test_codex_stop_hook_preserves_receipt_for_transient_slack_error(
+    tmp_path,
+    monkeypatch,
+    error_code,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "post_slack_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            SlackApiError(
+                "chat.postMessage",
+                {"ok": False, "error": error_code},
+            )
+        ),
+    )
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "transcript_path": "/tmp/codex-session-1.jsonl",
+            "last_assistant_message": "Waiting for input.",
+        }
+    )
+
+    with pytest.raises(SlackApiError, match=error_code):
+        notify_codex_agent_stop(profile, payload)
+
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    assert list(Path(state_path).parent.rglob("*.receipt.json"))
+
+
+@pytest.mark.parametrize(
+    ("status_code", "receipt_preserved"),
+    ((400, False), (503, True)),
+)
+def test_codex_stop_hook_classifies_http_failure_for_receipt(
+    tmp_path,
+    monkeypatch,
+    status_code,
+    receipt_preserved,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    error = slackbot_module.urllib.error.HTTPError(
+        "https://slack.com/api/chat.postMessage",
+        status_code,
+        "test failure",
+        {},
+        None,
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "post_slack_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
+    )
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "transcript_path": "/tmp/codex-session-1.jsonl",
+            "last_assistant_message": "Waiting for input.",
+        }
+    )
+
+    with pytest.raises(slackbot_module.urllib.error.HTTPError):
+        notify_codex_agent_stop(profile, payload)
+
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    receipts = list(Path(state_path).parent.rglob("*.receipt.json"))
+    assert bool(receipts) is receipt_preserved
+
+
+@pytest.mark.parametrize("malformed_receipt", ("{", "[]", "{}"))
+def test_codex_stop_hook_fails_closed_for_malformed_receipt(
+    tmp_path,
+    monkeypatch,
+    malformed_receipt,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    message = "Waiting for input."
+    message_hash = slackbot_module._codex_hook_message_hash(message)
+    receipt_path = slackbot_module._codex_hook_delivery_receipt_paths(
+        state_path,
+        {"session:codex-session-1"},
+        turn_id="turn-1",
+        message_hash=message_hash,
+        notify_user_id="U111",
+        transcript_path="/tmp/codex-session-1.jsonl",
+    )[0]
+    Path(receipt_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(receipt_path).write_text(malformed_receipt, encoding="utf-8")
+    posts = []
+    monkeypatch.setattr(
+        slackbot_module,
+        "post_slack_message",
+        lambda *args, **kwargs: posts.append(args),
+    )
+
+    with pytest.raises(
+        slackbot_module.CodexHookRetryableError,
+        match="durable Codex hook receipt",
+    ):
+        notify_codex_agent_stop(
+            profile,
+            json.dumps(
+                {
+                    "session_id": "codex-session-1",
+                    "turn_id": "turn-1",
+                    "transcript_path": "/tmp/codex-session-1.jsonl",
+                    "last_assistant_message": message,
+                }
+            ),
+        )
+
+    assert posts == []
+    assert Path(receipt_path).read_text(encoding="utf-8") == malformed_receipt
 
 
 def test_codex_hook_pending_client_id_prunes_expired_receipt(tmp_path):
@@ -2812,6 +4690,7 @@ def test_codex_hook_pending_client_id_prunes_expired_receipt(tmp_path):
     receipt_path.write_text(
         json.dumps(
             {
+                "version": 1,
                 "delivery_state": "pending",
                 "key": "session:codex-session-1",
                 "fallback_key": None,
@@ -2833,6 +4712,47 @@ def test_codex_hook_pending_client_id_prunes_expired_receipt(tmp_path):
         message_hash="message-hash",
         notify_user_id="U111",
         transcript_path="/tmp/transcript.jsonl",
+    )
+
+    assert client_msg_id is None
+    assert not receipt_path.exists()
+
+
+@pytest.mark.parametrize(
+    "posting_at",
+    ("2020-01-01T00:00:00Z", "not-a-timestamp"),
+)
+def test_codex_hook_posting_marker_has_recovery_expiration(
+    tmp_path,
+    posting_at,
+):
+    receipt_path = tmp_path / "posting.receipt.json"
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "delivery_state": "posting",
+                "key": "session:codex-session-1",
+                "fallback_key": None,
+                "notify_user_id": "U111",
+                "turn_id": None,
+                "message_sha256": "message-hash",
+                "transcript_path": "/tmp/transcript.jsonl",
+                "client_msg_id": "posting-client-id",
+                "posting_at": posting_at,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    client_msg_id = slackbot_module._codex_hook_pending_client_msg_id(
+        [str(receipt_path)],
+        desired_key="session:codex-session-1",
+        turn_id=None,
+        message_hash="message-hash",
+        notify_user_id="U111",
+        transcript_path="/tmp/transcript.jsonl",
+        delivery_state="posting",
     )
 
     assert client_msg_id is None
@@ -2912,6 +4832,149 @@ def test_codex_stop_hook_recovers_partial_pending_receipt_write(
     assert not list(Path(state_path).parent.rglob("*.receipt.json"))
 
 
+def test_codex_stop_hook_cleans_partial_posting_receipt_write(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    original_write_json = slackbot_module.write_json_atomic
+    posting_writes = 0
+    failed = False
+
+    def fail_second_posting_write(path, data, *args, **kwargs):
+        nonlocal failed, posting_writes
+        if data.get("delivery_state") == "posting":
+            posting_writes += 1
+            if posting_writes == 2 and not failed:
+                failed = True
+                raise OSError("partial posting receipt failure")
+        return original_write_json(path, data, *args, **kwargs)
+
+    calls = []
+
+    def fake_post(config, route, text):
+        slackbot_module._mark_slack_delivery_stage("posting")
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "write_json_atomic",
+        fail_second_posting_write,
+    )
+    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "last_assistant_message": "Waiting for input.",
+        }
+    )
+
+    with pytest.raises(
+        slackbot_module.CodexHookRetryableError,
+        match="partial durable receipt",
+    ):
+        notify_codex_agent_stop(
+            profile,
+            payload,
+            tmux_session="codex-work",
+            tmux_socket="codex",
+        )
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    assert calls == []
+    assert not list(Path(state_path).parent.rglob("*.receipt.json"))
+
+    result = notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    assert result["status"] == "notified"
+    assert len(calls) == 1
+    assert not list(Path(state_path).parent.rglob("*.receipt.json"))
+
+
+def test_sessionless_retry_recovers_aged_legacy_delivered_receipt(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    def fail_bind(*args, **kwargs):
+        raise OSError("simulated binding failure")
+
+    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "bind_agent_tmux_thread", fail_bind)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "transcript_path": "/tmp/codex-session-1.jsonl",
+            "last_assistant_message": "Waiting for input.",
+        }
+    )
+
+    with pytest.raises(
+        slackbot_module.CodexHookRetryableError,
+        match="simulated binding failure",
+    ):
+        notify_codex_agent_stop(
+            profile,
+            payload,
+            tmux_session="codex-work",
+            tmux_socket="codex",
+        )
+
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    receipt_paths = list(Path(state_path).parent.rglob("*.receipt.json"))
+    assert receipt_paths
+    for receipt_path in receipt_paths:
+        receipt = read_json(receipt_path, {})
+        assert receipt["delivery_state"] == "delivered"
+        receipt.pop("delivery_state")
+        receipt["notified_at"] = "2020-01-01T00:00:00Z"
+        slackbot_module.write_json_atomic(receipt_path, receipt)
+    monkeypatch.setattr(
+        slackbot_module,
+        "bind_agent_tmux_thread",
+        bind_agent_tmux_thread,
+    )
+
+    retry = notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    assert retry["status"] == "skipped"
+    assert retry["reason"] == "delivery_receipt"
+    assert len(calls) == 1
+    assert not list(Path(state_path).parent.rglob("*.receipt.json"))
+
+
 def test_codex_stop_hook_starts_new_thread_when_recipient_changes(
     tmp_path,
     monkeypatch,
@@ -2938,6 +5001,8 @@ def test_codex_stop_hook_starts_new_thread_when_recipient_changes(
             return {"channel": "D111", "ts": "1.000001"}
         if route.dm_user_id == "U222":
             return {"channel": "D222", "ts": "2.000001"}
+        if route.dm_user_id == "U333":
+            return {"channel": "D333", "ts": "4.000001"}
         return {"channel": route.channel_id, "ts": "3.000001"}
 
     monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
@@ -2991,6 +5056,42 @@ def test_codex_stop_hook_starts_new_thread_when_recipient_changes(
         )
         is None
     )
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8").replace(
+            "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U222",
+            "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U333",
+        ),
+        encoding="utf-8",
+    )
+    payload["turn_id"] = "turn-4"
+    payload["last_assistant_message"] = "Third recipient."
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D222",
+        thread_ts="2.000001",
+        host="localhost",
+        tmux_session="newer-session",
+        tmux_socket="codex",
+    )
+
+    notify_codex_agent_stop(profile, json.dumps(payload))
+
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D222",
+            thread_ts="2.000001",
+        )["tmux_session"]
+        == "newer-session"
+    )
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D333",
+            thread_ts="4.000001",
+        )["tmux_session"]
+        == "codex-work"
+    )
 
 
 def test_codex_stop_hook_keeps_distinct_sessions_on_same_tmux_separate(
@@ -3029,7 +5130,7 @@ def test_codex_stop_hook_keeps_distinct_sessions_on_same_tmux_separate(
             tmux_socket="codex",
         )
 
-    replay = notify_codex_agent_stop(
+    old_session_retry = notify_codex_agent_stop(
         profile,
         json.dumps(
             {
@@ -3042,7 +5143,9 @@ def test_codex_stop_hook_keeps_distinct_sessions_on_same_tmux_separate(
         tmux_socket="codex",
     )
 
-    assert replay["status"] == "skipped"
+    assert old_session_retry["status"] == "skipped"
+    assert old_session_retry["reason"] == "duplicate"
+    assert len(calls) == 2
     assert (
         query_agent_tmux_thread(
             profile,
@@ -3902,6 +6005,73 @@ def test_codex_stop_hook_pre_delivery_state_timeout_is_retryable(
         )
 
 
+def test_codex_stop_hook_fails_closed_for_corrupt_state(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    state_path = Path(
+        slackbot_module.agent_codex_hook_state_path(config.paths)
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text('{"sessions":', encoding="utf-8")
+    monkeypatch.setattr(
+        slackbot_module,
+        "post_slack_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("corrupt state must fail before Slack delivery")
+        ),
+    )
+
+    with pytest.raises(SlackbotError, match="Cannot parse Codex hook state"):
+        notify_codex_agent_stop(
+            profile,
+            json.dumps(
+                {
+                    "session_id": "codex-session-1",
+                    "turn_id": "turn-1",
+                    "last_assistant_message": "Ready for review.",
+                }
+            ),
+        )
+
+    assert state_path.read_text(encoding="utf-8") == '{"sessions":'
+
+
+def test_codex_hook_state_reader_fails_closed_for_invalid_utf8(tmp_path):
+    state_path = tmp_path / "agent-codex-hooks.json"
+    state_path.write_bytes(b"\xff\xfe")
+
+    with pytest.raises(SlackbotError, match="Cannot parse Codex hook state"):
+        slackbot_module._read_codex_hook_state(str(state_path))
+
+
+def test_codex_hook_state_reader_tolerates_disappearing_file(
+    tmp_path,
+    monkeypatch,
+):
+    state_path = tmp_path / "agent-codex-hooks.json"
+    state_path.write_text("{}", encoding="utf-8")
+    original_read_text = Path.read_text
+
+    def disappear_on_read(path, *args, **kwargs):
+        if path == state_path:
+            raise FileNotFoundError
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", disappear_on_read)
+
+    assert slackbot_module._read_codex_hook_state(str(state_path)) == {}
+
+
 def test_codex_hook_delivery_locks_use_fixed_buckets(tmp_path):
     state_path = str(tmp_path / "agent-codex-hooks.json")
     lock_paths = {
@@ -4062,6 +6232,93 @@ def test_codex_stop_hook_recovers_legacy_receipt_identity(
     assert not Path(legacy_receipt_path).exists()
 
 
+def test_legacy_receipt_without_cutoff_preserves_rejected_route(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    message = "Ready for review."
+    message_hash = slackbot_module._codex_hook_message_hash(message)
+    receipt_path = slackbot_module._codex_hook_delivery_receipt_paths(
+        state_path,
+        {"session:codex-session-1"},
+        turn_id="turn-1",
+        message_hash=message_hash,
+        notify_user_id="U111",
+        transcript_path=None,
+    )[0]
+    slackbot_module.write_json_atomic(
+        receipt_path,
+        {
+            "version": 1,
+            "key": "session:codex-session-1",
+            "fallback_key": None,
+            "notify_user_id": "U111",
+            "channel_id": "D111",
+            "thread_ts": "1.000001",
+            "turn_id": "turn-1",
+            "message_sha256": message_hash,
+            "tmux_binding": None,
+            "notified_at": slackbot_module.utcnow_iso(),
+        },
+    )
+    binding = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="newer-session",
+        tmux_socket="codex",
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "resolve_codex_agent_tmux_binding",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("simulated pane lookup failure")
+        ),
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "post_slack_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy receipt should prevent a second post")
+        ),
+    )
+
+    recovered = notify_codex_agent_stop(
+        profile,
+        json.dumps(
+            {
+                "session_id": "codex-session-1",
+                "turn_id": "turn-1",
+                "last_assistant_message": message,
+            }
+        ),
+    )
+
+    assert recovered["status"] == "skipped"
+    assert recovered["reason"] == "delivery_receipt"
+    assert recovered["tmux_binding"] is None
+    assert not Path(receipt_path).exists()
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        == binding
+    )
+
+
 def test_codex_hook_receipt_dedupe_without_turn_id_expires(tmp_path):
     state_path = str(tmp_path / "agent-codex-hooks.json")
     message_hash = "message-hash"
@@ -4075,6 +6332,7 @@ def test_codex_hook_receipt_dedupe_without_turn_id_expires(tmp_path):
     )[0]
     receipt = {
         "version": 1,
+        "delivery_state": "pending",
         "key": "session:codex-session-1",
         "fallback_key": None,
         "notify_user_id": "U111",
@@ -4105,9 +6363,21 @@ def test_codex_hook_receipt_dedupe_without_turn_id_expires(tmp_path):
         notify_user_id="U111",
         transcript_path="/tmp/codex-session-1.jsonl",
     )
+    receipt["delivery_state"] = "delivered"
+    receipt["notified_at"] = "2020-01-01T00:00:00Z"
+    slackbot_module.write_json_atomic(receipt_path, receipt)
+    durable_delivery = slackbot_module._codex_hook_delivery_receipt(
+        [receipt_path],
+        desired_key="session:codex-session-1",
+        turn_id=None,
+        message_hash=message_hash,
+        notify_user_id="U111",
+        transcript_path="/tmp/codex-session-1.jsonl",
+    )
 
     assert expired is None
-    assert fresh == receipt
+    assert fresh is not None
+    assert durable_delivery == receipt
 
 
 def test_codex_hook_migrates_legacy_receipt_among_unrelated_state_files(
@@ -4160,6 +6430,60 @@ def test_codex_hook_migrates_legacy_receipt_among_unrelated_state_files(
         )
     )
     assert Path(route_receipt_path).exists()
+
+
+def test_codex_hook_route_lookup_recovers_from_corrupt_route_receipt(
+    tmp_path,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    config = load_config(profile)
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    route = {
+        "channel_id": "D111",
+        "thread_ts": "1.000001",
+        "notify_user_id": "U111",
+    }
+    receipt = {
+        "version": 1,
+        "key": "session:codex-session-1",
+        "fallback_key": None,
+        **route,
+        "turn_id": "turn-1",
+        "message_sha256": "message-hash",
+        "tmux_binding": None,
+        "notified_at": slackbot_module.utcnow_iso(),
+    }
+    alias_path = slackbot_module._codex_hook_delivery_receipt_paths(
+        state_path,
+        {receipt["key"]},
+        turn_id=receipt["turn_id"],
+        message_hash=receipt["message_sha256"],
+        notify_user_id=route["notify_user_id"],
+        transcript_path=None,
+    )[0]
+    slackbot_module.write_json_atomic(alias_path, receipt)
+    route_path = slackbot_module._codex_hook_delivery_route_receipt_path(
+        state_path,
+        **route,
+    )
+    Path(route_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(route_path).write_text("{", encoding="utf-8")
+
+    bot = SlackSocketBot(config)
+
+    assert bot._is_agent_notify_thread(
+        SlackbotRoute(channel_id="D111", thread_ts="1.000001"),
+        "U111",
+    )
+    assert json.loads(Path(route_path).read_text(encoding="utf-8")) == receipt
 
 
 def test_codex_hook_rechecks_legacy_receipts_after_state_dir_changes(
@@ -5015,20 +7339,34 @@ def test_codex_stop_hook_receipt_does_not_cross_shared_tmux_sessions(
         assert not first_retry_future.done()
         release_second_receipt.set()
         second = second_future.result()
-        first_retry = first_retry_future.result()
+        with pytest.raises(
+            slackbot_module.CodexHookRetryableError,
+            match="not exclusively bound to its intended tmux target",
+        ):
+            first_retry_future.result()
 
     assert second["status"] == "notified"
-    assert first_retry["status"] == "skipped"
-    assert first_retry["reason"] == "delivery_receipt"
     assert len(calls) == 2
     sessions = query_codex_agent_threads(profile)["hook_state"]["sessions"]
-    assert set(sessions) == {
-        "session:codex-session-1",
-        "session:codex-session-2",
-    }
-    assert sessions["session:codex-session-1"]["channel_id"] == "D1"
+    assert set(sessions) == {"session:codex-session-2"}
     assert sessions["session:codex-session-2"]["channel_id"] == "D2"
-    assert not list(Path(state_path).parent.rglob("*.receipt.json"))
+    assert list(Path(state_path).parent.rglob("*.receipt.json"))
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D2",
+            thread_ts="2.000001",
+        )["tmux_session"]
+        == "codex-work"
+    )
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D1",
+            thread_ts="1.000001",
+        )
+        is None
+    )
 
 
 def test_codex_stop_hook_recovers_binding_without_duplicate_post(
@@ -5052,6 +7390,21 @@ def test_codex_stop_hook_recovers_binding_without_duplicate_post(
     def fail_bind(*args, **kwargs):
         raise OSError("simulated binding failure")
 
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="stale-session",
+        tmux_socket="codex",
+    )
+    config = load_config(profile)
+    bindings = read_json(config.paths.agent_tmux_bindings_path, {})
+    bindings["D111:1.000001"]["updated_at"] = "2020-01-01T00:00:00+00:00"
+    slackbot_module.write_json_atomic(
+        config.paths.agent_tmux_bindings_path,
+        bindings,
+    )
     monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
     monkeypatch.setattr("sneeze.slackbot.bind_agent_tmux_thread", fail_bind)
     payload = json.dumps(
@@ -5075,12 +7428,9 @@ def test_codex_stop_hook_recovers_binding_without_duplicate_post(
 
     status = query_codex_agent_threads(profile)
     state = status["hook_state"]
-    entry = state["sessions"]["session:codex-session-1"]
-    assert entry["channel_id"] == "D111"
-    assert len(entry["notifications"]) == 1
+    assert state.get("sessions", {}) == {}
     state_path = Path(status["hook_state_path"])
     assert list(state_path.parent.rglob("*.receipt.json"))
-
     monkeypatch.setattr(
         "sneeze.slackbot.bind_agent_tmux_thread",
         bind_agent_tmux_thread,
@@ -5100,7 +7450,726 @@ def test_codex_stop_hook_recovers_binding_without_duplicate_post(
         thread_ts="1.000001",
     )
     assert binding["tmux_session"] == "codex-work"
+    entry = query_codex_agent_threads(profile)["hook_state"]["sessions"][
+        "session:codex-session-1"
+    ]
+    assert entry["channel_id"] == "D111"
+    assert entry["tmux_session"] == "codex-work"
+    assert len(entry["notifications"]) == 1
     assert not list(state_path.parent.rglob("*.receipt.json"))
+
+
+@pytest.mark.parametrize("replacement_session", (None, "newer-session"))
+def test_codex_stop_hook_finalizes_superseded_route_read_only(
+    tmp_path,
+    monkeypatch,
+    replacement_session,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    def fail_bind(*args, **kwargs):
+        raise OSError("simulated binding failure")
+
+    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "bind_agent_tmux_thread", fail_bind)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+
+    with pytest.raises(
+        slackbot_module.CodexHookRetryableError,
+        match="simulated binding failure",
+    ):
+        notify_codex_agent_stop(
+            profile,
+            payload,
+            tmux_session="codex-work",
+            tmux_socket="codex",
+        )
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "bind_agent_tmux_thread",
+        bind_agent_tmux_thread,
+    )
+    replacement = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session=replacement_session or "codex-work",
+        tmux_socket="codex",
+    )
+    if replacement_session is None:
+        assert slackbot_module.unbind_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+
+    retry = notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    binding = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    if replacement_session is None:
+        assert binding is None
+    else:
+        assert binding == replacement
+    assert retry["status"] == "skipped"
+    assert retry["reason"] == "delivery_receipt"
+    assert len(calls) == 1
+    entry = query_codex_agent_threads(profile)["hook_state"]["sessions"][
+        "session:codex-session-1"
+    ]
+    assert "tmux_session" not in entry
+    state_path = Path(
+        slackbot_module.agent_codex_hook_state_path(
+            load_config(profile).paths
+        )
+    )
+    assert not list(state_path.parent.rglob("*.receipt.json"))
+
+
+def test_codex_stop_hook_does_not_restore_guardless_legacy_notification(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+    notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    status = query_codex_agent_threads(profile)
+    state = status["hook_state"]
+    notification = state["sessions"]["session:codex-session-1"][
+        "notifications"
+    ][0]
+    notification.pop("binding_observed_revision")
+    notification.pop("binding_observed_at")
+    slackbot_module.write_json_atomic(status["hook_state_path"], state)
+    assert slackbot_module.unbind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+
+    duplicate = notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    assert duplicate["status"] == "skipped"
+    assert len(calls) == 1
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+    entry = query_codex_agent_threads(profile)["hook_state"]["sessions"][
+        "session:codex-session-1"
+    ]
+    assert "tmux_session" not in entry
+
+
+def test_codex_stop_hook_finalizes_guardless_legacy_receipt_read_only(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    def fail_bind(*args, **kwargs):
+        raise OSError("simulated binding failure")
+
+    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "bind_agent_tmux_thread", fail_bind)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+    with pytest.raises(
+        slackbot_module.CodexHookRetryableError,
+        match="simulated binding failure",
+    ):
+        notify_codex_agent_stop(
+            profile,
+            payload,
+            tmux_session="codex-work",
+            tmux_socket="codex",
+        )
+    state_path = Path(
+        slackbot_module.agent_codex_hook_state_path(config.paths)
+    )
+    receipt_paths = list(state_path.parent.rglob("*.receipt.json"))
+    assert receipt_paths
+    for receipt_path in receipt_paths:
+        receipt = read_json(receipt_path, {})
+        receipt.pop("binding_observed_revision")
+        receipt.pop("binding_observed_at")
+        slackbot_module.write_json_atomic(receipt_path, receipt)
+    monkeypatch.setattr(
+        slackbot_module,
+        "bind_agent_tmux_thread",
+        bind_agent_tmux_thread,
+    )
+
+    retry = notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    assert retry["status"] == "skipped"
+    assert retry["reason"] == "delivery_receipt"
+    assert len(calls) == 1
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+    entry = query_codex_agent_threads(profile)["hook_state"]["sessions"][
+        "session:codex-session-1"
+    ]
+    assert "tmux_session" not in entry
+    assert not list(state_path.parent.rglob("*.receipt.json"))
+
+
+def test_codex_stop_hook_does_not_restore_after_tombstone_age_eviction(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+    notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    status = query_codex_agent_threads(profile)
+    state = status["hook_state"]
+    state["sessions"]["session:codex-session-1"]["notifications"][0][
+        "notified_at"
+    ] = "2020-01-01T00:00:00Z"
+    slackbot_module.write_json_atomic(status["hook_state_path"], state)
+    assert slackbot_module.unbind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        config.paths.agent_tmux_bindings_path
+    )
+    revision_state = read_json(revision_path, {})
+    revision_state["route_tombstones"]["D111:1.000001"][
+        "updated_at"
+    ] = "2020-01-01T00:00:00Z"
+    slackbot_module.write_json_atomic(revision_path, revision_state)
+    slackbot_module._observe_agent_tmux_binding_revision(config.paths)
+    assert (
+        "D111:1.000001"
+        not in read_json(revision_path, {})["route_tombstones"]
+    )
+
+    duplicate = notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    assert duplicate["status"] == "skipped"
+    assert len(calls) == 1
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+
+
+def test_codex_stop_hook_does_not_restore_after_tombstone_capacity_eviction(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "AGENT_TMUX_ROUTE_TOMBSTONE_MAX_ENTRIES",
+        2,
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+    notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    assert slackbot_module.unbind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    for index in range(3):
+        channel_id = f"D{index + 2}"
+        thread_ts = f"{index + 2}.000001"
+        bind_agent_tmux_thread(
+            profile,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            host="localhost",
+            tmux_session=f"codex-work-{index}",
+            tmux_socket="codex",
+        )
+        assert slackbot_module.unbind_agent_tmux_thread(
+            profile,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+        )
+    revision_path = slackbot_module._agent_tmux_binding_revision_counter_path(
+        config.paths.agent_tmux_bindings_path
+    )
+    assert (
+        "D111:1.000001"
+        not in read_json(revision_path, {})["route_tombstones"]
+    )
+
+    duplicate = notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    assert duplicate["status"] == "skipped"
+    assert len(calls) == 1
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+
+
+def test_codex_stop_hook_recovery_cutoff_matches_transcript(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "transcript_path": "/tmp/transcript-a.jsonl",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+    notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    status = query_codex_agent_threads(profile)
+    state = status["hook_state"]
+    entry = state["sessions"]["session:codex-session-1"]
+    entry["notifications"][0]["notified_at"] = slackbot_module.utcnow_iso()
+    entry["notifications"][0][
+        "binding_observed_at"
+    ] = "2000-01-01T00:00:00+00:00"
+    entry["notifications"][0]["binding_observed_revision"] = 0
+    unrelated = dict(entry["notifications"][0])
+    unrelated["transcript_path"] = "/tmp/transcript-b.jsonl"
+    unrelated["notified_at"] = "2100-01-01T00:00:00+00:00"
+    unrelated["binding_observed_at"] = "2100-01-01T00:00:00+00:00"
+    unrelated["binding_observed_revision"] = 999999
+    entry["notifications"].append(unrelated)
+    slackbot_module.write_json_atomic(status["hook_state_path"], state)
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="newer-session",
+        tmux_socket="codex",
+    )
+
+    retry = notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    assert retry["status"] == "skipped"
+    assert retry["reason"] == "duplicate"
+    binding = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    assert binding["tmux_session"] == "newer-session"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "concurrent_thread_ts",
+    ("1.000001", "2.000001"),
+    ids=("same-route", "different-route"),
+)
+def test_codex_stop_hook_preserves_route_claimed_during_slack_delivery(
+    tmp_path,
+    monkeypatch,
+    concurrent_thread_ts,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+    concurrent_session = (
+        "newer-session"
+        if concurrent_thread_ts == "1.000001"
+        else "codex-work"
+    )
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        bind_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts=concurrent_thread_ts,
+            host="localhost",
+            tmux_session=concurrent_session,
+            tmux_socket="codex",
+        )
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+
+    if concurrent_thread_ts == "1.000001":
+        first = notify_codex_agent_stop(
+            profile,
+            payload,
+            tmux_session="codex-work",
+            tmux_socket="codex",
+        )
+        second = notify_codex_agent_stop(
+            profile,
+            payload,
+            tmux_session="codex-work",
+            tmux_socket="codex",
+        )
+        assert first["status"] == "notified"
+        assert second["status"] == "skipped"
+    else:
+        for _ in range(2):
+            with pytest.raises(
+                slackbot_module.CodexHookRetryableError,
+                match="not exclusively bound to its intended tmux target",
+            ):
+                notify_codex_agent_stop(
+                    profile,
+                    payload,
+                    tmux_session="codex-work",
+                    tmux_socket="codex",
+                )
+
+    binding = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts=concurrent_thread_ts,
+    )
+    assert binding["tmux_session"] == concurrent_session
+    if concurrent_thread_ts != "1.000001":
+        assert (
+            query_agent_tmux_thread(
+                profile,
+                channel_id="D111",
+                thread_ts="1.000001",
+            )
+            is None
+        )
+    assert len(calls) == 1
+    sessions = query_codex_agent_threads(profile)["hook_state"].get(
+        "sessions", {}
+    )
+    if concurrent_thread_ts == "1.000001":
+        entry = sessions["session:codex-session-1"]
+        assert "tmux_session" not in entry
+    else:
+        assert "session:codex-session-1" not in sessions
+
+
+def test_codex_stop_hook_preserves_more_specific_same_route_binding(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    concurrent_bindings = []
+
+    def fake_post(config, route, text):
+        concurrent_bindings.append(
+            bind_agent_tmux_thread(
+                profile,
+                channel_id="D111",
+                thread_ts="1.000001",
+                host="localhost",
+                tmux_session="codex-work",
+                tmux_socket="codex",
+                tmux_pane="%1",
+                tmux_pane_pid="101",
+                tmux_session_created="202",
+                tmux_server_pid="303",
+            )
+        )
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+
+    notify_codex_agent_stop(
+        profile,
+        json.dumps(
+            {
+                "session_id": "codex-session-1",
+                "turn_id": "turn-1",
+                "last_assistant_message": "Ready for review.",
+            }
+        ),
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    binding = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    assert binding["tmux_session"] == "codex-work"
+    assert binding["tmux_pane"] == "%1"
+    assert binding["tmux_pane_pid"] == "101"
+    assert binding["tmux_session_created"] == "202"
+    assert binding["tmux_server_pid"] == "303"
+    assert binding["updated_at"] > concurrent_bindings[0]["updated_at"]
+
+
+def test_duplicate_rejected_cleanup_uses_original_binding_cutoff(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+    notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+    newer_binding = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="newer-session",
+        tmux_socket="codex",
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "resolve_codex_agent_tmux_binding",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("simulated pane lookup failure")
+        ),
+    )
+
+    retry = notify_codex_agent_stop(
+        profile,
+        payload,
+        tmux_session="codex-work",
+        tmux_socket="codex",
+    )
+
+    assert retry["status"] == "skipped"
+    assert retry["reason"] == "duplicate"
+    assert len(calls) == 1
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        == newer_binding
+    )
 
 
 def test_codex_stop_hook_can_notify_without_tmux_binding(
@@ -5261,6 +8330,87 @@ def test_codex_agent_hooks_install_preserves_unrelated_hooks(tmp_path):
     assert all(handler["timeout"] == 10 for handler in prompt_handlers)
 
 
+def test_codex_agent_hooks_install_preserves_commands_containing_markers(
+    tmp_path,
+):
+    hooks_path = tmp_path / "hooks.json"
+    unrelated_commands = (
+        "printf slackbot-agent-stop-hook",
+        "python keep.py --label=slackbot-agent-stop-hook",
+        "node /tmp/webmux-agent-status.js.backup --status working",
+        "python keep.py webmux-agent-status.js",
+    )
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": command,
+                                }
+                                for command in unrelated_commands[:2]
+                            ]
+                        }
+                    ],
+                    "UserPromptSubmit": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": command,
+                                }
+                                for command in unrelated_commands[2:]
+                            ]
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    install_codex_agent_hooks(
+        hooks_path=str(hooks_path),
+        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        include_webmux=False,
+    )
+
+    updated = json.loads(hooks_path.read_text(encoding="utf-8"))
+    installed_commands = {
+        handler["command"]
+        for groups in updated["hooks"].values()
+        for group in groups
+        for handler in group["hooks"]
+    }
+    assert set(unrelated_commands) <= installed_commands
+
+
+def test_codex_agent_hooks_install_replaces_prefixed_stop_command(tmp_path):
+    hooks_path = tmp_path / "hooks.json"
+    stop_command = (
+        "sample-bot sample-slackbot-agent-stop-hook "
+        "--state-dir=/tmp/sample-state"
+    )
+
+    for _ in range(2):
+        install_codex_agent_hooks(
+            hooks_path=str(hooks_path),
+            slack_stop_command=stop_command,
+            include_webmux=False,
+        )
+
+    updated = json.loads(hooks_path.read_text(encoding="utf-8"))
+    stop_commands = [
+        handler["command"]
+        for group in updated["hooks"]["Stop"]
+        for handler in group["hooks"]
+    ]
+    assert stop_commands.count(stop_command) == 1
+
+
 def test_codex_agent_hooks_install_can_skip_webmux(tmp_path):
     hooks_path = tmp_path / "hooks.json"
 
@@ -5313,6 +8463,40 @@ def test_codex_agent_hooks_install_expands_tilde_before_backup(
     )
 
     installed = json.loads(hooks_path.read_text(encoding="utf-8"))
+    assert (
+        installed["hooks"]["PostToolUse"] == original["hooks"]["PostToolUse"]
+    )
+    assert Path(result["backup_path"]).read_text(encoding="utf-8") == (
+        json.dumps(original)
+    )
+    assert result["hooks_path"] == str(hooks_path)
+
+
+def test_codex_agent_hooks_install_preserves_hooks_file_symlink(tmp_path):
+    dotfiles_path = tmp_path / "dotfiles" / "hooks.json"
+    dotfiles_path.parent.mkdir()
+    original = {
+        "hooks": {
+            "PostToolUse": [
+                {"hooks": [{"type": "command", "command": "python audit.py"}]}
+            ]
+        }
+    }
+    dotfiles_path.write_text(json.dumps(original), encoding="utf-8")
+    hooks_path = tmp_path / ".codex" / "hooks.json"
+    hooks_path.parent.mkdir()
+    hooks_path.symlink_to(Path("../dotfiles/hooks.json"))
+    original_link = hooks_path.readlink()
+
+    result = install_codex_agent_hooks(
+        hooks_path=str(hooks_path),
+        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        include_webmux=False,
+    )
+
+    installed = json.loads(dotfiles_path.read_text(encoding="utf-8"))
+    assert hooks_path.is_symlink()
+    assert hooks_path.readlink() == original_link
     assert (
         installed["hooks"]["PostToolUse"] == original["hooks"]["PostToolUse"]
     )
@@ -5385,6 +8569,48 @@ def test_codex_agent_hooks_install_replaces_custom_named_webmux_hooks(
     assert unrelated_command in prompt_commands
     assert old_managed_command not in prompt_commands
     assert stop_commands.count("trentn-bot slackbot-agent-stop-hook") == 1
+
+
+def test_codex_agent_hooks_install_preserves_other_webmux_kind(tmp_path):
+    hooks_path = tmp_path / "hooks.json"
+    webmux_script = tmp_path / "webmux-agent-status.js"
+    webmux_script.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    other_agent_command = (
+        f"node {webmux_script} --kind claude --status working"
+    )
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": other_agent_command,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    install_codex_agent_hooks(
+        hooks_path=str(hooks_path),
+        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        include_webmux=False,
+    )
+
+    updated = json.loads(hooks_path.read_text(encoding="utf-8"))
+    prompt_commands = [
+        handler["command"]
+        for group in updated["hooks"]["UserPromptSubmit"]
+        for handler in group["hooks"]
+    ]
+    assert prompt_commands == [other_agent_command]
 
 
 def test_codex_agent_hooks_install_warns_without_webmux_path(tmp_path):
@@ -5540,6 +8766,9 @@ def test_agent_tmux_capture_bound_thread(tmp_path, monkeypatch):
         tmux_socket="codex",
         tmux_conf=str(tmux_conf),
         tmux_pane="%7",
+        tmux_pane_pid="101",
+        tmux_session_created="202",
+        tmux_server_pid="303",
     )
     config = load_config(profile)
     calls = []
@@ -5549,7 +8778,7 @@ def test_agent_tmux_capture_bound_thread(tmp_path, monkeypatch):
         if "display-message" in args:
             return SimpleNamespace(
                 returncode=0,
-                stdout="codex-work\n",
+                stdout="codex-work\t%7\t101\t202\t303\n",
                 stderr="",
             )
         return SimpleNamespace(
@@ -5599,7 +8828,7 @@ def test_agent_tmux_paste_targets_bound_pane(tmp_path, monkeypatch):
         if "display-message" in args:
             return SimpleNamespace(
                 returncode=0,
-                stdout="codex-work\n",
+                stdout="codex-work\t%7\t101\t202\t303\n",
                 stderr="",
             )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -5613,6 +8842,9 @@ def test_agent_tmux_paste_targets_bound_pane(tmp_path, monkeypatch):
             "tmux_session": "codex-work",
             "tmux_socket": "codex",
             "tmux_pane": "%7",
+            "tmux_pane_pid": "101",
+            "tmux_session_created": "202",
+            "tmux_server_pid": "303",
         },
         "literal $HOME; -- text\nsecond line",
     )
@@ -5640,7 +8872,7 @@ def test_agent_tmux_paste_failure_deletes_loaded_buffer(
         if "display-message" in args:
             return SimpleNamespace(
                 returncode=0,
-                stdout="codex-work\n",
+                stdout="codex-work\t%7\t101\t202\t303\n",
                 stderr="",
             )
         if "paste-buffer" in args:
@@ -5661,6 +8893,9 @@ def test_agent_tmux_paste_failure_deletes_loaded_buffer(
                 "tmux_session": "codex-work",
                 "tmux_socket": "codex",
                 "tmux_pane": "%7",
+                "tmux_pane_pid": "101",
+                "tmux_session_created": "202",
+                "tmux_server_pid": "303",
             },
             "literal text",
         )
@@ -5712,7 +8947,7 @@ def test_agent_tmux_rejects_reused_pane_from_another_session(
         calls.append(args)
         return SimpleNamespace(
             returncode=0,
-            stdout="different-session\n",
+            stdout="different-session\t%7\t101\t202\t303\n",
             stderr="",
         )
 
@@ -5726,6 +8961,9 @@ def test_agent_tmux_rejects_reused_pane_from_another_session(
                 "tmux_session": "codex-work",
                 "tmux_socket": "codex",
                 "tmux_pane": "%7",
+                "tmux_pane_pid": "101",
+                "tmux_session_created": "202",
+                "tmux_server_pid": "303",
             },
             "do not paste",
         )
@@ -5758,6 +8996,9 @@ def test_agent_tmux_reports_missing_bound_pane(tmp_path, monkeypatch):
                 "tmux_session": "codex-work",
                 "tmux_socket": "codex",
                 "tmux_pane": "%7",
+                "tmux_pane_pid": "101",
+                "tmux_session_created": "202",
+                "tmux_server_pid": "303",
             },
             "do not paste",
         )
@@ -5777,6 +9018,9 @@ def test_agent_tmux_sample_selects_bound_pane_cwd(tmp_path, monkeypatch):
         tmux_session="codex-work",
         tmux_socket="codex",
         tmux_pane="%7",
+        tmux_pane_pid="101",
+        tmux_session_created="202",
+        tmux_server_pid="303",
     )
     config = load_config(profile)
     calls = []
@@ -5787,7 +9031,7 @@ def test_agent_tmux_sample_selects_bound_pane_cwd(tmp_path, monkeypatch):
         if "display-message" in args:
             return SimpleNamespace(
                 returncode=0,
-                stdout="codex-work\n",
+                stdout="codex-work\t%7\t101\t202\t303\n",
                 stderr="",
             )
         if "capture-pane" in args:
@@ -9013,6 +12257,7 @@ def test_stale_session_resume_retries_as_fresh_session(
         {"session_id": "stale-session", "updated_at": "now"},
     )
     session_ids = []
+    audit_events = []
 
     class FakeRunner:
         def run(self, prompt, session_id=None, **kwargs):
@@ -9034,6 +12279,11 @@ def test_stale_session_resume_retries_as_fresh_session(
             }
 
     bot.runner = FakeRunner()
+    monkeypatch.setattr(
+        slackbot_module,
+        "append_slackbot_audit_event",
+        lambda config, event: audit_events.append(dict(event)),
+    )
     posts = []
     monkeypatch.setattr(
         "sneeze.slackbot.post_slack_message",
@@ -9055,6 +12305,121 @@ def test_stale_session_resume_retries_as_fresh_session(
         "fresh-session"
     )
     assert posts[-1] == "fresh reply"
+    resume_failed = [
+        event
+        for event in audit_events
+        if event.get("status") == "resume_failed"
+    ]
+    assert len(resume_failed) == 1
+    assert resume_failed[0]["kind"] == "codex_invocation"
+    assert resume_failed[0]["session_id"] == "stale-session"
+    assert resume_failed[0]["conversation_key"] == "dm:D111:U111"
+    assert resume_failed[0]["returncode"] == 1
+
+
+def test_codex_started_audit_failure_prevents_execution(
+    tmp_path, monkeypatch
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bot = SlackSocketBot(load_config(profile))
+    runner_called = False
+
+    class UnexpectedRunner:
+        def run(self, *args, **kwargs):
+            nonlocal runner_called
+            runner_called = True
+            raise AssertionError("Codex must not run without a started audit")
+
+    bot.runner = UnexpectedRunner()
+    updates = []
+    monkeypatch.setattr(
+        slackbot_module,
+        "post_slack_message",
+        lambda *args, **kwargs: {"ts": "2.000001", "channel": "D111"},
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "append_slackbot_audit_event",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("audit storage unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "update_slack_message",
+        lambda *args, **kwargs: updates.append(kwargs) or {"ok": True},
+    )
+
+    with pytest.raises(OSError, match="audit storage unavailable"):
+        bot._run_codex_for_route(
+            "continue",
+            SlackbotRoute(channel_id="D111", dm_user_id="U111"),
+        )
+
+    assert runner_called is False
+    assert updates[0]["channel"] == "D111"
+    assert updates[0]["ts"] == "2.000001"
+    assert "did not start" in updates[0]["text"]
+
+
+def test_codex_failure_audit_error_does_not_mask_slack_reply(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    output = []
+    bot = SlackSocketBot(load_config(profile), out=output.append)
+    bot.conversations.set(
+        "dm:D111:U111",
+        {"session_id": "resume-session", "updated_at": "now"},
+    )
+
+    class FailingRunner:
+        def run(self, prompt, session_id=None, **kwargs):
+            raise RuntimeError("runner exploded")
+
+    bot.runner = FailingRunner()
+    audit_events = []
+
+    def fail_failed_audit(config, event):
+        audit_events.append(dict(event))
+        if event.get("status") == "failed":
+            raise OSError("audit disk error")
+
+    updates = []
+    monkeypatch.setattr(
+        slackbot_module,
+        "append_slackbot_audit_event",
+        fail_failed_audit,
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "post_slack_message",
+        lambda config, route, text: {"ts": "2.000001", "channel": "D111"},
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "update_slack_message",
+        lambda *args, **kwargs: updates.append(kwargs["text"])
+        or {"ok": True},
+    )
+
+    bot._run_codex_for_route(
+        "continue",
+        SlackbotRoute(channel_id="D111", dm_user_id="U111"),
+    )
+
+    failed = [
+        event for event in audit_events if event.get("status") == "failed"
+    ]
+    assert failed[0]["session_id"] == "resume-session"
+    assert failed[0]["error"] == "runner exploded"
+    assert "internal error while talking to Codex" in updates[-1]
+    assert any(
+        "Failed to append Slackbot audit event" in item for item in output
+    )
 
 
 def test_channel_thread_sessions_are_isolated_by_slack_user(
@@ -10188,6 +13553,149 @@ def test_authorization_allows_user_or_channel_match(tmp_path):
     assert not bot._is_authorized("U222", "C123")
 
 
+def test_authorization_recovers_and_reads_trust_under_one_lock(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bot = SlackSocketBot(load_config(profile))
+    lock_state = {"held": None}
+    lock_sequence = []
+
+    class TrackingLock:
+        def __init__(self, kind):
+            self.kind = kind
+
+        def __enter__(self):
+            assert lock_state["held"] is None
+            lock_state["held"] = self.kind
+            lock_sequence.append(self.kind)
+
+        def __exit__(self, exc_type, exc, traceback):
+            lock_state["held"] = None
+
+    def recover_locked(config):
+        assert lock_state["held"] == "exclusive"
+        return False
+
+    def read_locked(paths):
+        assert lock_state["held"] == "exclusive"
+        return {
+            "trusted_channel_ids": ["C777"],
+            "trusted_user_ids": [],
+        }
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "locked_json_path",
+        lambda path: TrackingLock("exclusive"),
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "shared_locked_json_path",
+        lambda path: TrackingLock("shared"),
+    )
+    monkeypatch.setattr(slackbot_module.os.path, "lexists", lambda path: True)
+    monkeypatch.setattr(
+        slackbot_module,
+        "_recover_slackbot_trust_transaction_locked",
+        recover_locked,
+    )
+    monkeypatch.setattr(slackbot_module, "read_slackbot_trust", read_locked)
+
+    assert bot._is_authorized("U222", "C777")
+    assert lock_state["held"] is None
+    assert lock_sequence == ["shared", "exclusive"]
+
+
+def test_authorization_common_path_uses_shared_trust_lock(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    bot = SlackSocketBot(load_config(profile))
+    lock_state = {"held": False}
+
+    class TrackingSharedLock:
+        def __enter__(self):
+            lock_state["held"] = True
+
+        def __exit__(self, exc_type, exc, traceback):
+            lock_state["held"] = False
+
+    def read_locked(paths):
+        assert lock_state["held"]
+        return {
+            "trusted_channel_ids": ["C777"],
+            "trusted_user_ids": [],
+        }
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "shared_locked_json_path",
+        lambda path: TrackingSharedLock(),
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "locked_json_path",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError("common authorization must not take write lock")
+        ),
+    )
+    monkeypatch.setattr(
+        slackbot_module.os.path, "lexists", lambda path: False
+    )
+    monkeypatch.setattr(slackbot_module, "read_slackbot_trust", read_locked)
+
+    assert bot._is_authorized("U222", "C777")
+    assert not lock_state["held"]
+
+
+@pytest.mark.skipif(slackbot_module.fcntl is None, reason="requires flock")
+def test_shared_json_locks_allow_parallel_readers_and_block_writer(tmp_path):
+    path = tmp_path / "trust.json"
+    first_reader_entered = threading.Event()
+    second_reader_entered = threading.Event()
+    release_readers = threading.Event()
+    writer_entered = threading.Event()
+
+    def hold_reader(entered):
+        with slackbot_module.shared_locked_json_path(path):
+            entered.set()
+            assert release_readers.wait(timeout=2)
+
+    def hold_writer():
+        with slackbot_module.locked_json_path(path):
+            writer_entered.set()
+
+    first_reader = threading.Thread(
+        target=hold_reader,
+        args=(first_reader_entered,),
+    )
+    second_reader = threading.Thread(
+        target=hold_reader,
+        args=(second_reader_entered,),
+    )
+    writer = threading.Thread(target=hold_writer)
+    first_reader.start()
+    second_reader.start()
+    assert first_reader_entered.wait(timeout=1)
+    assert second_reader_entered.wait(timeout=1)
+    writer.start()
+    assert not writer_entered.wait(timeout=0.05)
+    release_readers.set()
+    first_reader.join(timeout=1)
+    second_reader.join(timeout=1)
+    writer.join(timeout=1)
+
+    assert writer_entered.is_set()
+    assert not first_reader.is_alive()
+    assert not second_reader.is_alive()
+    assert not writer.is_alive()
+
+
 def test_runtime_channel_trust_allows_channel(tmp_path):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
@@ -10200,6 +13708,31 @@ def test_runtime_channel_trust_allows_channel(tmp_path):
     assert SlackSocketBot(config)._is_authorized("U222", "C777")
     assert untrust_slack_channel(config.paths, "C777")
     assert not SlackSocketBot(config)._is_authorized("U222", "C777")
+
+
+def test_direct_trust_mutations_reject_pending_transaction(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    assert trust_slack_channel(config.paths, "C777")
+    original_trust = read_slackbot_trust(config.paths)
+    slackbot_module.write_json_atomic(
+        slackbot_module._slackbot_trust_transaction_path(config.paths),
+        {},
+    )
+
+    operations = (
+        lambda: slackbot_module.write_slackbot_trust(
+            config.paths,
+            {"trusted_channel_ids": ["C888"]},
+        ),
+        lambda: trust_slack_channel(config.paths, "C888"),
+        lambda: untrust_slack_channel(config.paths, "C777"),
+    )
+    for operation in operations:
+        with pytest.raises(SlackbotError, match="pending Slackbot trust"):
+            operation()
+        assert read_slackbot_trust(config.paths) == original_trust
 
 
 def test_control_policy_command_posts_without_codex(tmp_path, monkeypatch):
@@ -10230,6 +13763,334 @@ def test_control_policy_command_posts_without_codex(tmp_path, monkeypatch):
     assert handled
     assert "effective Codex policy" in calls[0]
     assert "workspace-write" in calls[0]
+
+
+def test_revoke_channel_control_emits_audit_event(tmp_path, monkeypatch):
+    profile = replace(
+        make_profile(tmp_path),
+        default_allowed_user_ids=("U111",),
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    bot = SlackSocketBot(config)
+    assert trust_slack_channel(config.paths, "C777")
+    audit_events = []
+    posts = []
+    monkeypatch.setattr(
+        slackbot_module,
+        "append_slackbot_audit_event",
+        lambda config, event: audit_events.append(dict(event)),
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "post_slack_message",
+        lambda config, route, text: posts.append(text),
+    )
+
+    handled = bot._maybe_handle_control_command(
+        "!revoke-channel C777",
+        SlackbotRoute(channel_id="D111", dm_user_id="U111"),
+        "U111",
+    )
+
+    assert handled
+    assert [event["status"] for event in audit_events] == [
+        "started",
+        "completed",
+    ]
+    assert audit_events[0]["kind"] == "slackbot_control"
+    assert audit_events[0]["command"] == "revoke-channel"
+    assert audit_events[0]["channel_id"] == "C777"
+    assert audit_events[0]["route"]["channel_id"] == "D111"
+    assert audit_events[0]["route"]["dm_user_id"] == "U111"
+    assert audit_events[0]["slack_user_id"] == "U111"
+    assert audit_events[0]["changed"] is True
+    assert audit_events[1]["audit_id"] == audit_events[0]["audit_id"]
+    assert "no longer trusted" in posts[0]
+
+
+def test_channel_trust_control_requires_started_audit(tmp_path, monkeypatch):
+    profile = replace(
+        make_profile(tmp_path),
+        default_allowed_user_ids=("U111",),
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    bot = SlackSocketBot(config)
+    posts = []
+    monkeypatch.setattr(
+        slackbot_module,
+        "append_slackbot_audit_event",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("audit storage unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "post_slack_message",
+        lambda *args, **kwargs: posts.append(args[-1]),
+    )
+
+    with pytest.raises(OSError, match="audit storage unavailable"):
+        bot._handle_channel_trust_command(
+            SlackbotRoute(channel_id="D111", dm_user_id="U111"),
+            "U111",
+            "C777",
+            trusted=True,
+        )
+
+    assert (
+        "C777" not in read_slackbot_trust(config.paths)["trusted_channel_ids"]
+    )
+    assert posts == []
+    transaction_path = slackbot_module._slackbot_trust_transaction_path(
+        config.paths
+    )
+    transaction = read_json(transaction_path, {})
+    assert transaction["version"] == 2
+    assert transaction["phase"] == "prepared"
+    recovered_events = []
+    monkeypatch.setattr(
+        slackbot_module,
+        "append_slackbot_audit_event",
+        lambda config, event: recovered_events.append(dict(event)),
+    )
+
+    assert slackbot_module.recover_slackbot_trust_transaction(config)
+    assert recovered_events[0]["status"] == "failed"
+    assert recovered_events[0]["recovered"] is True
+    assert not transaction_path.exists()
+
+
+def test_channel_trust_control_does_not_open_audit_when_prepare_fails(
+    tmp_path,
+    monkeypatch,
+):
+    profile = replace(
+        make_profile(tmp_path),
+        default_allowed_user_ids=("U111",),
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    bot = SlackSocketBot(config)
+    audit_events = []
+    original_write_json_atomic = slackbot_module.write_json_atomic
+    transaction_path = slackbot_module._slackbot_trust_transaction_path(
+        config.paths
+    )
+
+    def fail_transaction_prepare(path, data):
+        if Path(path) == transaction_path:
+            raise OSError("transaction storage unavailable")
+        return original_write_json_atomic(path, data)
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "append_slackbot_audit_event",
+        lambda config, event: audit_events.append(dict(event)),
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "write_json_atomic",
+        fail_transaction_prepare,
+    )
+
+    with pytest.raises(OSError, match="transaction storage unavailable"):
+        bot._handle_channel_trust_command(
+            SlackbotRoute(channel_id="D111", dm_user_id="U111"),
+            "U111",
+            "C777",
+            trusted=True,
+        )
+
+    assert audit_events == []
+    assert (
+        "C777" not in read_slackbot_trust(config.paths)["trusted_channel_ids"]
+    )
+
+
+def test_channel_trust_control_preserves_state_after_completion_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    profile = replace(
+        make_profile(tmp_path),
+        default_allowed_user_ids=("U111",),
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    bot = SlackSocketBot(config)
+    audit_events = []
+
+    def fail_completed_audit(config, event):
+        audit_events.append(dict(event))
+        if event.get("status") == "completed":
+            raise OSError("completed audit failed")
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "append_slackbot_audit_event",
+        fail_completed_audit,
+    )
+
+    with pytest.raises(OSError, match="completed audit failed"):
+        bot._handle_channel_trust_command(
+            SlackbotRoute(channel_id="D111", dm_user_id="U111"),
+            "U111",
+            "C777",
+            trusted=True,
+        )
+
+    assert "C777" in read_slackbot_trust(config.paths)["trusted_channel_ids"]
+    assert [event["status"] for event in audit_events] == [
+        "started",
+        "completed",
+    ]
+    assert slackbot_module._slackbot_trust_transaction_path(
+        config.paths
+    ).exists()
+    transaction = read_json(
+        slackbot_module._slackbot_trust_transaction_path(config.paths),
+        {},
+    )
+    assert transaction["version"] == 2
+    assert transaction["phase"] == "state_committed"
+    recovered_events = []
+    monkeypatch.setattr(
+        slackbot_module,
+        "append_slackbot_audit_event",
+        lambda config, event: recovered_events.append(dict(event)),
+    )
+
+    assert slackbot_module.recover_slackbot_trust_transaction(config)
+    assert recovered_events[0]["status"] == "completed"
+    assert recovered_events[0]["recovered"] is True
+    assert not slackbot_module._slackbot_trust_transaction_path(
+        config.paths
+    ).exists()
+    assert "C777" in read_slackbot_trust(config.paths)["trusted_channel_ids"]
+
+
+@pytest.mark.parametrize(
+    ("state_applied", "expected_status"),
+    ((False, "failed"), (True, "completed")),
+)
+def test_channel_trust_transaction_recovers_after_restart(
+    tmp_path,
+    monkeypatch,
+    state_applied,
+    expected_status,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    original_trust = read_slackbot_trust(config.paths)
+    updated_trust = dict(original_trust)
+    updated_trust["trusted_channel_ids"] = ["C777"]
+    audit_event = {
+        "kind": "slackbot_control",
+        "command": "allow-channel",
+        "audit_id": "audit-transaction-1",
+        "channel_id": "C777",
+        "route": {"channel_id": "D111"},
+        "slack_user_id": "U111",
+        "requested_trusted": True,
+    }
+    transaction_path = slackbot_module._slackbot_trust_transaction_path(
+        config.paths
+    )
+    slackbot_module.write_json_atomic(
+        transaction_path,
+        {
+            "version": 1,
+            "original_trust": original_trust,
+            "updated_trust": updated_trust,
+            "audit_event": audit_event,
+            "changed": True,
+            "prepared_at": slackbot_module.utcnow_iso(),
+        },
+    )
+    if state_applied:
+        slackbot_module.write_json_atomic(
+            config.paths.trust_path,
+            updated_trust,
+        )
+    audit_events = []
+    monkeypatch.setattr(
+        slackbot_module,
+        "append_slackbot_audit_event",
+        lambda config, event: audit_events.append(dict(event)),
+    )
+
+    bot = SlackSocketBot(config)
+    bot.executor.shutdown(wait=False)
+
+    assert [event["status"] for event in audit_events] == [expected_status]
+    assert audit_events[0]["recovered"] is True
+    assert not transaction_path.exists()
+    trusted_channels = read_slackbot_trust(config.paths)[
+        "trusted_channel_ids"
+    ]
+    assert ("C777" in trusted_channels) is state_applied
+
+
+def test_prepared_unchanged_trust_transaction_recovers_as_failed(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    trust = read_slackbot_trust(config.paths)
+    transaction_path = slackbot_module._slackbot_trust_transaction_path(
+        config.paths
+    )
+    slackbot_module.write_json_atomic(
+        transaction_path,
+        {
+            "version": 2,
+            "phase": "prepared",
+            "original_trust": trust,
+            "updated_trust": trust,
+            "audit_event": {
+                "kind": "slackbot_control",
+                "command": "revoke-channel",
+                "audit_id": "audit-transaction-noop",
+            },
+            "changed": False,
+            "prepared_at": slackbot_module.utcnow_iso(),
+        },
+    )
+    audit_events = []
+    monkeypatch.setattr(
+        slackbot_module,
+        "append_slackbot_audit_event",
+        lambda config, event: audit_events.append(dict(event)),
+    )
+
+    assert slackbot_module.recover_slackbot_trust_transaction(config)
+
+    assert audit_events[0]["status"] == "failed"
+    assert "started audit" in audit_events[0]["error"]
+    assert not transaction_path.exists()
+
+
+def test_channel_trust_transaction_rejects_symlink(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    target = tmp_path / "trust-transaction-target.json"
+    target.write_text("{}", encoding="utf-8")
+    transaction_path = slackbot_module._slackbot_trust_transaction_path(
+        config.paths
+    )
+    transaction_path.parent.mkdir(parents=True, exist_ok=True)
+    transaction_path.symlink_to(target)
+
+    with pytest.raises(SlackbotError, match="Cannot open"):
+        SlackSocketBot(config)
+
+    assert target.read_text(encoding="utf-8") == "{}"
 
 
 def test_diag_command_dms_public_details(tmp_path, monkeypatch):
@@ -10286,6 +14147,27 @@ def test_effective_codex_policy_and_rendering(tmp_path):
     assert "yolo-style" in rendered
 
 
+def test_audit_codex_policy_omits_argument_and_url_values(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = replace(
+        load_config(profile),
+        codex_extra_args=("--config", "api_token=generic-secret"),
+        mcp_server_url=(
+            "https://user:password@example.com/mcp?token=generic-secret"
+        ),
+    )
+
+    policy = slackbot_module.audit_codex_policy(config)
+    serialized = json.dumps(policy)
+
+    assert policy["codex_extra_arg_count"] == 2
+    assert policy["mcp_server_configured"] is True
+    assert "generic-secret" not in serialized
+    assert "password" not in serialized
+    assert "example.com" not in serialized
+
+
 def test_append_slackbot_audit_event_writes_private_jsonl(tmp_path):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
@@ -10298,6 +14180,7 @@ def test_append_slackbot_audit_event_writes_private_jsonl(tmp_path):
             "value": 1,
             "SLACK_BOT_TOKEN": "xoxb-secret-token",
             "message": "Bearer abcdef ghp_secret sk-secret",
+            "set_values": {"plain", "Bearer nested-secret"},
         },
     )
 
@@ -10307,7 +14190,373 @@ def test_append_slackbot_audit_event_writes_private_jsonl(tmp_path):
     assert record["app_slug"] == "sample"
     assert record["SLACK_BOT_TOKEN"] == "***"
     assert record["message"] == "Bearer *** ghp_*** sk-***"
+    assert record["set_values"] == ["Bearer ***", "plain"]
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_json_atomic_fsyncs_file_and_parent(tmp_path, monkeypatch):
+    path = tmp_path / "state.json"
+    fsync_targets = []
+    original_fsync = slackbot_module.os.fsync
+
+    def record_fsync(fd):
+        fsync_targets.append(
+            "directory"
+            if slackbot_module.stat.S_ISDIR(os.fstat(fd).st_mode)
+            else "file"
+        )
+        original_fsync(fd)
+
+    monkeypatch.setattr(slackbot_module.os, "fsync", record_fsync)
+
+    slackbot_module.write_json_atomic(path, {"value": 1})
+
+    assert fsync_targets == ["file", "directory"]
+    assert read_json(path, {}) == {"value": 1}
+
+
+def test_append_slackbot_audit_event_fsyncs_file_and_parent(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    fsync_targets = []
+    original_fsync = slackbot_module.os.fsync
+
+    def record_fsync(fd):
+        fsync_targets.append(
+            "directory"
+            if slackbot_module.stat.S_ISDIR(os.fstat(fd).st_mode)
+            else "file"
+        )
+        original_fsync(fd)
+
+    monkeypatch.setattr(slackbot_module.os, "fsync", record_fsync)
+
+    append_slackbot_audit_event(config, {"kind": "test"})
+
+    assert fsync_targets == ["file", "directory"]
+
+
+def test_append_slackbot_audit_event_uses_one_write_for_large_record(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    write_sizes = []
+    original_write = slackbot_module.os.write
+
+    def record_write(fd, data):
+        write_sizes.append(len(data))
+        return original_write(fd, data)
+
+    monkeypatch.setattr(slackbot_module.os, "write", record_write)
+
+    append_slackbot_audit_event(
+        config,
+        {"kind": "large-test", "message": "x" * 20_000},
+    )
+
+    assert len(write_sizes) == 1
+    assert write_sizes[0] > 8_192
+    record = json.loads(Path(config.paths.audit_path).read_text())
+    assert record["kind"] == "large-test"
+
+
+def test_append_slackbot_audit_event_completes_short_writes(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    writes = []
+    original_write = slackbot_module.os.write
+
+    def short_write(fd, data):
+        chunk_size = max(1, len(data) // 2)
+        writes.append(chunk_size)
+        return original_write(fd, data[:chunk_size])
+
+    monkeypatch.setattr(slackbot_module.os, "write", short_write)
+
+    append_slackbot_audit_event(
+        config,
+        {"kind": "short-write-test", "message": "x" * 20_000},
+    )
+
+    assert len(writes) > 1
+    record = json.loads(Path(config.paths.audit_path).read_text())
+    assert record["kind"] == "short-write-test"
+
+
+def test_append_slackbot_audit_event_rolls_back_failed_short_write(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    append_slackbot_audit_event(config, {"kind": "baseline"})
+    audit_path = Path(config.paths.audit_path)
+    baseline = audit_path.read_bytes()
+    original_write = slackbot_module.os.write
+    calls = 0
+
+    def partial_then_fail(fd, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            chunk_size = max(1, len(data) // 2)
+            return original_write(fd, data[:chunk_size])
+        raise OSError("injected audit write failure")
+
+    monkeypatch.setattr(slackbot_module.os, "write", partial_then_fail)
+
+    with pytest.raises(OSError, match="injected audit write failure"):
+        append_slackbot_audit_event(
+            config,
+            {"kind": "failed-short-write", "message": "x" * 20_000},
+        )
+
+    assert calls == 2
+    assert audit_path.read_bytes() == baseline
+
+
+@pytest.mark.parametrize(
+    "missing_control",
+    ("O_NOFOLLOW", "O_NONBLOCK", "O_DIRECTORY"),
+)
+def test_append_slackbot_audit_event_requires_posix_controls(
+    tmp_path,
+    monkeypatch,
+    missing_control,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    monkeypatch.delattr(slackbot_module.os, missing_control)
+
+    with pytest.raises(SlackbotError, match="requires POSIX file controls"):
+        append_slackbot_audit_event(config, {"kind": "test"})
+
+
+def test_append_slackbot_audit_event_requires_fcntl(tmp_path, monkeypatch):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    monkeypatch.setattr(slackbot_module, "fcntl", None)
+
+    with pytest.raises(SlackbotError, match="requires POSIX file controls"):
+        append_slackbot_audit_event(config, {"kind": "test"})
+
+
+def test_append_slackbot_audit_event_resolves_parent_symlink(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    linked_parent = tmp_path / "linked-audit-parent"
+    linked_parent.symlink_to(redirected, target_is_directory=True)
+    config = replace(
+        config,
+        paths=replace(
+            config.paths,
+            state_dir=str(linked_parent),
+            audit_path=str(linked_parent / "audit.jsonl"),
+        ),
+    )
+
+    append_slackbot_audit_event(config, {"kind": "test"})
+
+    record = json.loads(
+        (redirected / "audit.jsonl").read_text(encoding="utf-8")
+    )
+    assert record["kind"] == "test"
+
+
+def test_append_slackbot_audit_event_rejects_writable_parent(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    writable_parent = tmp_path / "writable-audit-parent"
+    writable_parent.mkdir()
+    writable_parent.chmod(0o777)
+    config = replace(
+        config,
+        paths=replace(
+            config.paths,
+            state_dir=str(writable_parent),
+            audit_path=str(writable_parent / "audit.jsonl"),
+        ),
+    )
+
+    with pytest.raises(SlackbotError, match="writable by another user"):
+        append_slackbot_audit_event(config, {"kind": "test"})
+
+    assert not (writable_parent / "audit.jsonl").exists()
+
+
+def test_append_slackbot_audit_event_rejects_group_writable_parent(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    group_parent = tmp_path / "group-audit-parent"
+    group_parent.mkdir()
+    group_parent.chmod(0o770)
+    config = replace(
+        config,
+        paths=replace(
+            config.paths,
+            state_dir=str(group_parent),
+            audit_path=str(group_parent / "audit.jsonl"),
+        ),
+    )
+
+    with pytest.raises(SlackbotError, match="another group member"):
+        append_slackbot_audit_event(config, {"kind": "test"})
+
+    assert not (group_parent / "audit.jsonl").exists()
+
+
+def test_append_slackbot_audit_event_allows_writable_ancestor_above_state(
+    tmp_path,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    shared_parent = tmp_path / "shared-parent"
+    shared_parent.mkdir()
+    shared_parent.chmod(0o770)
+    private_state = shared_parent / "state"
+    private_state.mkdir(mode=0o700)
+    config = replace(
+        config,
+        paths=replace(
+            config.paths,
+            state_dir=str(private_state),
+            audit_path=str(private_state / "audit.jsonl"),
+        ),
+    )
+
+    append_slackbot_audit_event(config, {"kind": "test"})
+
+    assert (private_state / "audit.jsonl").exists()
+
+
+def test_append_slackbot_audit_event_rejects_symlink(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    target = tmp_path / "audit-target.jsonl"
+    target.write_text("do not change\n", encoding="utf-8")
+    audit_path = Path(config.paths.audit_path)
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.symlink_to(target)
+
+    with pytest.raises(OSError):
+        append_slackbot_audit_event(config, {"kind": "test"})
+
+    assert target.read_text(encoding="utf-8") == "do not change\n"
+
+
+def test_append_slackbot_audit_event_uses_effective_uid(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    effective_uid = os.geteuid()
+    monkeypatch.setattr(
+        slackbot_module.os, "getuid", lambda: effective_uid + 1
+    )
+    monkeypatch.setattr(slackbot_module.os, "geteuid", lambda: effective_uid)
+
+    append_slackbot_audit_event(config, {"kind": "test"})
+
+    assert Path(config.paths.audit_path).exists()
+
+
+def test_append_slackbot_audit_event_rejects_owner_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    audit_path = Path(config.paths.audit_path)
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text("do not change\n", encoding="utf-8")
+    monkeypatch.setattr(
+        slackbot_module.os,
+        "geteuid",
+        lambda: audit_path.stat().st_uid + 1,
+    )
+
+    with pytest.raises(SlackbotError, match="not owned"):
+        append_slackbot_audit_event(config, {"kind": "test"})
+
+    assert audit_path.read_text(encoding="utf-8") == "do not change\n"
+
+
+def test_append_slackbot_audit_event_rejects_hard_link(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    target = tmp_path / "audit-target.jsonl"
+    target.write_text("do not change\n", encoding="utf-8")
+    target.chmod(0o640)
+    audit_path = Path(config.paths.audit_path)
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    os.link(target, audit_path)
+
+    with pytest.raises(SlackbotError, match="exactly one link"):
+        append_slackbot_audit_event(config, {"kind": "test"})
+
+    assert target.read_text(encoding="utf-8") == "do not change\n"
+    assert target.stat().st_mode & 0o777 == 0o640
+
+
+def test_append_slackbot_audit_event_rejects_fifo_without_blocking(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    audit_path = Path(config.paths.audit_path)
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(audit_path)
+
+    with pytest.raises((OSError, SlackbotError)):
+        append_slackbot_audit_event(config, {"kind": "test"})
+
+
+def test_best_effort_audit_ignores_output_callback_failure(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    monkeypatch.setattr(
+        slackbot_module,
+        "append_slackbot_audit_event",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("audit disk error")
+        ),
+    )
+
+    slackbot_module._append_slackbot_audit_event_best_effort(
+        config,
+        {"kind": "test"},
+        out=lambda message: (_ for _ in ()).throw(
+            RuntimeError("output callback error")
+        ),
+    )
 
 
 def test_resolve_slack_mentions_uses_users_info(tmp_path, monkeypatch):
@@ -10652,6 +14901,66 @@ def test_notification_only_recipient_skips_general_dm_handlers(
 
     assert general_calls == []
     assert mirrored == [text]
+
+
+@pytest.mark.parametrize("normally_authorized", (False, True))
+def test_corrupt_agent_state_fails_soft_for_dm_classification(
+    tmp_path,
+    monkeypatch,
+    normally_authorized,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    allowed_user_id = "U111" if normally_authorized else "U222"
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n"
+        + f"SAMPLE_SLACKBOT_ALLOWED_DM_USER_IDS={allowed_user_id}\n",
+        encoding="utf-8",
+    )
+    config = load_config(profile)
+    hook_state_path = Path(
+        slackbot_module.agent_codex_hook_state_path(config.paths)
+    )
+    hook_state_path.parent.mkdir(parents=True, exist_ok=True)
+    hook_state_path.write_text("[]", encoding="utf-8")
+    bindings_path = Path(config.paths.agent_tmux_bindings_path)
+    bindings_path.parent.mkdir(parents=True, exist_ok=True)
+    bindings_path.write_bytes(b"\xff")
+    bot = SlackSocketBot(config)
+    dispatched = []
+    denied = []
+    monkeypatch.setattr(
+        bot,
+        "_run_codex_for_route",
+        lambda text, route, **kwargs: dispatched.append((text, route)),
+    )
+    monkeypatch.setattr(
+        bot,
+        "_post_unauthorized",
+        lambda route: denied.append(route),
+    )
+
+    bot._handle_event(
+        {
+            "type": "message",
+            "channel_type": "im",
+            "user": "U111",
+            "channel": "D111",
+            "thread_ts": "1.000001",
+            "ts": "2.000001",
+            "text": "please handle this normally",
+        }
+    )
+
+    if normally_authorized:
+        assert dispatched[0][0] == "please handle this normally"
+        assert denied == []
+    else:
+        assert dispatched == []
+        assert len(denied) == 1
 
 
 @pytest.mark.parametrize(

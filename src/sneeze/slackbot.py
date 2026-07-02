@@ -9,6 +9,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,10 @@ class CodexHookRetryableError(SlackbotError):
 
 
 class TmuxPaneMismatchError(SlackbotError):
+    pass
+
+
+class AgentTmuxStateError(SlackbotError):
     pass
 
 
@@ -132,21 +137,45 @@ AGENT_TMUX_BINDING_KEYS = (
     "tmux_pane",
     *AGENT_TMUX_PANE_IDENTITY_KEYS,
 )
+AGENT_TMUX_ROUTE_TOMBSTONE_MAX_AGE_SECONDS = 30 * 86400.0
+AGENT_TMUX_ROUTE_TOMBSTONE_MAX_ENTRIES = 4096
 AGENT_CODEX_HOOK_STATE_FILENAME = "agent-codex-hooks.json"
 AGENT_CODEX_HOOK_NOTIFY_USER_KEY = "AGENT_NOTIFY_SLACK_USER_ID"
 AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS = 10.0
 AGENT_CODEX_HOOK_DELIVERY_LOCK_BUCKETS = 4096
 AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS = 120.0
+AGENT_CODEX_HOOK_AMBIGUOUS_DELIVERY_SECONDS = 86400.0
 AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS = 600.0
 AGENT_CODEX_HOOK_COMMAND_TIMEOUT_SECONDS = 150
 AGENT_CODEX_HOOK_SLACK_REQUEST_TIMEOUT_SECONDS = 2.0
 AGENT_CODEX_HOOK_SLACK_REQUEST_ATTEMPTS = 2
 AGENT_CODEX_HOOK_SLACK_RETRY_DELAY_SECONDS = 1.0
 AGENT_CODEX_HOOK_SLACK_TOTAL_TIMEOUT_SECONDS = 20.0
-AGENT_CODEX_HOOK_COMMAND_MARKERS = (
-    "slackbot-agent-stop-hook",
-    "webmux-agent-status.js",
+DEFINITIVE_SLACK_API_ERRORS = frozenset(
+    {
+        "account_inactive",
+        "channel_not_found",
+        "invalid_arguments",
+        "invalid_arg_name",
+        "invalid_array_arg",
+        "invalid_auth",
+        "invalid_charset",
+        "invalid_form_data",
+        "invalid_post_type",
+        "is_archived",
+        "missing_scope",
+        "msg_too_long",
+        "no_permission",
+        "no_text",
+        "not_authed",
+        "restricted_action",
+        "restricted_action_read_only_channel",
+        "token_revoked",
+    }
 )
+AGENT_CODEX_HOOK_STOP_SUBCOMMAND = "slackbot-agent-stop-hook"
+AGENT_CODEX_HOOK_WEBMUX_SCRIPT = "webmux-agent-status.js"
+AGENT_CODEX_HOOK_SLACK_STATUS_MESSAGE = "Notifying Slack"
 AGENT_CODEX_HOOK_WEBMUX_STATUS_MESSAGE = "Updating WebMux agent status"
 SLACK_API_REQUEST_POLICY: ContextVar[dict[str, float | int] | None] = (
     ContextVar("slack_api_request_policy", default=None)
@@ -162,6 +191,12 @@ SLACK_SINGLE_MESSAGE_MRKDWN: ContextVar[bool | None] = ContextVar(
 SLACK_CLIENT_MSG_ID: ContextVar[str | None] = ContextVar(
     "slack_client_msg_id",
     default=None,
+)
+SLACK_DELIVERY_STAGE_CALLBACK: ContextVar[Callable[[str], None] | None] = (
+    ContextVar(
+        "slack_delivery_stage_callback",
+        default=None,
+    )
 )
 USER_CONFIG_MODAL_CALLBACK_ID = "sneeze_user_config"
 USER_CONFIG_OPEN_ACTION_ID = "sneeze_open_user_config"
@@ -467,6 +502,10 @@ def utcnow_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
+def _utcnow_precise_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
 def service_manager_kind() -> str:
     return "launchd" if sys.platform == "darwin" else "systemd"
 
@@ -662,6 +701,18 @@ def write_json(
     write_text(path, json.dumps(value, indent=2, sort_keys=True) + "\n", mode)
 
 
+def _fsync_parent_directory(path: str | Path) -> None:
+    parent = Path(path).expanduser().parent
+    directory_fd = os.open(
+        parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def write_json_atomic(
     path: str | Path,
     value: Any,
@@ -670,9 +721,36 @@ def write_json_atomic(
     target = Path(path).expanduser()
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp_path = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
-    write_json(tmp_path, value, mode=mode)
-    os.replace(tmp_path, target)
-    target.chmod(mode)
+    encoded = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    fd = None
+    try:
+        fd = os.open(
+            tmp_path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            mode,
+        )
+        os.fchmod(fd, mode)
+        view = memoryview(encoded)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("failed to write atomic JSON payload")
+            view = view[written:]
+        os.fsync(fd)
+        completed_fd = fd
+        fd = None
+        os.close(completed_fd)
+        os.replace(tmp_path, target)
+        _fsync_parent_directory(target)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        tmp_path.unlink(missing_ok=True)
 
 
 def child_process_env(config: SlackbotConfig) -> dict[str, str]:
@@ -779,6 +857,30 @@ def read_json(path: str | Path, default: Any) -> Any:
         return default
 
 
+def _read_agent_tmux_bindings(path: str | Path) -> dict[str, Any]:
+    target = Path(path).expanduser()
+    try:
+        text = target.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SlackbotError(
+            f"Cannot read agent tmux bindings at {target}: {exc}"
+        ) from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SlackbotError(
+            f"Cannot parse agent tmux bindings at {target}: {exc}"
+        ) from exc
+    if not isinstance(data, dict) or any(
+        not isinstance(key, str) or not isinstance(value, dict)
+        for key, value in data.items()
+    ):
+        raise SlackbotError(f"Invalid agent tmux bindings object at {target}")
+    return data
+
+
 @contextmanager
 def locked_json_path(path: str | Path):
     target = Path(path).expanduser()
@@ -787,6 +889,21 @@ def locked_json_path(path: str | Path):
     with lock_path.open("a", encoding="utf-8") as handle:
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def shared_locked_json_path(path: str | Path):
+    target = Path(path).expanduser()
+    lock_path = target.with_suffix(target.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a", encoding="utf-8") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
         try:
             yield
         finally:
@@ -1552,6 +1669,11 @@ def redact_secret_value(value: Any, *, key: str | None = None) -> Any:
         return [redact_secret_value(item) for item in value]
     if isinstance(value, tuple):
         return tuple(redact_secret_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return [
+            redact_secret_value(item)
+            for item in sorted(value, key=lambda item: str(item))
+        ]
     return value
 
 
@@ -1565,6 +1687,22 @@ def read_slackbot_trust(paths: SlackbotPaths) -> dict[str, Any]:
     }
 
 
+def _slackbot_trust_transaction_path(paths: SlackbotPaths) -> Path:
+    target = Path(paths.trust_path)
+    return target.with_suffix(target.suffix + ".transaction.json")
+
+
+def _require_no_pending_slackbot_trust_transaction(
+    paths: SlackbotPaths,
+) -> None:
+    transaction_path = _slackbot_trust_transaction_path(paths)
+    if os.path.lexists(transaction_path):
+        raise SlackbotError(
+            "A pending Slackbot trust transaction must be recovered before "
+            f"trust state can be changed: {transaction_path}"
+        )
+
+
 def write_slackbot_trust(paths: SlackbotPaths, data: dict[str, Any]) -> None:
     trusted = {
         "trusted_channel_ids": sorted(
@@ -1575,6 +1713,7 @@ def write_slackbot_trust(paths: SlackbotPaths, data: dict[str, Any]) -> None:
         ),
     }
     with locked_json_path(paths.trust_path):
+        _require_no_pending_slackbot_trust_transaction(paths)
         write_json_atomic(paths.trust_path, trusted)
 
 
@@ -1583,6 +1722,7 @@ def trust_slack_channel(paths: SlackbotPaths, channel_id: str) -> bool:
     if not channel_id:
         raise SlackbotError("Slack channel ID is required")
     with locked_json_path(paths.trust_path):
+        _require_no_pending_slackbot_trust_transaction(paths)
         data = read_slackbot_trust(paths)
         channels = set(data["trusted_channel_ids"])
         changed = channel_id not in channels
@@ -1597,6 +1737,7 @@ def untrust_slack_channel(paths: SlackbotPaths, channel_id: str) -> bool:
     if not channel_id:
         raise SlackbotError("Slack channel ID is required")
     with locked_json_path(paths.trust_path):
+        _require_no_pending_slackbot_trust_transaction(paths)
         data = read_slackbot_trust(paths)
         channels = set(data["trusted_channel_ids"])
         changed = channel_id in channels
@@ -1604,6 +1745,154 @@ def untrust_slack_channel(paths: SlackbotPaths, channel_id: str) -> bool:
         data["trusted_channel_ids"] = sorted(channels)
         write_json_atomic(paths.trust_path, data)
         return changed
+
+
+def _read_slackbot_trust_transaction(
+    paths: SlackbotPaths,
+) -> dict[str, Any] | None:
+    target = _slackbot_trust_transaction_path(paths)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    get_effective_uid = getattr(os, "geteuid", None) or getattr(
+        os,
+        "getuid",
+        None,
+    )
+    if nofollow is None or nonblock is None or get_effective_uid is None:
+        raise SlackbotError(
+            "secure Slackbot trust recovery requires POSIX file controls"
+        )
+    fd = None
+    try:
+        fd = os.open(target, os.O_RDONLY | nonblock | nofollow)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SlackbotError(
+            f"Cannot open Slackbot trust transaction {target}: {exc}"
+        ) from exc
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SlackbotError(
+                f"Slackbot trust transaction is not a regular file: {target}"
+            )
+        if metadata.st_uid != get_effective_uid():
+            raise SlackbotError(
+                "Slackbot trust transaction is not owned by the current "
+                f"user: {target}"
+            )
+        if metadata.st_nlink != 1:
+            raise SlackbotError(
+                "Slackbot trust transaction must have exactly one link: "
+                f"{target}"
+            )
+        os.set_blocking(fd, True)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = None
+            transaction = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SlackbotError(
+            f"Cannot recover Slackbot trust transaction {target}: {exc}"
+        ) from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if not isinstance(transaction, dict) or transaction.get(
+        "version"
+    ) not in {
+        1,
+        2,
+    }:
+        raise SlackbotError(f"Invalid Slackbot trust transaction at {target}")
+    for key in ("original_trust", "updated_trust", "audit_event"):
+        if not isinstance(transaction.get(key), dict):
+            raise SlackbotError(
+                f"Invalid Slackbot trust transaction field {key} at {target}"
+            )
+    if not isinstance(transaction.get("changed"), bool):
+        raise SlackbotError(
+            f"Invalid Slackbot trust transaction changed flag at {target}"
+        )
+    transaction = dict(transaction)
+    if transaction["version"] == 1:
+        transaction["phase"] = "started"
+    elif transaction.get("phase") not in {
+        "prepared",
+        "started",
+        "state_committed",
+    }:
+        raise SlackbotError(
+            f"Invalid Slackbot trust transaction phase at {target}"
+        )
+    audit_event = transaction["audit_event"]
+    if (
+        audit_event.get("kind") != "slackbot_control"
+        or audit_event.get("command")
+        not in {"allow-channel", "revoke-channel"}
+        or not str(audit_event.get("audit_id") or "").strip()
+    ):
+        raise SlackbotError(
+            f"Invalid Slackbot trust transaction audit event at {target}"
+        )
+    return transaction
+
+
+def _remove_slackbot_trust_transaction(paths: SlackbotPaths) -> None:
+    target = _slackbot_trust_transaction_path(paths)
+    target.unlink(missing_ok=True)
+    _fsync_parent_directory(target)
+
+
+def _recover_slackbot_trust_transaction_locked(
+    config: SlackbotConfig,
+) -> bool:
+    transaction = _read_slackbot_trust_transaction(config.paths)
+    if transaction is None:
+        return False
+    current_trust = read_slackbot_trust(config.paths)
+    original_trust = transaction["original_trust"]
+    updated_trust = transaction["updated_trust"]
+    changed = transaction["changed"]
+    audit_event = transaction["audit_event"]
+    phase = transaction["phase"]
+    if phase == "prepared" and current_trust == original_trust:
+        status = "failed"
+        error = "interrupted before started audit confirmation"
+    elif current_trust == updated_trust:
+        status = "completed"
+        error = None
+    elif changed and current_trust == original_trust:
+        if phase == "state_committed":
+            raise SlackbotError(
+                "Slackbot trust state was rolled back after its transaction "
+                "was committed"
+            )
+        status = "failed"
+        error = "interrupted before trust state commit"
+    else:
+        raise SlackbotError(
+            "Slackbot trust state does not match its pending transaction"
+        )
+    append_slackbot_audit_event(
+        config,
+        {
+            **audit_event,
+            "status": status,
+            "changed": changed,
+            "recovered": True,
+            "error": error,
+        },
+    )
+    _remove_slackbot_trust_transaction(config.paths)
+    return True
+
+
+def recover_slackbot_trust_transaction(config: SlackbotConfig) -> bool:
+    if not os.path.lexists(_slackbot_trust_transaction_path(config.paths)):
+        return False
+    with locked_json_path(config.paths.trust_path):
+        return _recover_slackbot_trust_transaction_locked(config)
 
 
 def slackbot_admin_user_ids(config: SlackbotConfig) -> tuple[str, ...]:
@@ -1705,6 +1994,22 @@ def effective_codex_policy(config: SlackbotConfig) -> dict[str, Any]:
     }
 
 
+def audit_codex_policy(config: SlackbotConfig) -> dict[str, Any]:
+    return {
+        "execution_mode": config.execution_mode,
+        "codex_mode": config.codex_mode,
+        "codex_model_configured": bool(config.codex_model),
+        "codex_profile_configured": bool(config.codex_profile),
+        "codex_extra_arg_count": len(config.codex_extra_args),
+        "codex_tmux_lifecycle": config.codex_tmux_lifecycle,
+        "mcp_server_configured": bool(config.mcp_server_url),
+        "danger_full_access": config.codex_mode == "danger-full-access",
+        "approval_policy": (
+            "bypass" if config.codex_mode == "danger-full-access" else ""
+        ),
+    }
+
+
 def render_effective_codex_policy(config: SlackbotConfig) -> str:
     policy = effective_codex_policy(config)
     lines = [
@@ -1739,6 +2044,106 @@ def render_effective_codex_policy(config: SlackbotConfig) -> str:
     return "\n".join(lines)
 
 
+def _validate_slackbot_audit_directory(
+    directory_fd: int,
+    directory_path: Path,
+    *,
+    effective_uid: int,
+    protect_from_writes: bool,
+) -> None:
+    metadata = os.fstat(directory_fd)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SlackbotError(
+            f"Slackbot audit parent is not a directory: {directory_path}"
+        )
+    if metadata.st_uid not in {0, effective_uid}:
+        raise SlackbotError(
+            "Slackbot audit parent is not owned by root or the current "
+            f"user: {directory_path}"
+        )
+    group_writable = bool(metadata.st_mode & stat.S_IWGRP)
+    world_writable = bool(metadata.st_mode & stat.S_IWOTH)
+    if protect_from_writes and world_writable:
+        raise SlackbotError(
+            "Slackbot audit parent is writable by another user: "
+            f"{directory_path}"
+        )
+    if protect_from_writes and group_writable:
+        raise SlackbotError(
+            "Slackbot audit parent is writable by another group member: "
+            f"{directory_path}"
+        )
+
+
+def _open_slackbot_audit_parent(
+    path: str | Path,
+    *,
+    effective_uid: int,
+    secure_root: str | Path,
+) -> tuple[Path, int]:
+    absolute_target = Path(
+        os.path.abspath(os.fspath(Path(path).expanduser()))
+    )
+    target = Path(os.path.realpath(absolute_target.parent)) / (
+        absolute_target.name
+    )
+    private_root = Path(
+        os.path.realpath(
+            os.path.abspath(os.fspath(Path(secure_root).expanduser()))
+        )
+    )
+    try:
+        target.parent.relative_to(private_root)
+    except ValueError as exc:
+        raise SlackbotError(
+            "Slackbot audit path must be inside the Slackbot state "
+            f"directory: {target}"
+        ) from exc
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise SlackbotError(
+            "secure Slackbot auditing requires POSIX file controls"
+        )
+    flags = os.O_RDONLY | directory | nofollow | getattr(os, "O_CLOEXEC", 0)
+    current_path = Path(target.anchor)
+    current_fd = os.open(target.anchor, flags)
+    try:
+        _validate_slackbot_audit_directory(
+            current_fd,
+            current_path,
+            effective_uid=effective_uid,
+            protect_from_writes=current_path == private_root,
+        )
+        for component in target.parent.parts[1:]:
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            next_path = current_path / component
+            try:
+                _validate_slackbot_audit_directory(
+                    next_fd,
+                    next_path,
+                    effective_uid=effective_uid,
+                    protect_from_writes=(
+                        next_path == private_root
+                        or private_root in next_path.parents
+                    ),
+                )
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+            current_path = next_path
+        return target, current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
 def append_slackbot_audit_event(
     config: SlackbotConfig,
     event: dict[str, Any],
@@ -1747,12 +2152,98 @@ def append_slackbot_audit_event(
     record.setdefault("created_at", utcnow_iso())
     record.setdefault("app_slug", config.profile.app_slug)
     text = json.dumps(record, sort_keys=True, default=str) + "\n"
-    path = Path(config.paths.audit_path)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8", newline="\n") as handle:
-        handle.write(text)
-    path.chmod(0o600)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    get_effective_uid = getattr(os, "geteuid", None) or getattr(
+        os,
+        "getuid",
+        None,
+    )
+    if (
+        nofollow is None
+        or nonblock is None
+        or directory is None
+        or get_effective_uid is None
+        or fcntl is None
+    ):
+        raise SlackbotError(
+            "secure Slackbot auditing requires POSIX file controls"
+        )
+    effective_uid = get_effective_uid()
+    path, parent_fd = _open_slackbot_audit_parent(
+        config.paths.audit_path,
+        effective_uid=effective_uid,
+        secure_root=config.paths.state_dir,
+    )
+    fd = None
+    try:
+        fd = os.open(
+            path.name,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | nofollow | nonblock,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SlackbotError(
+                f"Slackbot audit target is not a regular file: {path}"
+            )
+        if metadata.st_uid != effective_uid:
+            raise SlackbotError(
+                "Slackbot audit target is not owned by the current user: "
+                f"{path}"
+            )
+        if metadata.st_nlink != 1:
+            raise SlackbotError(
+                f"Slackbot audit target must have exactly one link: {path}"
+            )
+        os.set_blocking(fd, True)
+        os.fchmod(fd, 0o600)
+        encoded = text.encode("utf-8")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            original_size = os.fstat(fd).st_size
+            try:
+                offset = 0
+                while offset < len(encoded):
+                    written = os.write(fd, encoded[offset:])
+                    if written <= 0:
+                        raise OSError("Slackbot audit write made no progress")
+                    offset += written
+                os.fsync(fd)
+                os.fsync(parent_fd)
+            except BaseException as exc:
+                try:
+                    os.ftruncate(fd, original_size)
+                    os.fsync(fd)
+                except OSError as rollback_exc:
+                    raise SlackbotError(
+                        "Slackbot audit write failed and could not be rolled "
+                        f"back: {rollback_exc}"
+                    ) from exc
+                raise
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent_fd)
+
+
+def _append_slackbot_audit_event_best_effort(
+    config: SlackbotConfig,
+    event: dict[str, Any],
+    *,
+    out: Callable[[str], None] | None = None,
+) -> None:
+    try:
+        append_slackbot_audit_event(config, event)
+    except Exception as exc:
+        try:
+            emit(out, f"Failed to append Slackbot audit event: {exc}")
+        except Exception:
+            pass
 
 
 def _diagnostic_result(
@@ -2146,6 +2637,23 @@ def slack_single_message_policy(
         SLACK_SINGLE_MESSAGE_MAX_CHARS.reset(max_chars_token)
 
 
+@contextmanager
+def slack_delivery_stage_policy(
+    callback: Callable[[str], None] | None,
+):
+    token = SLACK_DELIVERY_STAGE_CALLBACK.set(callback)
+    try:
+        yield
+    finally:
+        SLACK_DELIVERY_STAGE_CALLBACK.reset(token)
+
+
+def _mark_slack_delivery_stage(stage: str) -> None:
+    callback = SLACK_DELIVERY_STAGE_CALLBACK.get()
+    if callback is not None:
+        callback(stage)
+
+
 def slack_api_post(
     token: str,
     method: str,
@@ -2251,6 +2759,22 @@ def slack_api_post(
     if not result.get("ok"):
         raise SlackApiError(method, result)
     return result
+
+
+def _slack_post_failure_is_definitive(exc: Exception) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, SlackApiError):
+            return current.error in DEFINITIVE_SLACK_API_ERRORS
+        if isinstance(current, urllib.error.HTTPError):
+            return 400 <= current.code < 500 and current.code not in {
+                408,
+                409,
+                425,
+                429,
+            }
+        current = current.__cause__
+    return False
 
 
 def _slack_form_value(value: Any) -> str:
@@ -2461,6 +2985,7 @@ def _post_single_slack_message(
 ) -> dict[str, Any] | None:
     channel = route.channel_id
     if not channel and route.dm_user_id:
+        _mark_slack_delivery_stage("pending")
         opened = slack_api_post(
             config.bot_token,
             "conversations.open",
@@ -2489,16 +3014,19 @@ def _post_single_slack_message(
         payload["blocks"] = render_slack_blocks(blocks)
     if route.thread_ts:
         payload["thread_ts"] = route.thread_ts
+    _mark_slack_delivery_stage("posting")
     try:
         return slack_api_post(config.bot_token, "chat.postMessage", payload)
     except SlackApiError as exc:
         if exc.error != "not_in_channel":
             raise
+        _mark_slack_delivery_stage("pending")
         slack_api_post(
             config.bot_token,
             "conversations.join",
             {"channel": channel},
         )
+        _mark_slack_delivery_stage("posting")
         return slack_api_post(config.bot_token, "chat.postMessage", payload)
 
 
@@ -4408,6 +4936,13 @@ def safe_tmux_session_name(value: str) -> str:
     return candidate[:120]
 
 
+def normalize_tmux_socket(value: str | None) -> str:
+    socket_value = str(value or "").strip()
+    if "/" not in socket_value:
+        return socket_value
+    return os.path.realpath(os.path.abspath(os.path.expanduser(socket_value)))
+
+
 def codex_tmux_bin(config: SlackbotConfig) -> str:
     value = (
         env_lookup(config.profile, config.env, "CODEX_TMUX_BIN")
@@ -4422,7 +4957,7 @@ def _configured_codex_tmux_socket(
     profile: SlackbotProfile,
     env: dict[str, str],
 ) -> str:
-    return (
+    return normalize_tmux_socket(
         env_lookup(profile, env, "CODEX_TMUX_SOCKET")
         or env_lookup(profile, env, "CONSOLE_TMUX_SOCKET")
         or profile.default_codex_tmux_socket
@@ -4451,8 +4986,7 @@ def codex_tmux_command(
 ) -> list[str]:
     command = [
         tmux_bin or codex_tmux_bin(config),
-        "-L",
-        codex_tmux_socket(config),
+        *_tmux_socket_args(codex_tmux_socket(config)),
     ]
     tmux_conf = codex_tmux_conf(config)
     if tmux_conf:
@@ -4509,7 +5043,9 @@ def tmux_command_for_binding(
     config: SlackbotConfig,
     binding: dict[str, Any],
 ) -> tuple[list[str], str, str | None]:
-    tmux_socket = str(binding.get("tmux_socket") or codex_tmux_socket(config))
+    tmux_socket = normalize_tmux_socket(
+        str(binding.get("tmux_socket") or codex_tmux_socket(config))
+    )
     tmux_conf_value = binding.get("tmux_conf")
     tmux_conf = (
         str(tmux_conf_value) if tmux_conf_value else codex_tmux_conf(config)
@@ -4518,6 +5054,92 @@ def tmux_command_for_binding(
     if tmux_conf:
         command.extend(["-f", tmux_conf])
     return command, tmux_socket, tmux_conf
+
+
+def _agent_tmux_binding_has_stable_pane_identity(
+    binding: dict[str, Any],
+) -> bool:
+    return bool(
+        str(binding.get("tmux_pane") or "").strip()
+        and all(
+            str(binding.get(key) or "").strip()
+            for key in AGENT_TMUX_PANE_IDENTITY_KEYS
+        )
+    )
+
+
+def _upgrade_legacy_agent_tmux_pane_binding(
+    config: SlackbotConfig,
+    binding: dict[str, Any],
+) -> dict[str, Any] | None:
+    channel_id = str(binding.get("channel_id") or "").strip()
+    thread_ts = str(binding.get("thread_ts") or "").strip()
+    if not channel_id or not thread_ts:
+        return None
+    key = agent_tmux_thread_key(channel_id, thread_ts)
+    with locked_agent_tmux_json_path(config.paths.agent_tmux_bindings_path):
+        data = _read_agent_tmux_bindings(
+            config.paths.agent_tmux_bindings_path
+        )
+        revision_state = _agent_tmux_binding_revision_state(
+            config.paths.agent_tmux_bindings_path,
+            data,
+        )
+        _persist_agent_tmux_tombstone_reconciliation(
+            config.paths.agent_tmux_bindings_path,
+            data,
+            revision_state,
+        )
+        current = data.get(key)
+        if not isinstance(current, dict):
+            return None
+        for field in (
+            "host",
+            "tmux_session",
+            "tmux_socket",
+            "tmux_conf",
+            "tmux_pane",
+        ):
+            if str(current.get(field) or "") != str(binding.get(field) or ""):
+                return None
+        if _agent_tmux_binding_has_stable_pane_identity(current):
+            return current
+        tmux_pane = str(current.get("tmux_pane") or "").strip()
+        tmux_session = str(current.get("tmux_session") or "").strip()
+        tmux_command, tmux_socket, tmux_conf = tmux_command_for_binding(
+            config,
+            current,
+        )
+        identity = _tmux_pane_identity(
+            tmux_command[0],
+            tmux_pane,
+            tmux_socket=tmux_socket,
+            tmux_conf=tmux_conf,
+        )
+        if (
+            not identity
+            or identity.get("tmux_session") != tmux_session
+            or identity.get("tmux_pane") != tmux_pane
+            or not _agent_tmux_binding_has_stable_pane_identity(identity)
+        ):
+            return None
+        upgraded = dict(current)
+        upgraded.update(identity)
+        upgraded["updated_at"] = _utcnow_precise_iso()
+        upgraded_revision = int(revision_state["binding_revision"]) + 1
+        upgraded["binding_revision"] = upgraded_revision
+        data[key] = upgraded
+        revision_state["binding_revision"] = upgraded_revision
+        _sync_agent_tmux_binding_revision_state(revision_state, data)
+        # This upgrade is additive, so publish the binding before its sidecar.
+        write_json_atomic(config.paths.agent_tmux_bindings_path, data)
+        write_json_atomic(
+            _agent_tmux_binding_revision_counter_path(
+                config.paths.agent_tmux_bindings_path
+            ),
+            revision_state,
+        )
+        return upgraded
 
 
 def agent_tmux_target(
@@ -4529,6 +5151,21 @@ def agent_tmux_target(
         raise SlackbotError("The tmux binding is missing a session name")
     tmux_pane = str(binding.get("tmux_pane") or "").strip()
     if tmux_pane:
+        if not _agent_tmux_binding_has_stable_pane_identity(binding):
+            upgraded_binding = _upgrade_legacy_agent_tmux_pane_binding(
+                config,
+                binding,
+            )
+            if upgraded_binding is not None:
+                binding.clear()
+                binding.update(upgraded_binding)
+            tmux_session = str(binding.get("tmux_session") or "").strip()
+            tmux_pane = str(binding.get("tmux_pane") or "").strip()
+        if not _agent_tmux_binding_has_stable_pane_identity(binding):
+            raise SlackbotError(
+                f"The bound tmux pane {tmux_pane} lacks stable identity; "
+                "refusing to target a replacement pane"
+            )
         tmux_command, tmux_socket, tmux_conf = tmux_command_for_binding(
             config,
             binding,
@@ -4536,28 +5173,16 @@ def agent_tmux_target(
         expected_identity = {
             key: str(binding.get(key) or "").strip()
             for key in AGENT_TMUX_PANE_IDENTITY_KEYS
-            if str(binding.get(key) or "").strip()
         }
-        current_identity = None
-        if expected_identity:
-            current_identity = _tmux_pane_identity(
-                tmux_command[0],
-                tmux_pane,
-                tmux_socket=tmux_socket,
-                tmux_conf=tmux_conf,
-            )
-            current_session = (
-                current_identity.get("tmux_session")
-                if current_identity
-                else None
-            )
-        else:
-            current_session = _tmux_session_from_pane(
-                tmux_command[0],
-                tmux_pane,
-                tmux_socket=tmux_socket,
-                tmux_conf=tmux_conf,
-            )
+        current_identity = _tmux_pane_identity(
+            tmux_command[0],
+            tmux_pane,
+            tmux_socket=tmux_socket,
+            tmux_conf=tmux_conf,
+        )
+        current_session = (
+            current_identity.get("tmux_session") if current_identity else None
+        )
         if current_session is None:
             raise SlackbotError(
                 f"The bound tmux pane {tmux_pane} could not be found "
@@ -4583,6 +5208,7 @@ def agent_codex_hook_state_path(paths: SlackbotPaths) -> str:
 
 
 def _tmux_socket_args(socket_name: str | None) -> list[str]:
+    socket_name = normalize_tmux_socket(socket_name)
     if not socket_name or socket_name == TMUX_DEFAULT_SERVER_SOCKET:
         return []
     if "/" in socket_name:
@@ -4605,7 +5231,8 @@ def _tmux_command(
 def _tmux_socket_path_from_env(value: str | None) -> str | None:
     if not value:
         return None
-    return value.split(",", 1)[0] or None
+    socket_path = value.split(",", 1)[0]
+    return normalize_tmux_socket(socket_path) or None
 
 
 def _tmux_session_from_pane(
@@ -4700,17 +5327,9 @@ def _resolve_tmux_pane_identity(
         tmux_socket=tmux_socket,
         tmux_conf=tmux_conf,
     )
-    if identity:
+    if identity and _agent_tmux_binding_has_stable_pane_identity(identity):
         return identity
-    session = _tmux_session_from_pane(
-        tmux_bin,
-        pane_id,
-        tmux_socket=tmux_socket,
-        tmux_conf=tmux_conf,
-    )
-    if not session:
-        return None
-    return {"tmux_session": session, "tmux_pane": pane_id}
+    return None
 
 
 def _codex_hook_tmux_pane_for_socket(
@@ -4746,7 +5365,7 @@ def resolve_codex_agent_tmux_binding(
     raise_on_pane_mismatch: bool = False,
 ) -> dict[str, str] | None:
     payload = hook_payload or {}
-    explicit_socket = (
+    explicit_socket = normalize_tmux_socket(
         tmux_socket
         or str(payload.get("tmux_socket") or "").strip()
         or os.environ.get("CODEX_TMUX_SOCKET")
@@ -4915,8 +5534,8 @@ def _agent_tmux_socket_path(value: str) -> Path | None:
         socket_root = (
             Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{uid}"
         )
-        return socket_root / value
-    return Path(value).expanduser().absolute()
+        return Path(os.path.realpath(socket_root / value))
+    return Path(normalize_tmux_socket(value))
 
 
 def _canonical_tmux_socket_identity(value: str | None) -> str:
@@ -4993,6 +5612,480 @@ def _agent_tmux_bindings_same_target(
         if left_value and right_value and left_value != right_value:
             return False
     return True
+
+
+def _agent_tmux_binding_satisfies_expected(
+    actual: dict[str, Any],
+    expected: dict[str, Any],
+    *,
+    default_socket: str | None = None,
+) -> bool:
+    if not _agent_tmux_bindings_same_target(
+        actual,
+        expected,
+        default_socket=default_socket,
+    ):
+        return False
+    for key in (
+        "tmux_session",
+        "tmux_conf",
+        "tmux_pane",
+        *AGENT_TMUX_PANE_IDENTITY_KEYS,
+    ):
+        expected_value = str(expected.get(key) or "")
+        if expected_value and str(actual.get(key) or "") != expected_value:
+            return False
+    return True
+
+
+def _agent_tmux_binding_matches_snapshot(
+    actual: Any,
+    expected: Any,
+    *,
+    default_socket: str | None = None,
+) -> bool:
+    if not isinstance(actual, dict) or not isinstance(expected, dict):
+        return False
+    if not _agent_tmux_hosts_same(
+        str(actual.get("host") or ""),
+        str(expected.get("host") or ""),
+    ):
+        return False
+    if str(actual.get("tmux_session") or "") != str(
+        expected.get("tmux_session") or ""
+    ):
+        return False
+    if not _agent_tmux_sockets_same(
+        str(actual.get("tmux_socket") or default_socket or ""),
+        str(expected.get("tmux_socket") or default_socket or ""),
+    ):
+        return False
+    for key in (
+        "tmux_conf",
+        "tmux_pane",
+        *AGENT_TMUX_PANE_IDENTITY_KEYS,
+    ):
+        if str(actual.get(key) or "") != str(expected.get(key) or ""):
+            return False
+    expected_revision = _agent_tmux_binding_revision(
+        expected.get("binding_revision")
+    )
+    return expected_revision is None or (
+        _agent_tmux_binding_revision(actual.get("binding_revision"))
+        == expected_revision
+    )
+
+
+def _agent_tmux_timestamp(value: Any) -> datetime | None:
+    try:
+        timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return timestamp if timestamp.tzinfo is not None else None
+
+
+def _agent_tmux_timestamp_precedes(value: Any, cutoff: Any) -> bool:
+    timestamp = _agent_tmux_timestamp(value)
+    cutoff_timestamp = _agent_tmux_timestamp(cutoff)
+    if timestamp is None or cutoff_timestamp is None:
+        return False
+    try:
+        return timestamp < cutoff_timestamp
+    except TypeError:
+        return False
+
+
+def _agent_tmux_binding_revision(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _agent_tmux_max_binding_revision(data: dict[str, Any]) -> int:
+    return max(
+        (
+            revision
+            for candidate in data.values()
+            if isinstance(candidate, dict)
+            and (
+                revision := _agent_tmux_binding_revision(
+                    candidate.get("binding_revision")
+                )
+            )
+            is not None
+        ),
+        default=0,
+    )
+
+
+def _agent_tmux_binding_revision_counter_path(
+    bindings_path: str | Path,
+) -> Path:
+    target = Path(bindings_path).expanduser()
+    return target.with_suffix(target.suffix + ".revision")
+
+
+def _agent_tmux_active_route_revisions(
+    data: dict[str, Any],
+) -> dict[str, int]:
+    return {
+        key: _agent_tmux_binding_revision(candidate.get("binding_revision"))
+        or 0
+        for key, candidate in data.items()
+        if isinstance(key, str) and isinstance(candidate, dict)
+    }
+
+
+def _prune_agent_tmux_route_tombstones(
+    route_tombstones: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], int]:
+    now = datetime.now(UTC)
+    retained = []
+    evicted = []
+    for key, tombstone in route_tombstones.items():
+        timestamp = _agent_tmux_timestamp(tombstone.get("updated_at"))
+        if timestamp is None:
+            evicted.append((key, tombstone))
+            continue
+        age_seconds = (now - timestamp.astimezone(UTC)).total_seconds()
+        if age_seconds > AGENT_TMUX_ROUTE_TOMBSTONE_MAX_AGE_SECONDS:
+            evicted.append((key, tombstone))
+            continue
+        retained.append((key, tombstone))
+    retained.sort(
+        key=lambda item: (
+            int(item[1]["binding_revision"]),
+            item[0],
+        ),
+        reverse=True,
+    )
+    evicted.extend(retained[AGENT_TMUX_ROUTE_TOMBSTONE_MAX_ENTRIES:])
+    eviction_revision = max(
+        (int(item[1]["binding_revision"]) for item in evicted),
+        default=0,
+    )
+    return (
+        dict(retained[:AGENT_TMUX_ROUTE_TOMBSTONE_MAX_ENTRIES]),
+        eviction_revision,
+    )
+
+
+def _sync_agent_tmux_binding_revision_state(
+    revision_state: dict[str, Any],
+    data: dict[str, Any],
+) -> None:
+    active_routes = _agent_tmux_active_route_revisions(data)
+    route_tombstones = revision_state["route_tombstones"]
+    for key in active_routes:
+        route_tombstones.pop(key, None)
+    revision_state["active_routes"] = active_routes
+    pruned_tombstones, eviction_revision = _prune_agent_tmux_route_tombstones(
+        route_tombstones
+    )
+    revision_state["route_tombstones"] = pruned_tombstones
+    revision_state["restore_floor_revision"] = max(
+        int(revision_state.get("restore_floor_revision") or 0),
+        eviction_revision,
+    )
+
+
+def _reconcile_agent_tmux_tombstoned_routes(
+    data: dict[str, Any],
+    revision_state: dict[str, Any],
+) -> bool:
+    changed = False
+    for key, tombstone in revision_state["route_tombstones"].items():
+        candidate = data.get(key)
+        if not isinstance(candidate, dict):
+            continue
+        candidate_revision = _agent_tmux_binding_revision(
+            candidate.get("binding_revision")
+        )
+        tombstone_revision = int(tombstone["binding_revision"])
+        if (
+            candidate_revision is None
+            or candidate_revision < tombstone_revision
+        ):
+            data.pop(key, None)
+            changed = True
+    return changed
+
+
+def _migrate_agent_tmux_unversioned_routes(
+    data: dict[str, Any],
+    revision_state: dict[str, Any],
+) -> bool:
+    active_routes = revision_state["active_routes"]
+    revision = int(revision_state["binding_revision"])
+    changed = False
+    for key in sorted(data):
+        candidate = data[key]
+        if (
+            not isinstance(candidate, dict)
+            or _agent_tmux_binding_revision(candidate.get("binding_revision"))
+            is not None
+            or active_routes.get(key) != 0
+            or key in revision_state["route_tombstones"]
+        ):
+            continue
+        revision += 1
+        migrated = dict(candidate)
+        migrated["binding_revision"] = revision
+        data[key] = migrated
+        changed = True
+    revision_state["binding_revision"] = revision
+    return changed
+
+
+def _persist_agent_tmux_tombstone_reconciliation(
+    bindings_path: str,
+    data: dict[str, Any],
+    revision_state: dict[str, Any],
+) -> bool:
+    revision_path = _agent_tmux_binding_revision_counter_path(bindings_path)
+    persisted_revision_state = read_json(revision_path, None)
+    migrated = _migrate_agent_tmux_unversioned_routes(data, revision_state)
+    if migrated:
+        # Migration is additive: publish stamped live routes before claiming
+        # their revisions in the sidecar so a crash cannot suppress them.
+        write_json_atomic(bindings_path, data)
+    reconciled = _reconcile_agent_tmux_tombstoned_routes(
+        data,
+        revision_state,
+    )
+    _sync_agent_tmux_binding_revision_state(revision_state, data)
+    if persisted_revision_state != revision_state:
+        # Publish suppression intent first so an interrupted bindings rewrite
+        # fails closed instead of resurrecting an older route.
+        write_json_atomic(revision_path, revision_state)
+    if reconciled:
+        write_json_atomic(bindings_path, data)
+    return migrated or reconciled
+
+
+def _agent_tmux_binding_revision_state(
+    bindings_path: str | Path,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    counter_path = _agent_tmux_binding_revision_counter_path(bindings_path)
+    persisted_revision = None
+    restore_floor_revision = 0
+    route_tombstones: dict[str, dict[str, Any]] = {}
+    active_routes: dict[str, int] | None = None
+    if counter_path.exists():
+        try:
+            counter_state = read_json(counter_path, None)
+        except UnicodeDecodeError:
+            counter_state = None
+        if counter_state is None:
+            corrupt_path = counter_path.with_name(
+                f"{counter_path.name}.corrupt.{uuid.uuid4().hex}"
+            )
+            with counter_path.open("rb") as source:
+                with corrupt_path.open("xb") as target:
+                    os.fchmod(target.fileno(), 0o600)
+                    shutil.copyfileobj(source, target)
+                    target.flush()
+                    os.fsync(target.fileno())
+            _fsync_parent_directory(corrupt_path)
+            recovery_revision = max(
+                time.time_ns(),
+                _agent_tmux_max_binding_revision(data),
+            )
+            recovered_state = {
+                "version": 3,
+                "binding_revision": recovery_revision,
+                "route_tombstones": {},
+                "active_routes": _agent_tmux_active_route_revisions(data),
+                "restore_floor_revision": recovery_revision,
+            }
+            write_json_atomic(counter_path, recovered_state)
+            return recovered_state
+        persisted_revision = _agent_tmux_binding_revision(
+            counter_state.get("binding_revision")
+            if isinstance(counter_state, dict)
+            else counter_state
+        )
+        if persisted_revision is None:
+            raise SlackbotError(
+                "Invalid agent tmux binding revision state at "
+                f"{counter_path}"
+            )
+        if isinstance(counter_state, dict):
+            parsed_restore_floor = _agent_tmux_binding_revision(
+                counter_state.get("restore_floor_revision", 0)
+            )
+            if parsed_restore_floor is None:
+                raise SlackbotError(
+                    "Invalid agent tmux restore floor state at "
+                    f"{counter_path}"
+                )
+            restore_floor_revision = parsed_restore_floor
+            raw_tombstones = counter_state.get("route_tombstones", {})
+            if not isinstance(raw_tombstones, dict):
+                raise SlackbotError(
+                    "Invalid agent tmux route tombstone state at "
+                    f"{counter_path}"
+                )
+            for key, tombstone in raw_tombstones.items():
+                if (
+                    not isinstance(key, str)
+                    or not isinstance(tombstone, dict)
+                    or _agent_tmux_binding_revision(
+                        tombstone.get("binding_revision")
+                    )
+                    is None
+                ):
+                    raise SlackbotError(
+                        "Invalid agent tmux route tombstone state at "
+                        f"{counter_path}"
+                    )
+                route_tombstones[key] = dict(tombstone)
+            raw_active_routes = counter_state.get("active_routes")
+            if raw_active_routes is not None:
+                if not isinstance(raw_active_routes, dict):
+                    raise SlackbotError(
+                        "Invalid agent tmux active route state at "
+                        f"{counter_path}"
+                    )
+                active_routes = {}
+                for key, revision in raw_active_routes.items():
+                    parsed_revision = _agent_tmux_binding_revision(revision)
+                    if not isinstance(key, str) or parsed_revision is None:
+                        raise SlackbotError(
+                            "Invalid agent tmux active route state at "
+                            f"{counter_path}"
+                        )
+                    active_routes[key] = parsed_revision
+    route_tombstones, eviction_revision = _prune_agent_tmux_route_tombstones(
+        route_tombstones
+    )
+    restore_floor_revision = max(
+        restore_floor_revision,
+        eviction_revision,
+    )
+    tombstone_revision = max(
+        (
+            int(tombstone["binding_revision"])
+            for tombstone in route_tombstones.values()
+        ),
+        default=0,
+    )
+    binding_revision = max(
+        persisted_revision or 0,
+        tombstone_revision,
+        _agent_tmux_max_binding_revision(data),
+    )
+    current_routes = _agent_tmux_active_route_revisions(data)
+    if active_routes is not None:
+        missing_routes = set(active_routes).difference(current_routes)
+        superseded_routes = {
+            key
+            for key, expected_revision in active_routes.items()
+            if key in current_routes
+            and current_routes[key] < expected_revision
+        }
+        unexpected_routes = set(current_routes).difference(active_routes)
+        stale_routes = missing_routes | superseded_routes | unexpected_routes
+        if stale_routes:
+            binding_revision += 1
+            updated_at = _utcnow_precise_iso()
+            for key in stale_routes:
+                route_tombstones[key] = {
+                    "binding_revision": binding_revision,
+                    "updated_at": updated_at,
+                }
+            route_tombstones, eviction_revision = (
+                _prune_agent_tmux_route_tombstones(route_tombstones)
+            )
+            restore_floor_revision = max(
+                restore_floor_revision,
+                eviction_revision,
+            )
+    return {
+        "version": 3,
+        "binding_revision": binding_revision,
+        "route_tombstones": route_tombstones,
+        "active_routes": (
+            active_routes if active_routes is not None else current_routes
+        ),
+        "restore_floor_revision": restore_floor_revision,
+    }
+
+
+def _agent_tmux_binding_not_newer_than(
+    candidate: Any,
+    *,
+    revision: int | None,
+    timestamp: str | None,
+) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    if revision is not None:
+        candidate_revision = _agent_tmux_binding_revision(
+            candidate.get("binding_revision")
+        )
+        return (
+            candidate_revision is not None and candidate_revision <= revision
+        )
+    return bool(
+        timestamp
+        and _agent_tmux_timestamp_precedes(
+            candidate.get("updated_at"), timestamp
+        )
+    )
+
+
+def _agent_tmux_route_tombstone_not_newer_than(
+    revision_state: dict[str, Any],
+    key: str,
+    *,
+    revision: int | None,
+    timestamp: str | None,
+) -> bool:
+    tombstone = revision_state["route_tombstones"].get(key)
+    return tombstone is None or _agent_tmux_binding_not_newer_than(
+        tombstone,
+        revision=revision,
+        timestamp=timestamp,
+    )
+
+
+def _agent_tmux_route_state_not_newer_than(
+    data: dict[str, Any],
+    revision_state: dict[str, Any],
+    key: str,
+    *,
+    revision: int | None,
+    timestamp: str | None,
+) -> bool:
+    candidate = data.get(key)
+    return (
+        candidate is None
+        or _agent_tmux_binding_not_newer_than(
+            candidate,
+            revision=revision,
+            timestamp=timestamp,
+        )
+    ) and _agent_tmux_route_tombstone_not_newer_than(
+        revision_state,
+        key,
+        revision=revision,
+        timestamp=timestamp,
+    )
+
+
+def _record_agent_tmux_route_tombstone(
+    revision_state: dict[str, Any],
+    key: str,
+    *,
+    binding_revision: int,
+    updated_at: str,
+) -> None:
+    revision_state["route_tombstones"][key] = {
+        "binding_revision": binding_revision,
+        "updated_at": updated_at,
+    }
 
 
 def _clean_agent_tmux_text(text: str) -> str:
@@ -5626,9 +6719,24 @@ def _codex_hook_entry_binding(
     return binding
 
 
+def _codex_hook_entry_binding_snapshot(
+    entry: dict[str, Any],
+) -> dict[str, Any] | None:
+    binding = _codex_hook_entry_binding(entry)
+    if binding is None:
+        return None
+    binding_revision = _agent_tmux_binding_revision(
+        entry.get("binding_revision")
+    )
+    if binding_revision is not None:
+        binding["binding_revision"] = binding_revision
+    return binding
+
+
 def _clear_codex_hook_entry_binding(entry: dict[str, Any]) -> None:
     for key in AGENT_TMUX_BINDING_KEYS:
         entry.pop(key, None)
+    entry.pop("binding_revision", None)
     entry.pop("fallback_key", None)
 
 
@@ -5638,6 +6746,7 @@ def _replace_codex_hook_entry_binding(
 ) -> None:
     for key in AGENT_TMUX_BINDING_KEYS:
         entry.pop(key, None)
+    entry.pop("binding_revision", None)
     entry.update(binding)
 
 
@@ -5648,7 +6757,7 @@ def _codex_hook_requested_tmux_sockets(
     tmux_session: str | None,
     tmux_socket: str | None,
 ) -> tuple[str, ...]:
-    explicit_socket = (
+    explicit_socket = normalize_tmux_socket(
         tmux_socket
         or str(payload.get("tmux_socket") or "").strip()
         or os.environ.get("CODEX_TMUX_SOCKET")
@@ -5912,6 +7021,50 @@ def _codex_hook_delivery_route_receipt_path(
     )
 
 
+def _read_codex_hook_delivery_receipt(
+    path: str | Path,
+) -> dict[str, Any] | None:
+    target = Path(path)
+    try:
+        text = target.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CodexHookRetryableError(
+            f"Cannot read durable Codex hook receipt {target}: {exc}"
+        ) from exc
+    try:
+        receipt = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise CodexHookRetryableError(
+            f"Cannot parse durable Codex hook receipt {target}: {exc}"
+        ) from exc
+    delivery_state = (
+        receipt.get("delivery_state") if isinstance(receipt, dict) else None
+    )
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("version") != 1
+        or not str(receipt.get("key") or "").strip()
+        or not str(receipt.get("notify_user_id") or "").strip()
+        or not str(receipt.get("message_sha256") or "").strip()
+        or delivery_state not in {None, "pending", "posting", "delivered"}
+    ):
+        raise CodexHookRetryableError(
+            f"Invalid durable Codex hook receipt at {target}"
+        )
+    return receipt
+
+
+def _read_codex_hook_delivery_receipt_for_routing(
+    path: str | Path,
+) -> dict[str, Any] | None:
+    try:
+        return _read_codex_hook_delivery_receipt(path)
+    except (CodexHookRetryableError, OSError):
+        return None
+
+
 def _codex_hook_delivery_receipt(
     receipt_paths: Iterable[str],
     *,
@@ -5922,8 +7075,8 @@ def _codex_hook_delivery_receipt(
     transcript_path: str | None,
 ) -> dict[str, Any] | None:
     for receipt_path in receipt_paths:
-        receipt = read_json(receipt_path, {})
-        if not isinstance(receipt, dict):
+        receipt = _read_codex_hook_delivery_receipt(receipt_path)
+        if receipt is None:
             continue
         receipt_key = str(receipt.get("key") or "")
         receipt_fallback_key = str(receipt.get("fallback_key") or "")
@@ -5932,16 +7085,24 @@ def _codex_hook_delivery_receipt(
                 continue
         elif desired_key not in (receipt_key, receipt_fallback_key):
             continue
-        requires_bounded_dedupe = turn_id is None
+        delivery_state = receipt.get("delivery_state")
+        delivered = delivery_state == "delivered" or bool(
+            delivery_state is None
+            and receipt.get("channel_id")
+            and receipt.get("thread_ts")
+        )
+        requires_bounded_dedupe = turn_id is None and not delivered
         if transcript_path:
             stored_transcript_path = receipt.get("transcript_path")
             if stored_transcript_path not in (None, transcript_path):
                 continue
-            if stored_transcript_path is None and not desired_key.startswith(
-                "session:"
+            if (
+                not delivered
+                and stored_transcript_path is None
+                and not desired_key.startswith("session:")
             ):
                 requires_bounded_dedupe = True
-        elif not desired_key.startswith("session:"):
+        elif not delivered and not desired_key.startswith("session:"):
             requires_bounded_dedupe = True
         if requires_bounded_dedupe:
             elapsed = _agent_tmux_elapsed_since(receipt.get("notified_at"))
@@ -5969,14 +7130,15 @@ def _codex_hook_pending_client_msg_id(
     message_hash: str,
     notify_user_id: str,
     transcript_path: str | None,
+    delivery_state: str = "pending",
 ) -> str | None:
     # Sessionless retries with different tmux provenance are distinct
     # deliveries and therefore use different receipt paths.
     for receipt_path in receipt_paths:
-        pending = read_json(receipt_path, {})
-        if not isinstance(pending, dict):
+        pending = _read_codex_hook_delivery_receipt(receipt_path)
+        if pending is None:
             continue
-        if pending.get("delivery_state") != "pending":
+        if pending.get("delivery_state") != delivery_state:
             continue
         pending_key = str(pending.get("key") or "")
         pending_fallback_key = str(pending.get("fallback_key") or "")
@@ -5992,13 +7154,22 @@ def _codex_hook_pending_client_msg_id(
             or pending.get("transcript_path") != transcript_path
         ):
             continue
-        elapsed = _agent_tmux_elapsed_since(pending.get("pending_at"))
-        if (
-            elapsed is None
-            or elapsed > AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS
-        ):
-            Path(receipt_path).unlink(missing_ok=True)
-            continue
+        if delivery_state == "pending":
+            elapsed = _agent_tmux_elapsed_since(pending.get("pending_at"))
+            if (
+                elapsed is None
+                or elapsed > AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS
+            ):
+                Path(receipt_path).unlink(missing_ok=True)
+                continue
+        elif delivery_state == "posting":
+            elapsed = _agent_tmux_elapsed_since(pending.get("posting_at"))
+            if (
+                elapsed is None
+                or elapsed > AGENT_CODEX_HOOK_AMBIGUOUS_DELIVERY_SECONDS
+            ):
+                Path(receipt_path).unlink(missing_ok=True)
+                continue
         client_msg_id = str(pending.get("client_msg_id") or "").strip()
         if client_msg_id:
             return client_msg_id
@@ -6050,6 +7221,31 @@ def _codex_hook_delivery_aliases(
     return aliases
 
 
+def _read_codex_hook_state(state_path: str) -> dict[str, Any]:
+    target = Path(state_path)
+    try:
+        text = target.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except UnicodeDecodeError as exc:
+        raise SlackbotError(
+            f"Cannot parse Codex hook state {target}: {exc}"
+        ) from exc
+    try:
+        state = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SlackbotError(
+            f"Cannot parse Codex hook state {target}: {exc}"
+        ) from exc
+    if not isinstance(state, dict):
+        raise SlackbotError(
+            f"Codex hook state {target} must contain a JSON object"
+        )
+    if not isinstance(state.get("sessions"), dict):
+        state["sessions"] = {}
+    return state
+
+
 @contextmanager
 def _locked_codex_hook_delivery_aliases(
     state_path: str,
@@ -6078,7 +7274,7 @@ def _locked_codex_hook_delivery_aliases(
                         state_path
                     ) as acquired_state_lock:
                         if acquired_state_lock:
-                            state = read_json(state_path, {})
+                            state = _read_codex_hook_state(state_path)
                             aliases = _codex_hook_delivery_aliases(
                                 state.get("sessions") or {},
                                 desired_key,
@@ -6243,6 +7439,30 @@ def _locked_codex_hook_finalization_state(state_path: str):
         ) from exc
 
 
+def _update_codex_hook_state_binding(
+    state_path: str,
+    desired_key: str,
+    fallback_key: str | None,
+    binding: dict[str, Any] | None,
+) -> None:
+    with _locked_codex_hook_finalization_state(state_path):
+        state = _read_codex_hook_state(state_path)
+        sessions = state.setdefault("sessions", {})
+        key, entry, _ = _codex_hook_resolved_entry(
+            sessions,
+            desired_key,
+            fallback_key,
+        )
+        if not entry:
+            return
+        if binding is None:
+            _clear_codex_hook_entry_binding(entry)
+        else:
+            _replace_codex_hook_entry_binding(entry, binding)
+        sessions[key] = entry
+        write_json_atomic(state_path, state)
+
+
 @contextmanager
 def _locked_codex_hook_pre_delivery_state(state_path: str):
     try:
@@ -6304,14 +7524,14 @@ def _render_codex_stop_notification(
     return "\n".join(lines)
 
 
-def _codex_hook_notification_seen(
+def _codex_hook_matching_notification(
     entry: dict[str, Any],
     *,
     session_id: str | None,
     transcript_path: str | None,
     turn_id: str | None,
     message_hash: str,
-) -> bool:
+) -> dict[str, Any] | None:
     for item in entry.get("notifications") or []:
         if not isinstance(item, dict):
             continue
@@ -6329,8 +7549,156 @@ def _codex_hook_notification_seen(
                     or elapsed > AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS
                 ):
                     continue
+            return item
+    return None
+
+
+def _codex_hook_recovery_requires_existing_route(
+    recovery_record: dict[str, Any] | None,
+    *,
+    current_binding_revision: int,
+    restore_floor_revision: int,
+    binding_observed_revision: int | None,
+    binding_observed_at: str | None,
+) -> bool:
+    if recovery_record is None:
+        return False
+    if binding_observed_revision is None or not _agent_tmux_timestamp(
+        binding_observed_at
+    ):
+        return True
+    elapsed = _agent_tmux_elapsed_since(recovery_record.get("notified_at"))
+    if (
+        elapsed is None
+        or elapsed > AGENT_TMUX_ROUTE_TOMBSTONE_MAX_AGE_SECONDS
+    ):
+        return True
+    return (
+        current_binding_revision < binding_observed_revision
+        or binding_observed_revision < restore_floor_revision
+    )
+
+
+def _codex_hook_tmux_route_was_superseded(
+    config: SlackbotConfig,
+    *,
+    channel_id: str,
+    thread_ts: str,
+    expected_binding: dict[str, Any],
+    binding_observed_revision: int | None,
+    binding_observed_at: str | None,
+) -> bool:
+    if binding_observed_revision is None and not _agent_tmux_timestamp(
+        binding_observed_at
+    ):
+        return False
+    key = agent_tmux_thread_key(channel_id, thread_ts)
+    with locked_agent_tmux_json_path(
+        config.paths.agent_tmux_bindings_path,
+        timeout_seconds=AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS,
+    ):
+        data = _read_agent_tmux_bindings(
+            config.paths.agent_tmux_bindings_path
+        )
+        revision_state = _agent_tmux_binding_revision_state(
+            config.paths.agent_tmux_bindings_path,
+            data,
+        )
+        _persist_agent_tmux_tombstone_reconciliation(
+            config.paths.agent_tmux_bindings_path,
+            data,
+            revision_state,
+        )
+        if (
+            binding_observed_revision is not None
+            and binding_observed_revision
+            < int(revision_state["restore_floor_revision"])
+        ):
             return True
-    return False
+        tombstone = revision_state["route_tombstones"].get(key)
+        if tombstone is not None and not _agent_tmux_binding_not_newer_than(
+            tombstone,
+            revision=binding_observed_revision,
+            timestamp=binding_observed_at,
+        ):
+            return True
+        current = data.get(key)
+        return bool(
+            isinstance(current, dict)
+            and not _agent_tmux_binding_not_newer_than(
+                current,
+                revision=binding_observed_revision,
+                timestamp=binding_observed_at,
+            )
+            and not _agent_tmux_binding_satisfies_expected(
+                current,
+                expected_binding,
+                default_socket=codex_tmux_socket(config),
+            )
+        )
+
+
+def _reconfirm_codex_hook_tmux_binding(
+    config: SlackbotConfig,
+    binding: dict[str, Any],
+    *,
+    channel_id: str,
+    thread_ts: str,
+    state_path: str,
+    desired_key: str,
+    fallback_key: str | None,
+    binding_observed_revision: int | None,
+    binding_observed_at: str | None,
+    recovery_requires_existing_route: bool,
+    claim_target_if_unbound: bool,
+) -> tuple[dict[str, Any] | None, bool]:
+    confirmed_binding = bind_agent_tmux_thread(
+        config.profile,
+        runtime_root=config.paths.runtime_root,
+        env_path=config.paths.env_path,
+        state_dir=config.paths.state_dir,
+        system_prompt_path=config.paths.system_prompt_path,
+        unit_name=config.paths.unit_name,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        host=binding["host"],
+        tmux_session=binding["tmux_session"],
+        tmux_socket=binding.get("tmux_socket"),
+        tmux_conf=binding.get("tmux_conf"),
+        tmux_pane=binding.get("tmux_pane"),
+        tmux_pane_pid=binding.get("tmux_pane_pid"),
+        tmux_session_created=binding.get("tmux_session_created"),
+        tmux_server_pid=binding.get("tmux_server_pid"),
+        exclusive_target=True,
+        claim_target_if_unbound=claim_target_if_unbound,
+        replace_route_if_mismatched=True,
+        replace_route_if_older_than=binding_observed_at,
+        replace_route_if_revision_at_most=binding_observed_revision,
+        require_existing_route=recovery_requires_existing_route,
+        lock_timeout_seconds=(AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS),
+    )
+    if confirmed_binding is not None:
+        return confirmed_binding, False
+    route_was_superseded = _codex_hook_tmux_route_was_superseded(
+        config,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        expected_binding=binding,
+        binding_observed_revision=binding_observed_revision,
+        binding_observed_at=binding_observed_at,
+    )
+    _update_codex_hook_state_binding(
+        state_path,
+        desired_key,
+        fallback_key,
+        None,
+    )
+    if not recovery_requires_existing_route and not route_was_superseded:
+        raise CodexHookRetryableError(
+            "Codex notification route is not exclusively bound to its "
+            "intended tmux target"
+        )
+    return None, True
 
 
 def notify_codex_agent_stop(
@@ -6387,6 +7755,28 @@ def notify_codex_agent_stop(
         ),
         environment_socket=_tmux_socket_path_from_env(os.environ.get("TMUX")),
     )
+    try:
+        observed_binding_state = _observe_agent_tmux_binding_state(
+            config.paths,
+            lock_timeout_seconds=(
+                AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
+            ),
+        )
+    except CodexHookRetryableError:
+        raise
+    except Exception as exc:
+        raise CodexHookRetryableError(
+            "Codex hook delivery has not started because state preparation "
+            f"failed: {exc}"
+        ) from exc
+    binding_observed_revision = int(
+        observed_binding_state["binding_revision"]
+    )
+    current_binding_revision = binding_observed_revision
+    restore_floor_revision = int(
+        observed_binding_state["restore_floor_revision"]
+    )
+    binding_observed_at = _utcnow_precise_iso()
     pane_binding_rejected = False
     try:
         binding = resolve_codex_agent_tmux_binding(
@@ -6432,13 +7822,14 @@ def notify_codex_agent_stop(
         transcript_path=transcript_path,
     ) as (_, write_receipt_paths, receipt_paths, receipt):
         with _locked_codex_hook_pre_delivery_state(state_path):
-            state = read_json(state_path, {})
+            state = _read_codex_hook_state(state_path)
             sessions = state.setdefault("sessions", {})
             key, entry, entry_migrated = _codex_hook_resolved_entry(
                 sessions,
                 desired_key,
                 fallback_key,
             )
+            entry_binding_snapshot = _codex_hook_entry_binding_snapshot(entry)
             if pane_binding_rejected:
                 if entry:
                     _clear_codex_hook_entry_binding(entry)
@@ -6470,18 +7861,25 @@ def notify_codex_agent_stop(
                 and entry.get("notify_user_id")
                 and entry.get("channel_id")
                 and entry.get("thread_ts")
+                and entry_binding_snapshot is not None
             ):
                 stale_recipient_route = (
                     str(entry["channel_id"]),
                     str(entry["thread_ts"]),
+                    entry_binding_snapshot,
                 )
-            duplicate = recipient_matches and _codex_hook_notification_seen(
-                entry,
-                session_id=session_id,
-                transcript_path=transcript_path,
-                turn_id=turn_id,
-                message_hash=message_hash,
+            matched_notification = (
+                _codex_hook_matching_notification(
+                    entry,
+                    session_id=session_id,
+                    transcript_path=transcript_path,
+                    turn_id=turn_id,
+                    message_hash=message_hash,
+                )
+                if recipient_matches
+                else None
             )
+            duplicate = matched_notification is not None
             channel_id = (
                 entry.get("channel_id") or None if recipient_matches else None
             )
@@ -6501,14 +7899,23 @@ def notify_codex_agent_stop(
                         "notify_user_id": notify_user_id,
                     }
                 )
-                if binding:
-                    _replace_codex_hook_entry_binding(entry, binding)
                 sessions[key] = entry
                 write_json_atomic(state_path, state)
 
         recovered_receipt = receipt is not None
         receipt_write_error = None
         if receipt:
+            binding_observed_revision = _agent_tmux_binding_revision(
+                receipt.get("binding_observed_revision")
+            )
+            receipt_binding_observed_at = _codex_hook_text_value(
+                receipt, "binding_observed_at"
+            )
+            binding_observed_at = (
+                receipt_binding_observed_at
+                if _agent_tmux_timestamp(receipt_binding_observed_at)
+                else None
+            )
             channel_id = str(receipt["channel_id"])
             thread_ts = str(receipt["thread_ts"])
             receipt_key = str(receipt.get("key") or "")
@@ -6517,8 +7924,13 @@ def notify_codex_agent_stop(
             fallback_key = (
                 str(receipt.get("fallback_key") or "").strip() or fallback_key
             )
+            receipt_binding = receipt.get("tmux_binding")
+            if entry_binding_snapshot is None and isinstance(
+                receipt_binding,
+                dict,
+            ):
+                entry_binding_snapshot = dict(receipt_binding)
             if not binding and not pane_binding_rejected:
-                receipt_binding = receipt.get("tmux_binding")
                 if isinstance(receipt_binding, dict):
                     persisted_binding, binding_rejected = (
                         _codex_hook_persisted_binding(
@@ -6534,27 +7946,58 @@ def notify_codex_agent_stop(
                         binding = persisted_binding
             if pane_binding_rejected:
                 fallback_key = None
+        elif duplicate:
+            binding_observed_revision = _agent_tmux_binding_revision(
+                (matched_notification or {}).get("binding_observed_revision")
+            )
+            matched_binding_observed_at = _codex_hook_text_value(
+                matched_notification or {}, "binding_observed_at"
+            )
+            binding_observed_at = (
+                matched_binding_observed_at
+                if _agent_tmux_timestamp(matched_binding_observed_at)
+                else None
+            )
 
+        recovery_record = receipt or (
+            matched_notification if duplicate else None
+        )
+        recovery_requires_existing_route = (
+            _codex_hook_recovery_requires_existing_route(
+                recovery_record,
+                current_binding_revision=current_binding_revision,
+                restore_floor_revision=restore_floor_revision,
+                binding_observed_revision=binding_observed_revision,
+                binding_observed_at=binding_observed_at,
+            )
+        )
+        binding_restore_rejected = False
         if pane_binding_rejected and channel_id and thread_ts:
-            try:
-                unbind_agent_tmux_thread(
-                    profile,
-                    runtime_root=runtime_root,
-                    env_path=env_path,
-                    state_dir=state_dir,
-                    system_prompt_path=system_prompt_path,
-                    unit_name=unit_name,
-                    channel_id=str(channel_id),
-                    thread_ts=str(thread_ts),
-                    lock_timeout_seconds=(
-                        AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
-                    ),
-                )
-            except Exception as exc:
-                raise CodexHookRetryableError(
-                    "Rejected Codex pane but could not clear its stale "
-                    f"tmux binding: {exc}"
-                ) from exc
+            if recovery_requires_existing_route:
+                binding_restore_rejected = True
+            elif entry_binding_snapshot is not None:
+                try:
+                    unbind_agent_tmux_thread(
+                        profile,
+                        runtime_root=runtime_root,
+                        env_path=env_path,
+                        state_dir=state_dir,
+                        system_prompt_path=system_prompt_path,
+                        unit_name=unit_name,
+                        channel_id=str(channel_id),
+                        thread_ts=str(thread_ts),
+                        only_if_older_than=binding_observed_at,
+                        only_if_revision_at_most=binding_observed_revision,
+                        only_if_matches=entry_binding_snapshot,
+                        lock_timeout_seconds=(
+                            AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
+                        ),
+                    )
+                except Exception as exc:
+                    raise CodexHookRetryableError(
+                        "Rejected Codex pane but could not clear its stale "
+                        f"tmux binding: {exc}"
+                    ) from exc
 
         if duplicate:
             try:
@@ -6571,46 +8014,35 @@ def notify_codex_agent_stop(
                         sorted({*receipt_paths, route_receipt_path})
                     )
                 if binding and channel_id and thread_ts:
-                    current_binding = query_agent_tmux_thread(
-                        profile,
-                        runtime_root=runtime_root,
-                        env_path=env_path,
-                        state_dir=state_dir,
-                        system_prompt_path=system_prompt_path,
-                        unit_name=unit_name,
-                        channel_id=channel_id,
-                        thread_ts=thread_ts,
-                        lock_timeout_seconds=(
-                            AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
-                        ),
-                    )
-                    if not current_binding:
-                        bind_agent_tmux_thread(
-                            profile,
-                            runtime_root=runtime_root,
-                            env_path=env_path,
-                            state_dir=state_dir,
-                            system_prompt_path=system_prompt_path,
-                            unit_name=unit_name,
-                            channel_id=channel_id,
-                            thread_ts=thread_ts,
-                            host=binding["host"],
-                            tmux_session=binding["tmux_session"],
-                            tmux_socket=binding.get("tmux_socket"),
-                            tmux_conf=binding.get("tmux_conf"),
-                            tmux_pane=binding.get("tmux_pane"),
-                            tmux_pane_pid=binding.get("tmux_pane_pid"),
-                            tmux_session_created=binding.get(
-                                "tmux_session_created"
+                    binding, binding_restore_rejected = (
+                        _reconfirm_codex_hook_tmux_binding(
+                            config,
+                            binding,
+                            channel_id=str(channel_id),
+                            thread_ts=str(thread_ts),
+                            state_path=state_path,
+                            desired_key=desired_key,
+                            fallback_key=fallback_key,
+                            binding_observed_revision=(
+                                binding_observed_revision
                             ),
-                            tmux_server_pid=binding.get("tmux_server_pid"),
-                            exclusive_target=True,
+                            binding_observed_at=binding_observed_at,
+                            recovery_requires_existing_route=(
+                                recovery_requires_existing_route
+                            ),
                             claim_target_if_unbound=True,
-                            lock_timeout_seconds=(
-                                AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
-                            ),
                         )
+                    )
+                if binding and channel_id and thread_ts:
+                    _update_codex_hook_state_binding(
+                        state_path,
+                        desired_key,
+                        fallback_key,
+                        binding,
+                    )
                 _remove_codex_hook_delivery_receipts(receipt_paths)
+            except CodexHookRetryableError:
+                raise
             except Exception as exc:
                 raise CodexHookRetryableError(
                     "Codex hook delivery is durable but duplicate "
@@ -6624,7 +8056,22 @@ def notify_codex_agent_stop(
             }
 
         if not receipt:
+            delivery_stage_callback = None
             if turn_id is None:
+                posting_client_msg_id = _codex_hook_pending_client_msg_id(
+                    receipt_paths,
+                    desired_key=desired_key,
+                    turn_id=turn_id,
+                    message_hash=message_hash,
+                    notify_user_id=notify_user_id,
+                    transcript_path=transcript_path,
+                    delivery_state="posting",
+                )
+                if posting_client_msg_id:
+                    raise CodexHookRetryableError(
+                        "Previous sessionless Slack delivery has an "
+                        "ambiguous outcome; refusing to post it again"
+                    )
                 client_msg_id = _codex_hook_pending_client_msg_id(
                     receipt_paths,
                     desired_key=desired_key,
@@ -6655,44 +8102,103 @@ def notify_codex_agent_stop(
                             "turn_id": turn_id,
                             "message_sha256": message_hash,
                             "transcript_path": transcript_path,
+                            "binding_observed_revision": (
+                                binding_observed_revision
+                            ),
+                            "binding_observed_at": binding_observed_at,
                             "client_msg_id": client_msg_id,
                             "pending_at": utcnow_iso(),
                         },
                     )
+            if turn_id is None:
+
+                def update_delivery_stage(stage: str) -> None:
+                    timestamp_key = (
+                        "posting_at" if stage == "posting" else "pending_at"
+                    )
+                    try:
+                        _write_codex_hook_delivery_receipts(
+                            write_receipt_paths,
+                            {
+                                "version": 1,
+                                "delivery_state": stage,
+                                "key": desired_key,
+                                "fallback_key": fallback_key,
+                                "notify_user_id": notify_user_id,
+                                "turn_id": turn_id,
+                                "message_sha256": message_hash,
+                                "transcript_path": transcript_path,
+                                "binding_observed_revision": (
+                                    binding_observed_revision
+                                ),
+                                "binding_observed_at": binding_observed_at,
+                                "client_msg_id": client_msg_id,
+                                timestamp_key: utcnow_iso(),
+                            },
+                        )
+                    except Exception:
+                        try:
+                            _remove_codex_hook_delivery_receipts(
+                                write_receipt_paths
+                            )
+                        except Exception as cleanup_exc:
+                            raise CodexHookRetryableError(
+                                "Codex hook delivery has not started but its "
+                                "partial stage receipt cleanup failed: "
+                                f"{cleanup_exc}"
+                            ) from cleanup_exc
+                        raise
+
+                delivery_stage_callback = update_delivery_stage
             first_message = not (channel_id and thread_ts)
             route = (
                 SlackbotRoute(channel_id=channel_id, thread_ts=thread_ts)
                 if channel_id and thread_ts
                 else SlackbotRoute(dm_user_id=notify_user_id)
             )
-            with (
-                slack_api_request_policy(
-                    timeout_seconds=(
-                        AGENT_CODEX_HOOK_SLACK_REQUEST_TIMEOUT_SECONDS
+            try:
+                with (
+                    slack_delivery_stage_policy(delivery_stage_callback),
+                    slack_api_request_policy(
+                        timeout_seconds=(
+                            AGENT_CODEX_HOOK_SLACK_REQUEST_TIMEOUT_SECONDS
+                        ),
+                        attempts=AGENT_CODEX_HOOK_SLACK_REQUEST_ATTEMPTS,
+                        retry_delay_seconds=(
+                            AGENT_CODEX_HOOK_SLACK_RETRY_DELAY_SECONDS
+                        ),
+                        total_timeout_seconds=(
+                            AGENT_CODEX_HOOK_SLACK_TOTAL_TIMEOUT_SECONDS
+                        ),
                     ),
-                    attempts=AGENT_CODEX_HOOK_SLACK_REQUEST_ATTEMPTS,
-                    retry_delay_seconds=(
-                        AGENT_CODEX_HOOK_SLACK_RETRY_DELAY_SECONDS
+                    slack_single_message_policy(
+                        mrkdwn=False,
+                        client_msg_id=client_msg_id,
                     ),
-                    total_timeout_seconds=(
-                        AGENT_CODEX_HOOK_SLACK_TOTAL_TIMEOUT_SECONDS
-                    ),
-                ),
-                slack_single_message_policy(
-                    mrkdwn=False,
-                    client_msg_id=client_msg_id,
-                ),
-            ):
-                response = post_slack_message(
-                    config,
-                    route,
-                    _render_codex_stop_notification(
-                        payload,
-                        binding,
-                        message,
-                        first_message=first_message,
-                    ),
-                )
+                ):
+                    response = post_slack_message(
+                        config,
+                        route,
+                        _render_codex_stop_notification(
+                            payload,
+                            binding,
+                            message,
+                            first_message=first_message,
+                        ),
+                    )
+            except Exception as exc:
+                if turn_id is None and _slack_post_failure_is_definitive(exc):
+                    try:
+                        _remove_codex_hook_delivery_receipts(
+                            write_receipt_paths
+                        )
+                    except Exception as cleanup_exc:
+                        raise CodexHookRetryableError(
+                            "Definitive Slack rejection was not delivered, "
+                            "but posting receipt cleanup failed: "
+                            f"{cleanup_exc}"
+                        ) from cleanup_exc
+                raise
             if response:
                 channel_id = channel_id or response.get("channel")
                 thread_ts = thread_ts or response.get("ts")
@@ -6703,6 +8209,7 @@ def notify_codex_agent_stop(
                 )
             receipt = {
                 "version": 1,
+                "delivery_state": "delivered",
                 "key": desired_key,
                 "fallback_key": fallback_key,
                 "notify_user_id": notify_user_id,
@@ -6712,6 +8219,8 @@ def notify_codex_agent_stop(
                 "message_sha256": message_hash,
                 "tmux_binding": binding,
                 "transcript_path": transcript_path,
+                "binding_observed_revision": binding_observed_revision,
+                "binding_observed_at": binding_observed_at,
                 "client_msg_id": client_msg_id,
                 "notified_at": utcnow_iso(),
             }
@@ -6737,8 +8246,12 @@ def notify_codex_agent_stop(
             except Exception as exc:
                 receipt_write_error = exc
 
-        if stale_recipient_route:
-            stale_channel_id, stale_thread_ts = stale_recipient_route
+        if stale_recipient_route and not recovery_requires_existing_route:
+            (
+                stale_channel_id,
+                stale_thread_ts,
+                stale_binding,
+            ) = stale_recipient_route
             try:
                 unbind_agent_tmux_thread(
                     profile,
@@ -6749,6 +8262,9 @@ def notify_codex_agent_stop(
                     unit_name=unit_name,
                     channel_id=stale_channel_id,
                     thread_ts=stale_thread_ts,
+                    only_if_older_than=binding_observed_at,
+                    only_if_revision_at_most=binding_observed_revision,
+                    only_if_matches=stale_binding,
                     lock_timeout_seconds=(
                         AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
                     ),
@@ -6759,8 +8275,59 @@ def notify_codex_agent_stop(
                     f"binding cleanup failed: {exc}"
                 ) from exc
 
+        if binding:
+            try:
+                binding, binding_restore_rejected = (
+                    _reconfirm_codex_hook_tmux_binding(
+                        config,
+                        binding,
+                        channel_id=str(channel_id),
+                        thread_ts=str(thread_ts),
+                        state_path=state_path,
+                        desired_key=desired_key,
+                        fallback_key=fallback_key,
+                        binding_observed_revision=binding_observed_revision,
+                        binding_observed_at=binding_observed_at,
+                        recovery_requires_existing_route=(
+                            recovery_requires_existing_route
+                        ),
+                        claim_target_if_unbound=False,
+                    )
+                )
+            except CodexHookRetryableError:
+                raise
+            except Exception as exc:
+                raise CodexHookRetryableError(
+                    "Codex hook delivery is durable but tmux binding "
+                    f"failed: {exc}"
+                ) from exc
+
+        if binding:
+            confirmed_revision = _agent_tmux_binding_revision(
+                binding.get("binding_revision")
+            )
+            confirmed_at = _codex_hook_text_value(binding, "updated_at")
+            if confirmed_revision is not None:
+                binding_observed_revision = confirmed_revision
+            if _agent_tmux_timestamp(confirmed_at):
+                binding_observed_at = confirmed_at
+            if receipt is not None and not recovered_receipt:
+                receipt["tmux_binding"] = binding
+                receipt["binding_observed_revision"] = (
+                    binding_observed_revision
+                )
+                receipt["binding_observed_at"] = binding_observed_at
+                try:
+                    _write_codex_hook_delivery_receipts(
+                        write_receipt_paths,
+                        receipt,
+                    )
+                    receipt_write_error = None
+                except Exception as exc:
+                    receipt_write_error = exc
+
         with _locked_codex_hook_finalization_state(state_path):
-            state = read_json(state_path, {})
+            state = _read_codex_hook_state(state_path)
             state["version"] = 1
             sessions = state.setdefault("sessions", {})
             key, entry, _ = _codex_hook_resolved_entry(
@@ -6788,6 +8355,8 @@ def notify_codex_agent_stop(
                     "message_sha256": message_hash,
                     "session_id": session_id,
                     "transcript_path": transcript_path,
+                    "binding_observed_revision": binding_observed_revision,
+                    "binding_observed_at": binding_observed_at,
                     "notified_at": now,
                 }
             )
@@ -6814,37 +8383,15 @@ def notify_codex_agent_stop(
                 entry["created_at"] = now
             if binding:
                 _replace_codex_hook_entry_binding(entry, binding)
+            elif binding_restore_rejected:
+                _clear_codex_hook_entry_binding(entry)
             sessions[key] = entry
             write_json_atomic(state_path, state)
-        if binding:
-            try:
-                bind_agent_tmux_thread(
-                    profile,
-                    runtime_root=runtime_root,
-                    env_path=env_path,
-                    state_dir=state_dir,
-                    system_prompt_path=system_prompt_path,
-                    unit_name=unit_name,
-                    channel_id=channel_id,
-                    thread_ts=thread_ts,
-                    host=binding["host"],
-                    tmux_session=binding["tmux_session"],
-                    tmux_socket=binding.get("tmux_socket"),
-                    tmux_conf=binding.get("tmux_conf"),
-                    tmux_pane=binding.get("tmux_pane"),
-                    tmux_pane_pid=binding.get("tmux_pane_pid"),
-                    tmux_session_created=binding.get("tmux_session_created"),
-                    tmux_server_pid=binding.get("tmux_server_pid"),
-                    exclusive_target=True,
-                    lock_timeout_seconds=(
-                        AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
-                    ),
-                )
-            except Exception as exc:
-                raise CodexHookRetryableError(
-                    "Codex hook delivery is durable but tmux binding "
-                    f"failed: {exc}"
-                ) from exc
+        if receipt_write_error is not None:
+            raise CodexHookRetryableError(
+                "Codex hook delivery was finalized but receipt persistence "
+                f"failed: {receipt_write_error}"
+            ) from receipt_write_error
         try:
             _remove_codex_hook_delivery_receipts(receipt_paths)
         except Exception as exc:
@@ -6852,11 +8399,6 @@ def notify_codex_agent_stop(
                 "Codex hook delivery is durable but receipt cleanup "
                 f"failed: {exc}"
             ) from exc
-        if receipt_write_error is not None:
-            raise CodexHookRetryableError(
-                "Codex hook delivery was finalized but receipt persistence "
-                f"failed: {receipt_write_error}"
-            ) from receipt_write_error
     return {
         "status": "skipped" if recovered_receipt else "notified",
         "reason": "delivery_receipt" if recovered_receipt else None,
@@ -6886,14 +8428,32 @@ def query_codex_agent_threads(
         unit_name=unit_name,
     )
     hook_state_path = agent_codex_hook_state_path(paths)
+    agent_tmux_bindings = {}
+    agent_tmux_bindings_error = None
+    try:
+        with locked_agent_tmux_json_path(paths.agent_tmux_bindings_path):
+            agent_tmux_bindings = _read_agent_tmux_bindings(
+                paths.agent_tmux_bindings_path
+            )
+            revision_state = _agent_tmux_binding_revision_state(
+                paths.agent_tmux_bindings_path,
+                agent_tmux_bindings,
+            )
+            _persist_agent_tmux_tombstone_reconciliation(
+                paths.agent_tmux_bindings_path,
+                agent_tmux_bindings,
+                revision_state,
+            )
+    except (OSError, SlackbotError, UnicodeDecodeError) as exc:
+        # Status remains available, but never exposes an unreconciled route.
+        agent_tmux_bindings = {}
+        agent_tmux_bindings_error = str(exc)
     return {
         "hook_state_path": hook_state_path,
         "hook_state": read_json(hook_state_path, {}),
         "agent_tmux_bindings_path": paths.agent_tmux_bindings_path,
-        "agent_tmux_bindings": read_json(
-            paths.agent_tmux_bindings_path,
-            {},
-        ),
+        "agent_tmux_bindings": agent_tmux_bindings,
+        "agent_tmux_bindings_error": agent_tmux_bindings_error,
     }
 
 
@@ -6976,7 +8536,9 @@ def _index_pending_codex_hook_receipt_routes(
                 age = float("inf")
                 try:
                     age = time.time() - alias_path.stat().st_mtime
-                    receipt = read_json(alias_path, {})
+                    receipt = _read_codex_hook_delivery_receipt_for_routing(
+                        alias_path
+                    )
                 except OSError:
                     receipt = None
                 if (
@@ -7009,11 +8571,10 @@ def _index_pending_codex_hook_receipt_routes(
                 continue
             if age > AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS:
                 continue
-            try:
-                receipt = read_json(alias_path, {})
-            except OSError:
-                continue
-            if not isinstance(receipt, dict):
+            receipt = _read_codex_hook_delivery_receipt_for_routing(
+                alias_path
+            )
+            if receipt is None:
                 continue
             receipt_channel_id = str(receipt.get("channel_id") or "")
             receipt_thread_ts = str(receipt.get("thread_ts") or "")
@@ -7101,8 +8662,10 @@ def _migrate_legacy_codex_hook_receipt_routes(state_path: str) -> None:
                     continue
                 if age > AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS:
                     continue
-            receipt = read_json(legacy_path, {})
-            if not isinstance(receipt, dict):
+            receipt = _read_codex_hook_delivery_receipt_for_routing(
+                legacy_path
+            )
+            if receipt is None:
                 continue
             _index_codex_hook_receipt_route(state_path, receipt)
         write_json_atomic(
@@ -7129,7 +8692,7 @@ def codex_hook_delivery_receipt_for_route(
         thread_ts=thread_ts,
         notify_user_id=notify_user_id,
     )
-    receipt = read_json(receipt_path, {})
+    receipt = _read_codex_hook_delivery_receipt_for_routing(receipt_path)
     if _codex_hook_receipt_matches_route(
         receipt,
         channel_id=channel_id,
@@ -7149,7 +8712,7 @@ def codex_hook_delivery_receipt_for_route(
         pending_receipt = None
     if pending_receipt is not None:
         return pending_receipt
-    receipt = read_json(receipt_path, {})
+    receipt = _read_codex_hook_delivery_receipt_for_routing(receipt_path)
     if _codex_hook_receipt_matches_route(
         receipt,
         channel_id=channel_id,
@@ -7162,7 +8725,7 @@ def codex_hook_delivery_receipt_for_route(
         _migrate_legacy_codex_hook_receipt_routes(state_path)
     except OSError:
         return None
-    receipt = read_json(receipt_path, {})
+    receipt = _read_codex_hook_delivery_receipt_for_routing(receipt_path)
     if _codex_hook_receipt_matches_route(
         receipt,
         channel_id=channel_id,
@@ -7207,15 +8770,9 @@ def _is_managed_agent_hook(handler: Any) -> bool:
     if handler.get("type") != "command":
         return False
     command = str(handler.get("command") or "")
-    if any(marker in command for marker in AGENT_CODEX_HOOK_COMMAND_MARKERS):
-        return True
     try:
         argv = shlex.split(command)
     except ValueError:
-        return False
-    if handler.get("statusMessage") != AGENT_CODEX_HOOK_WEBMUX_STATUS_MESSAGE:
-        return False
-    if len(argv) < 2 or Path(argv[0]).name not in {"node", "nodejs"}:
         return False
 
     def option_value(name: str) -> str | None:
@@ -7226,6 +8783,30 @@ def _is_managed_agent_hook(handler: Any) -> bool:
                 return value.split("=", 1)[1]
         return None
 
+    stop_subcommand = argv[1] if len(argv) >= 2 else ""
+    if stop_subcommand == AGENT_CODEX_HOOK_STOP_SUBCOMMAND or (
+        stop_subcommand.endswith(f"-{AGENT_CODEX_HOOK_STOP_SUBCOMMAND}")
+    ):
+        cli_name = Path(argv[0]).name
+        if (
+            handler.get("statusMessage")
+            == AGENT_CODEX_HOOK_SLACK_STATUS_MESSAGE
+            or cli_name == "sneeze"
+            or cli_name.endswith("-bot")
+        ):
+            return True
+    if (
+        len(argv) >= 2
+        and Path(argv[0]).name in {"node", "nodejs"}
+        and Path(argv[1]).name == AGENT_CODEX_HOOK_WEBMUX_SCRIPT
+        and option_value("--kind") in {None, "codex"}
+        and option_value("--status") in {"working", "waiting"}
+    ):
+        return True
+    if handler.get("statusMessage") != AGENT_CODEX_HOOK_WEBMUX_STATUS_MESSAGE:
+        return False
+    if len(argv) < 2 or Path(argv[0]).name not in {"node", "nodejs"}:
+        return False
     return option_value("--kind") == "codex" and option_value("--status") in {
         "working",
         "waiting",
@@ -7268,6 +8849,9 @@ def install_codex_agent_hooks(
     target = Path(
         hooks_path or (Path.home() / ".codex" / "hooks.json")
     ).expanduser()
+    write_target = (
+        target.resolve(strict=False) if target.is_symlink() else target
+    )
     if target.exists():
         try:
             config = json.loads(target.read_text(encoding="utf-8"))
@@ -7358,7 +8942,7 @@ def install_codex_agent_hooks(
                         slack_stop_command,
                         timeout=AGENT_CODEX_HOOK_COMMAND_TIMEOUT_SECONDS,
                     ),
-                    "statusMessage": "Notifying Slack",
+                    "statusMessage": AGENT_CODEX_HOOK_SLACK_STATUS_MESSAGE,
                 }
             ]
         }
@@ -7374,7 +8958,7 @@ def install_codex_agent_hooks(
             mode=0o600,
         )
         backup_path = str(backup)
-    write_json_atomic(target, config)
+    write_json_atomic(write_target, config)
     result = {
         "hooks_path": str(target),
         "backup_path": backup_path,
@@ -7737,6 +9321,7 @@ class SlackSocketBot:
     ):
         self.config = config
         self.out = out
+        recover_slackbot_trust_transaction(config)
         self.executor = ThreadPoolExecutor(max_workers=config.worker_count)
         self.work_semaphore = threading.Semaphore(
             config.worker_count * WORK_QUEUE_DEPTH_PER_WORKER
@@ -8260,6 +9845,11 @@ class SlackSocketBot:
             dm_user_id=slack_user_id if channel_type == "im" else None,
             thread_ts=thread_ts,
         )
+        is_normally_authorized = self._is_authorized(
+            slack_user_id,
+            channel,
+            channel_type=channel_type,
+        )
         is_bound_notify_thread = (
             channel_type == "im"
             and self._is_agent_notify_tmux_thread(route, slack_user_id)
@@ -8267,11 +9857,6 @@ class SlackSocketBot:
         is_agent_notify_thread = is_bound_notify_thread or (
             channel_type == "im"
             and self._is_agent_notify_thread(route, slack_user_id)
-        )
-        is_normally_authorized = self._is_authorized(
-            slack_user_id,
-            channel,
-            channel_type=channel_type,
         )
         notification_binding_only = (
             is_agent_notify_thread and not is_normally_authorized
@@ -8663,7 +10248,7 @@ class SlackSocketBot:
                 "Only a Slackbot admin can run diagnostics.",
             )
             return
-        append_slackbot_audit_event(
+        _append_slackbot_audit_event_best_effort(
             self.config,
             {
                 "kind": "slackbot_control",
@@ -8671,6 +10256,7 @@ class SlackSocketBot:
                 "route": route_to_dict(route),
                 "slack_user_id": user_id,
             },
+            out=self.out,
         )
         detail = render_diagnostic_results(
             run_slackbot_diagnostics(self.config),
@@ -8747,27 +10333,115 @@ class SlackSocketBot:
                 "No channel ID was available for this request.",
             )
             return
-        if trusted:
-            changed = trust_slack_channel(self.config.paths, channel_id)
-            state = "trusted" if changed else "already trusted"
-            command = "allow-channel"
-        else:
-            changed = untrust_slack_channel(self.config.paths, channel_id)
-            state = (
-                "no longer trusted" if changed else "not currently trusted"
+        command = "allow-channel" if trusted else "revoke-channel"
+        audit_id = uuid.uuid4().hex
+        audit_event = {
+            "kind": "slackbot_control",
+            "command": command,
+            "audit_id": audit_id,
+            "channel_id": channel_id,
+            "route": route_to_dict(route),
+            "slack_user_id": user_id,
+            "requested_trusted": trusted,
+        }
+        with locked_json_path(self.config.paths.trust_path):
+            _recover_slackbot_trust_transaction_locked(self.config)
+            original_trust = read_slackbot_trust(self.config.paths)
+            channels = set(original_trust["trusted_channel_ids"])
+            changed = (
+                (channel_id not in channels)
+                if trusted
+                else (channel_id in channels)
             )
-            command = "revoke-channel"
-        append_slackbot_audit_event(
-            self.config,
-            {
-                "kind": "slackbot_control",
-                "command": command,
-                "channel_id": channel_id,
-                "route": route_to_dict(route),
-                "slack_user_id": user_id,
+            if trusted:
+                channels.add(channel_id)
+                state = "trusted" if changed else "already trusted"
+            else:
+                channels.discard(channel_id)
+                state = (
+                    "no longer trusted"
+                    if changed
+                    else "not currently trusted"
+                )
+            updated_trust = dict(original_trust)
+            updated_trust["trusted_channel_ids"] = sorted(channels)
+            transaction_path = _slackbot_trust_transaction_path(
+                self.config.paths
+            )
+            transaction = {
+                "version": 2,
+                "phase": "prepared",
+                "original_trust": original_trust,
+                "updated_trust": updated_trust,
+                "audit_event": audit_event,
                 "changed": changed,
-            },
-        )
+                "prepared_at": utcnow_iso(),
+            }
+            write_json_atomic(transaction_path, transaction)
+            append_slackbot_audit_event(
+                self.config,
+                {**audit_event, "status": "started", "changed": changed},
+            )
+            transaction = {
+                **transaction,
+                "phase": "started",
+                "started_at": utcnow_iso(),
+            }
+            write_json_atomic(transaction_path, transaction)
+            # State-write failures can roll back before completion is
+            # attempted. Once completion append starts, preserve the updated
+            # state because the audit record may already be durable even if
+            # its parent-directory fsync reports an error.
+            try:
+                if changed:
+                    write_json_atomic(
+                        self.config.paths.trust_path,
+                        updated_trust,
+                    )
+            except Exception as exc:
+                rollback_error = None
+                if changed:
+                    try:
+                        write_json_atomic(
+                            self.config.paths.trust_path,
+                            original_trust,
+                        )
+                    except Exception as rollback_exc:
+                        rollback_error = rollback_exc
+                _append_slackbot_audit_event_best_effort(
+                    self.config,
+                    {
+                        **audit_event,
+                        "status": "failed",
+                        "changed": changed,
+                        "error": str(exc),
+                        "rollback_error": (
+                            str(rollback_error) if rollback_error else None
+                        ),
+                    },
+                    out=self.out,
+                )
+                if rollback_error is not None:
+                    raise SlackbotError(
+                        "Channel trust update failed and could not be rolled "
+                        f"back: {rollback_error}"
+                    ) from exc
+                raise
+            transaction = {
+                **transaction,
+                "phase": "state_committed",
+                "state_committed_at": utcnow_iso(),
+            }
+            write_json_atomic(transaction_path, transaction)
+            append_slackbot_audit_event(
+                self.config,
+                {
+                    **audit_event,
+                    "status": "completed",
+                    "changed": changed,
+                },
+            )
+            _remove_slackbot_trust_transaction(self.config.paths)
         post_slack_message(
             self.config,
             route,
@@ -8879,9 +10553,24 @@ class SlackSocketBot:
         *,
         channel_type: str | None = None,
     ) -> bool:
+        try:
+            transaction_path = _slackbot_trust_transaction_path(
+                self.config.paths
+            )
+            with shared_locked_json_path(self.config.paths.trust_path):
+                if not os.path.lexists(transaction_path):
+                    trust = read_slackbot_trust(self.config.paths)
+                else:
+                    trust = None
+            if trust is None:
+                with locked_json_path(self.config.paths.trust_path):
+                    _recover_slackbot_trust_transaction_locked(self.config)
+                    trust = read_slackbot_trust(self.config.paths)
+        except Exception as exc:
+            emit(self.out, f"Failed to recover Slackbot trust state: {exc}")
+            return False
         if self._is_admin(user_id):
             return True
-        trust = read_slackbot_trust(self.config.paths)
         if user_id and user_id in trust["trusted_user_ids"]:
             return True
         if channel_id and channel_id in trust["trusted_channel_ids"]:
@@ -9138,24 +10827,48 @@ class SlackSocketBot:
             else None
         )
         if should_run_codex:
-            append_slackbot_audit_event(
-                self.config,
-                {
-                    "kind": "codex_invocation",
-                    "status": "started",
-                    "run_id": audit_run_id,
-                    "route": route_to_dict(route),
-                    "slack_user_id": slack_user_id,
-                    "execution_mode": execution_mode,
-                    "project": project,
-                    "session": session,
-                    "conversation_key": conversation_key,
-                    "prompt_sha256": hashlib.sha256(
-                        prompt.encode("utf-8", errors="replace")
-                    ).hexdigest(),
-                    "policy": effective_codex_policy(self.config),
-                },
-            )
+            try:
+                append_slackbot_audit_event(
+                    self.config,
+                    {
+                        "kind": "codex_invocation",
+                        "status": "started",
+                        "run_id": audit_run_id,
+                        "route": route_to_dict(route),
+                        "slack_user_id": slack_user_id,
+                        "execution_mode": execution_mode,
+                        "project": project,
+                        "session": session,
+                        "conversation_key": conversation_key,
+                        "prompt_sha256": hashlib.sha256(
+                            prompt.encode("utf-8", errors="replace")
+                        ).hexdigest(),
+                        "policy": audit_codex_policy(self.config),
+                    },
+                )
+            except Exception:
+                placeholder_update_channel = (
+                    placeholder_channel or route.channel_id
+                )
+                if placeholder_ts and placeholder_update_channel:
+                    try:
+                        update_slack_message(
+                            self.config,
+                            channel=placeholder_update_channel,
+                            ts=placeholder_ts,
+                            text=(
+                                "Codex did not start because its required "
+                                "audit record could not be written."
+                            ),
+                        )
+                    except Exception as update_exc:
+                        emit(
+                            self.out,
+                            "Failed to replace Slack placeholder after audit "
+                            f"failure: {update_exc}",
+                        )
+                raise
+        audit_session_id = None
         try:
             lock_context = (
                 self._conversation_lock(conversation_key)
@@ -9183,6 +10896,7 @@ class SlackSocketBot:
                         slack_context=slack_context,
                     )
                     resume_session_id = (record or {}).get("session_id")
+                    audit_session_id = resume_session_id
 
                     def run_codex_turn(
                         session_id: str | None,
@@ -9202,8 +10916,11 @@ class SlackSocketBot:
                         )
 
                     result = run_codex_turn(resume_session_id)
+                    audit_session_id = (
+                        result.get("session_id") or resume_session_id
+                    )
                     if resume_session_id and result.get("returncode"):
-                        append_slackbot_audit_event(
+                        _append_slackbot_audit_event_best_effort(
                             self.config,
                             {
                                 "kind": "codex_invocation",
@@ -9213,8 +10930,12 @@ class SlackSocketBot:
                                 "conversation_key": conversation_key,
                                 "returncode": result.get("returncode"),
                             },
+                            out=self.out,
                         )
                         result = run_codex_turn(None)
+                        audit_session_id = (
+                            result.get("session_id") or audit_session_id
+                        )
                     if conversation_key and result.get("session_id"):
                         self.conversations.set(
                             conversation_key,
@@ -9231,7 +10952,7 @@ class SlackSocketBot:
                         or result["stdout"]
                     )
                     codex_returncode = result["returncode"]
-                    append_slackbot_audit_event(
+                    _append_slackbot_audit_event_best_effort(
                         self.config,
                         {
                             "kind": "codex_invocation",
@@ -9241,6 +10962,7 @@ class SlackSocketBot:
                             "session_id": result.get("session_id"),
                             "conversation_key": conversation_key,
                         },
+                        out=self.out,
                     )
                     if result["returncode"]:
                         reply_body = (
@@ -9249,15 +10971,17 @@ class SlackSocketBot:
                         )
         except Exception as exc:
             if should_run_codex:
-                append_slackbot_audit_event(
+                _append_slackbot_audit_event_best_effort(
                     self.config,
                     {
                         "kind": "codex_invocation",
                         "status": "failed",
                         "run_id": audit_run_id,
+                        "session_id": audit_session_id,
                         "error": str(exc),
                         "conversation_key": conversation_key,
                     },
+                    out=self.out,
                 )
             if reply_body is None:
                 reply_body = (
@@ -9917,15 +11641,18 @@ class SlackSocketBot:
     def _has_agent_tmux_thread(self, route: SlackbotRoute) -> bool:
         if not route.channel_id or not route.thread_ts:
             return False
-        if self._agent_tmux_binding_for_route(route):
-            return True
-        return bool(
-            get_agent_tmux_job(
-                self.config,
-                channel_id=route.channel_id,
-                thread_ts=route.thread_ts,
+        try:
+            if self._agent_tmux_binding_for_route(route):
+                return True
+            return bool(
+                get_agent_tmux_job(
+                    self.config,
+                    channel_id=route.channel_id,
+                    thread_ts=route.thread_ts,
+                )
             )
-        )
+        except (OSError, UnicodeDecodeError, SlackbotError):
+            return False
 
     def _is_agent_notify_thread(
         self,
@@ -9941,8 +11668,16 @@ class SlackSocketBot:
         )
         if not notify_user_id or slack_user_id != notify_user_id:
             return False
-        state = read_json(agent_codex_hook_state_path(self.config.paths), {})
-        sessions = state.get("sessions") or {}
+        try:
+            state = read_json(
+                agent_codex_hook_state_path(self.config.paths), {}
+            )
+        except (OSError, UnicodeDecodeError):
+            state = {}
+        raw_sessions = (
+            state.get("sessions") if isinstance(state, dict) else {}
+        )
+        sessions = raw_sessions if isinstance(raw_sessions, dict) else {}
         for entry in sessions.values():
             if not isinstance(entry, dict):
                 continue
@@ -9952,15 +11687,16 @@ class SlackSocketBot:
                 and entry.get("notify_user_id") == notify_user_id
             ):
                 return True
-        return (
-            codex_hook_delivery_receipt_for_route(
+        try:
+            receipt = codex_hook_delivery_receipt_for_route(
                 self.config.paths,
                 channel_id=route.channel_id,
                 thread_ts=route.thread_ts,
                 notify_user_id=notify_user_id,
             )
-            is not None
-        )
+        except (OSError, SlackbotError):
+            return False
+        return receipt is not None
 
     def _is_agent_notify_tmux_thread(
         self,
@@ -9974,7 +11710,10 @@ class SlackSocketBot:
         )
         if not notify_user_id or slack_user_id != notify_user_id:
             return False
-        return self._agent_tmux_binding_for_route(route) is not None
+        try:
+            return self._agent_tmux_binding_for_route(route) is not None
+        except (OSError, UnicodeDecodeError, SlackbotError):
+            return False
 
     def _maybe_mirror_agent_tmux_reply(
         self,
@@ -9991,7 +11730,10 @@ class SlackSocketBot:
         )
         if not notify_user_id or slack_user_id != notify_user_id:
             return False
-        binding = self._agent_tmux_binding_for_route(route)
+        try:
+            binding = self._agent_tmux_binding_for_route(route)
+        except (OSError, UnicodeDecodeError, SlackbotError):
+            return False
         if not binding:
             return False
         try:
@@ -10041,21 +11783,24 @@ class SlackSocketBot:
             return False
 
         command = tokens[0].lower()
-        job = get_agent_tmux_job(
-            self.config,
-            channel_id=route.channel_id,
-            thread_ts=route.thread_ts,
-        )
-        binding = query_agent_tmux_thread(
-            self.config.profile,
-            runtime_root=self.config.paths.runtime_root,
-            env_path=self.config.paths.env_path,
-            state_dir=self.config.paths.state_dir,
-            system_prompt_path=self.config.paths.system_prompt_path,
-            unit_name=self.config.paths.unit_name,
-            channel_id=route.channel_id,
-            thread_ts=route.thread_ts,
-        )
+        try:
+            job = get_agent_tmux_job(
+                self.config,
+                channel_id=route.channel_id,
+                thread_ts=route.thread_ts,
+            )
+            binding = query_agent_tmux_thread(
+                self.config.profile,
+                runtime_root=self.config.paths.runtime_root,
+                env_path=self.config.paths.env_path,
+                state_dir=self.config.paths.state_dir,
+                system_prompt_path=self.config.paths.system_prompt_path,
+                unit_name=self.config.paths.unit_name,
+                channel_id=route.channel_id,
+                thread_ts=route.thread_ts,
+            )
+        except (OSError, UnicodeDecodeError, SlackbotError):
+            return False
         generic_command = command in {"?", "help", "jobs", "use"}
         if not allow_generic_commands and generic_command:
             post_slack_message(
@@ -10507,6 +12252,40 @@ def run_slackbot(
     )
 
 
+def _observe_agent_tmux_binding_state(
+    paths: SlackbotPaths,
+    *,
+    lock_timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    with locked_agent_tmux_json_path(
+        paths.agent_tmux_bindings_path,
+        timeout_seconds=lock_timeout_seconds,
+    ):
+        data = _read_agent_tmux_bindings(paths.agent_tmux_bindings_path)
+        revision_state = _agent_tmux_binding_revision_state(
+            paths.agent_tmux_bindings_path,
+            data,
+        )
+        _persist_agent_tmux_tombstone_reconciliation(
+            paths.agent_tmux_bindings_path,
+            data,
+            revision_state,
+        )
+        return revision_state
+
+
+def _observe_agent_tmux_binding_revision(
+    paths: SlackbotPaths,
+    *,
+    lock_timeout_seconds: float | None = None,
+) -> int:
+    revision_state = _observe_agent_tmux_binding_state(
+        paths,
+        lock_timeout_seconds=lock_timeout_seconds,
+    )
+    return int(revision_state["binding_revision"])
+
+
 def bind_agent_tmux_thread(
     profile: SlackbotProfile,
     *,
@@ -10522,6 +12301,10 @@ def bind_agent_tmux_thread(
     tmux_server_pid: str | None = None,
     exclusive_target: bool = False,
     claim_target_if_unbound: bool = False,
+    replace_route_if_mismatched: bool = False,
+    replace_route_if_older_than: str | None = None,
+    replace_route_if_revision_at_most: int | None = None,
+    require_existing_route: bool = False,
     runtime_root: str | None = None,
     env_path: str | None = None,
     state_dir: str | None = None,
@@ -10541,18 +12324,30 @@ def bind_agent_tmux_thread(
         profile,
         dict(read_env_file(paths.env_path)),
     )
+    tmux_socket = normalize_tmux_socket(tmux_socket) or None
     key = f"{channel_id}:{thread_ts}"
     with locked_agent_tmux_json_path(
         paths.agent_tmux_bindings_path,
         timeout_seconds=lock_timeout_seconds,
     ):
-        data = read_json(paths.agent_tmux_bindings_path, {})
+        data = _read_agent_tmux_bindings(paths.agent_tmux_bindings_path)
+        revision_state = _agent_tmux_binding_revision_state(
+            paths.agent_tmux_bindings_path,
+            data,
+        )
+        _persist_agent_tmux_tombstone_reconciliation(
+            paths.agent_tmux_bindings_path,
+            data,
+            revision_state,
+        )
+        binding_revision = int(revision_state["binding_revision"]) + 1
         binding = {
             "channel_id": channel_id,
             "thread_ts": thread_ts,
             "host": host,
             "tmux_session": tmux_session,
-            "updated_at": utcnow_iso(),
+            "updated_at": _utcnow_precise_iso(),
+            "binding_revision": binding_revision,
         }
         if tmux_socket:
             binding["tmux_socket"] = tmux_socket
@@ -10567,7 +12362,51 @@ def bind_agent_tmux_thread(
         ):
             if value:
                 binding[identity_key] = value
+        binding_to_store = binding
+        replacement_guarded = replace_route_if_mismatched and (
+            replace_route_if_revision_at_most is not None
+            or replace_route_if_older_than is not None
+        )
+        if replacement_guarded and not (
+            _agent_tmux_route_tombstone_not_newer_than(
+                revision_state,
+                key,
+                revision=replace_route_if_revision_at_most,
+                timestamp=replace_route_if_older_than,
+            )
+        ):
+            return None
+        existing = data.get(key)
+        existing_matches = isinstance(existing, dict) and (
+            _agent_tmux_binding_satisfies_expected(
+                existing,
+                binding,
+                default_socket=default_tmux_socket,
+            )
+        )
+        restore_floor_blocks_recreation = (
+            replace_route_if_revision_at_most is not None
+            and replace_route_if_revision_at_most
+            < int(revision_state["restore_floor_revision"])
+        )
+        if restore_floor_blocks_recreation and not existing_matches:
+            return None
+        if require_existing_route and not existing_matches:
+            return None
         if exclusive_target:
+            if existing_matches:
+                preserve_existing = require_existing_route or (
+                    replacement_guarded
+                    and not _agent_tmux_binding_not_newer_than(
+                        existing,
+                        revision=replace_route_if_revision_at_most,
+                        timestamp=replace_route_if_older_than,
+                    )
+                )
+                if preserve_existing:
+                    binding_to_store = dict(existing)
+                    binding_to_store["updated_at"] = binding["updated_at"]
+                    binding_to_store["binding_revision"] = binding_revision
             target_routes = [
                 candidate_key
                 for candidate_key, candidate in data.items()
@@ -10575,19 +12414,75 @@ def bind_agent_tmux_thread(
                     candidate_key != key
                     and isinstance(candidate, dict)
                     and _agent_tmux_bindings_same_target(
-                        binding,
+                        binding_to_store,
                         candidate,
                         default_socket=default_tmux_socket,
                     )
                 )
             ]
-            if claim_target_if_unbound and (key in data or target_routes):
-                return None
-            for candidate_key in target_routes:
-                data.pop(candidate_key, None)
-        data[key] = binding
+            if claim_target_if_unbound:
+                conflict_keys = list(target_routes)
+                if key in data and not existing_matches:
+                    conflict_keys.append(key)
+                if conflict_keys:
+                    if not replace_route_if_mismatched:
+                        return None
+                    if any(
+                        not _agent_tmux_route_state_not_newer_than(
+                            data,
+                            revision_state,
+                            candidate_key,
+                            revision=replace_route_if_revision_at_most,
+                            timestamp=replace_route_if_older_than,
+                        )
+                        for candidate_key in conflict_keys
+                    ):
+                        return None
+                    for candidate_key in conflict_keys:
+                        data.pop(candidate_key, None)
+                        _record_agent_tmux_route_tombstone(
+                            revision_state,
+                            candidate_key,
+                            binding_revision=binding_revision,
+                            updated_at=binding["updated_at"],
+                        )
+            else:
+                guarded_keys = list(target_routes)
+                if key in data and not existing_matches:
+                    guarded_keys.append(key)
+                if replace_route_if_mismatched and guarded_keys:
+                    if any(
+                        not _agent_tmux_route_state_not_newer_than(
+                            data,
+                            revision_state,
+                            candidate_key,
+                            revision=replace_route_if_revision_at_most,
+                            timestamp=replace_route_if_older_than,
+                        )
+                        for candidate_key in guarded_keys
+                    ):
+                        return None
+                for candidate_key in target_routes:
+                    data.pop(candidate_key, None)
+                    _record_agent_tmux_route_tombstone(
+                        revision_state,
+                        candidate_key,
+                        binding_revision=binding_revision,
+                        updated_at=binding["updated_at"],
+                    )
+        data[key] = binding_to_store
+        revision_state["binding_revision"] = binding_revision
+        _sync_agent_tmux_binding_revision_state(revision_state, data)
+        # A crash after this write becomes a missing route. Publishing the
+        # binding first could expose an untracked route after restart.
+        write_json_atomic(
+            _agent_tmux_binding_revision_counter_path(
+                paths.agent_tmux_bindings_path
+            ),
+            revision_state,
+        )
         write_json_atomic(paths.agent_tmux_bindings_path, data)
-        return binding
+        return binding_to_store
 
 
 def unbind_agent_tmux_thread(
@@ -10595,6 +12490,9 @@ def unbind_agent_tmux_thread(
     *,
     channel_id: str,
     thread_ts: str,
+    only_if_older_than: str | None = None,
+    only_if_revision_at_most: int | None = None,
+    only_if_matches: dict[str, Any] | None = None,
     runtime_root: str | None = None,
     env_path: str | None = None,
     state_dir: str | None = None,
@@ -10611,12 +12509,76 @@ def unbind_agent_tmux_thread(
         unit_name=unit_name,
     )
     key = agent_tmux_thread_key(channel_id, thread_ts)
+    default_tmux_socket = _configured_codex_tmux_socket(
+        profile,
+        dict(read_env_file(paths.env_path)),
+    )
     with locked_agent_tmux_json_path(
         paths.agent_tmux_bindings_path,
         timeout_seconds=lock_timeout_seconds,
     ):
-        data = read_json(paths.agent_tmux_bindings_path, {})
+        data = _read_agent_tmux_bindings(paths.agent_tmux_bindings_path)
+        revision_state = _agent_tmux_binding_revision_state(
+            paths.agent_tmux_bindings_path,
+            data,
+        )
+        _persist_agent_tmux_tombstone_reconciliation(
+            paths.agent_tmux_bindings_path,
+            data,
+            revision_state,
+        )
+        current = data.get(key)
+        cutoff_guarded = (
+            only_if_older_than is not None
+            or only_if_revision_at_most is not None
+        )
+        guarded = cutoff_guarded or only_if_matches is not None
+        if guarded and (
+            current is None
+            or (
+                only_if_matches is not None
+                and not _agent_tmux_binding_matches_snapshot(
+                    current,
+                    only_if_matches,
+                    default_socket=default_tmux_socket,
+                )
+            )
+            or (
+                cutoff_guarded
+                and not _agent_tmux_route_state_not_newer_than(
+                    data,
+                    revision_state,
+                    key,
+                    revision=only_if_revision_at_most,
+                    timestamp=only_if_older_than,
+                )
+            )
+        ):
+            return False
         removed = data.pop(key, None) is not None
+        if (
+            not removed
+            and not guarded
+            and key in revision_state["route_tombstones"]
+        ):
+            return False
+        if removed or not guarded:
+            binding_revision = int(revision_state["binding_revision"]) + 1
+            revision_state["binding_revision"] = binding_revision
+            _record_agent_tmux_route_tombstone(
+                revision_state,
+                key,
+                binding_revision=binding_revision,
+                updated_at=_utcnow_precise_iso(),
+            )
+            _sync_agent_tmux_binding_revision_state(revision_state, data)
+            # Persist the tombstone before deleting the route document.
+            write_json_atomic(
+                _agent_tmux_binding_revision_counter_path(
+                    paths.agent_tmux_bindings_path
+                ),
+                revision_state,
+            )
         if removed:
             write_json_atomic(paths.agent_tmux_bindings_path, data)
         return removed
@@ -10642,12 +12604,27 @@ def query_agent_tmux_thread(
         system_prompt_path=system_prompt_path,
         unit_name=unit_name,
     )
-    with locked_agent_tmux_json_path(
-        paths.agent_tmux_bindings_path,
-        timeout_seconds=lock_timeout_seconds,
-    ):
-        data = read_json(paths.agent_tmux_bindings_path, {})
-        return data.get(f"{channel_id}:{thread_ts}")
+    try:
+        with locked_agent_tmux_json_path(
+            paths.agent_tmux_bindings_path,
+            timeout_seconds=lock_timeout_seconds,
+        ):
+            data = _read_agent_tmux_bindings(paths.agent_tmux_bindings_path)
+            revision_state = _agent_tmux_binding_revision_state(
+                paths.agent_tmux_bindings_path,
+                data,
+            )
+            _persist_agent_tmux_tombstone_reconciliation(
+                paths.agent_tmux_bindings_path,
+                data,
+                revision_state,
+            )
+            return data.get(f"{channel_id}:{thread_ts}")
+    except (OSError, SlackbotError, UnicodeDecodeError) as exc:
+        raise AgentTmuxStateError(
+            "Agent tmux binding state is unavailable at "
+            f"{paths.agent_tmux_bindings_path}: {exc}"
+        ) from exc
 
 
 def list_agent_tmux_jobs(

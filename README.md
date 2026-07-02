@@ -51,3 +51,11 @@ local repo is missing, it falls back to
 Multiple plugins can be installed. If two plugins expose the same command name,
 Sneeze prefixes the plugin username, such as `tpn-foo` and `dave-foo`. Core
 commands keep the unprefixed name.
+
+## Run Log Locks
+
+Run-log writes use a flock-backed v2 lock plus a compatibility `.lock` file.
+Dead local legacy locks are reclaimed after PID validation when the platform
+and filesystem support atomic path exchange. Unsupported exchange, live,
+remote, malformed, and unverifiable locks fail closed. The former
+`SNEEZE_LEGACY_RUN_LOG_LOCK_STALE` delay is no longer used.

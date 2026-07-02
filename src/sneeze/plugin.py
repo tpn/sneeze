@@ -50,10 +50,14 @@ def default_plugin_dir(username, base_dir=None):
 def github_shorthand_to_url(spec):
     if not spec.startswith("gh:"):
         return spec
-    repo = spec[3:]
+    repo, separator, revision = spec[3:].partition("@")
     if "/" not in repo:
         raise PluginError("gh: plugin specs must be in owner/repo form")
-    return f"git+https://github.com/{repo}.git"
+    if separator and not revision:
+        raise PluginError("gh: plugin revision must not be empty")
+    suffix = f"@{revision}" if revision else ""
+    git_suffix = "" if repo.lower().endswith(".git") else ".git"
+    return f"git+https://github.com/{repo}{git_suffix}{suffix}"
 
 
 def resolve_plugin_install_target(spec, src_dir=None):
@@ -207,12 +211,16 @@ dependencies = [
   "sneeze",
 ]
 
+[project.entry-points."sneeze.plugins"]
+{username} = "{package}"
+
 [tool.setuptools]
 package-dir = {{"" = "src"}}
 
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["sneeze", "sneeze.*"]
+# Discover the init-less parent; core's extend_path merges it at runtime.
 namespaces = true
 
 [tool.black]
