@@ -4844,18 +4844,29 @@ def _agent_tmux_sockets_same(left: str, right: str) -> bool:
     if not left or not right:
         return left == right
 
-    def socket_path(value: str) -> Path:
+    def socket_path(value: str) -> Path | None:
         if value == TMUX_DEFAULT_SERVER_SOCKET:
             value = "default"
         if "/" not in value:
-            uid = getattr(os, "getuid", lambda: 1000)()
+            getuid = getattr(os, "getuid", None)
+            if getuid is None:
+                return None
+            uid = getuid()
             socket_root = (
                 Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{uid}"
             )
             return socket_root / value
         return Path(value).expanduser().absolute()
 
-    return socket_path(left) == socket_path(right)
+    left_path = socket_path(left)
+    right_path = socket_path(right)
+    if left_path is None or right_path is None:
+        left_name = "default" if left == TMUX_DEFAULT_SERVER_SOCKET else left
+        right_name = (
+            "default" if right == TMUX_DEFAULT_SERVER_SOCKET else right
+        )
+        return "/" not in left_name and left_name == right_name
+    return left_path == right_path
 
 
 def _agent_tmux_bindings_same_target(

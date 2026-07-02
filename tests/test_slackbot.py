@@ -1449,7 +1449,8 @@ def test_agent_tmux_socket_alias_has_non_posix_uid_fallback(monkeypatch):
     monkeypatch.delenv("TMUX_TMPDIR", raising=False)
     monkeypatch.delattr(slackbot_module.os, "getuid", raising=False)
 
-    assert slackbot_module._agent_tmux_sockets_same(
+    assert slackbot_module._agent_tmux_sockets_same("codex", "codex")
+    assert not slackbot_module._agent_tmux_sockets_same(
         "codex",
         "/tmp/tmux-1000/codex",
     )
