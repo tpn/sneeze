@@ -4769,12 +4769,18 @@ def resolve_codex_agent_tmux_binding(
         return None
     tmux_bin = codex_tmux_bin(config)
     attempts: list[tuple[str | None, str | None]] = []
-    if environment_pane_id and not payload_pane_id and tmux_env_socket:
+    if (
+        not explicit_socket
+        and environment_pane_id
+        and not payload_pane_id
+        and tmux_env_socket
+    ):
         attempts.append((tmux_env_socket, None))
     attempts.append((resolved_socket, resolved_conf))
-    if tmux_env_socket:
-        attempts.append((tmux_env_socket, None))
-    attempts.append((None, None))
+    if not explicit_socket:
+        if tmux_env_socket:
+            attempts.append((tmux_env_socket, None))
+        attempts.append((None, None))
     seen: set[tuple[str | None, str | None]] = set()
     for socket_value, conf_value in attempts:
         key = (socket_value, conf_value)

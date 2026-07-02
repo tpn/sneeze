@@ -1483,6 +1483,49 @@ def test_tmux_binding_resolves_pane_from_tmux_socket_env(
     assert calls[0][1:3] == ["-S", socket_path]
 
 
+def test_tmux_binding_explicit_socket_precedes_ambient_tmux(
+    tmp_path,
+    monkeypatch,
+):
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    ambient_socket = str(tmp_path / "ambient.sock")
+    explicit_socket = str(tmp_path / "explicit.sock")
+    monkeypatch.setenv("TMUX", f"{ambient_socket},123,0")
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    for env_name in (
+        "WEBMUX_AGENT_SESSION",
+        "CODEX_TMUX_SESSION_NAME",
+        "CODEX_TMUX_SOCKET",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    calls = []
+
+    def fake_pane_identity(tmux_bin, pane_id, **kwargs):
+        calls.append(kwargs["tmux_socket"])
+        return {
+            "tmux_session": "codex-work",
+            "tmux_pane": pane_id,
+        }
+
+    monkeypatch.setattr(
+        "sneeze.slackbot._resolve_tmux_pane_identity",
+        fake_pane_identity,
+    )
+
+    binding = resolve_codex_agent_tmux_binding(
+        config,
+        {"tmux_socket": explicit_socket},
+    )
+
+    assert binding["tmux_socket"] == explicit_socket
+    assert calls == [explicit_socket]
+
+
 def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
     tmp_path,
     monkeypatch,
