@@ -4829,6 +4829,21 @@ def agent_tmux_thread_key(channel_id: str, thread_ts: str) -> str:
     return f"{channel_id}:{thread_ts}"
 
 
+def _agent_tmux_bindings_same_target(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> bool:
+    for key in ("host", "tmux_session", "tmux_socket", "tmux_pane"):
+        if str(left.get(key) or "") != str(right.get(key) or ""):
+            return False
+    for key in AGENT_TMUX_PANE_IDENTITY_KEYS:
+        left_value = str(left.get(key) or "")
+        right_value = str(right.get(key) or "")
+        if left_value and right_value and left_value != right_value:
+            return False
+    return True
+
+
 def _clean_agent_tmux_text(text: str) -> str:
     lines = [
         line.rstrip() for line in text.replace("\r\n", "\n").splitlines()
@@ -5484,6 +5499,20 @@ def _codex_hook_requested_tmux_sockets(
     return tuple(OrderedDict.fromkeys(candidates))
 
 
+def _codex_hook_requested_state_key(
+    *,
+    tmux_pane: str | None,
+    tmux_session: str | None,
+    tmux_sockets: tuple[str, ...],
+) -> str | None:
+    if not tmux_session or len(tmux_sockets) != 1:
+        return None
+    parts = [socket.gethostname(), tmux_sockets[0], tmux_session]
+    if tmux_pane:
+        parts.append(tmux_pane)
+    return "tmux:" + ":".join(parts)
+
+
 def _codex_hook_binding_matches_request(
     binding: dict[str, str],
     *,
@@ -6118,7 +6147,17 @@ def notify_codex_agent_stop(
         pane_binding_rejected = True
     session_id = _codex_hook_text_value(payload, "session_id")
     transcript_path = _codex_hook_text_value(payload, "transcript_path")
-    desired_key = _codex_hook_state_key(payload, binding)
+    requested_state_key = _codex_hook_requested_state_key(
+        tmux_pane=requested_pane,
+        tmux_session=requested_session,
+        tmux_sockets=requested_sockets,
+    )
+    if session_id or binding:
+        desired_key = _codex_hook_state_key(payload, binding)
+    elif requested_state_key:
+        desired_key = requested_state_key
+    else:
+        desired_key = _codex_hook_state_key(payload, binding)
     turn_id = _codex_hook_text_value(payload, "turn_id")
     message = _codex_hook_message_text(payload)
     message_hash = _codex_hook_message_hash(message)
@@ -6130,7 +6169,11 @@ def notify_codex_agent_stop(
         transcript_path=transcript_path,
     )
     state_path = agent_codex_hook_state_path(config.paths)
-    fallback_key = _codex_hook_state_key({}, binding) if binding else None
+    fallback_key = (
+        _codex_hook_state_key({}, binding) if binding else requested_state_key
+    )
+    if pane_binding_rejected:
+        fallback_key = None
 
     with _locked_codex_hook_delivery(
         state_path,
@@ -6317,6 +6360,7 @@ def notify_codex_agent_stop(
                                 "tmux_session_created"
                             ),
                             tmux_server_pid=binding.get("tmux_server_pid"),
+                            exclusive_target=True,
                             lock_timeout_seconds=(
                                 AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
                             ),
@@ -6514,6 +6558,7 @@ def notify_codex_agent_stop(
                     tmux_pane_pid=binding.get("tmux_pane_pid"),
                     tmux_session_created=binding.get("tmux_session_created"),
                     tmux_server_pid=binding.get("tmux_server_pid"),
+                    exclusive_target=True,
                     lock_timeout_seconds=(
                         AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
                     ),
@@ -10123,6 +10168,7 @@ def bind_agent_tmux_thread(
     tmux_pane_pid: str | None = None,
     tmux_session_created: str | None = None,
     tmux_server_pid: str | None = None,
+    exclusive_target: bool = False,
     runtime_root: str | None = None,
     env_path: str | None = None,
     state_dir: str | None = None,
@@ -10144,7 +10190,7 @@ def bind_agent_tmux_thread(
         timeout_seconds=lock_timeout_seconds,
     ):
         data = read_json(paths.agent_tmux_bindings_path, {})
-        data[key] = {
+        binding = {
             "channel_id": channel_id,
             "thread_ts": thread_ts,
             "host": host,
@@ -10152,20 +10198,29 @@ def bind_agent_tmux_thread(
             "updated_at": utcnow_iso(),
         }
         if tmux_socket:
-            data[key]["tmux_socket"] = tmux_socket
+            binding["tmux_socket"] = tmux_socket
         if tmux_conf:
-            data[key]["tmux_conf"] = tmux_conf
+            binding["tmux_conf"] = tmux_conf
         if tmux_pane:
-            data[key]["tmux_pane"] = tmux_pane
+            binding["tmux_pane"] = tmux_pane
         for identity_key, value in (
             ("tmux_pane_pid", tmux_pane_pid),
             ("tmux_session_created", tmux_session_created),
             ("tmux_server_pid", tmux_server_pid),
         ):
             if value:
-                data[key][identity_key] = value
+                binding[identity_key] = value
+        if exclusive_target:
+            for candidate_key, candidate in tuple(data.items()):
+                if (
+                    candidate_key != key
+                    and isinstance(candidate, dict)
+                    and _agent_tmux_bindings_same_target(binding, candidate)
+                ):
+                    data.pop(candidate_key, None)
+        data[key] = binding
         write_json_atomic(paths.agent_tmux_bindings_path, data)
-        return data[key]
+        return binding
 
 
 def unbind_agent_tmux_thread(
