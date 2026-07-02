@@ -6177,6 +6177,17 @@ def notify_codex_agent_stop(
                 str(entry.get("notify_user_id") or "").strip()
                 == notify_user_id
             )
+            stale_recipient_route = None
+            if (
+                not recipient_matches
+                and entry.get("notify_user_id")
+                and entry.get("channel_id")
+                and entry.get("thread_ts")
+            ):
+                stale_recipient_route = (
+                    str(entry["channel_id"]),
+                    str(entry["thread_ts"]),
+                )
             duplicate = recipient_matches and _codex_hook_notification_seen(
                 entry,
                 session_id=session_id,
@@ -6396,6 +6407,28 @@ def notify_codex_agent_stop(
                 write_receipt_paths,
                 receipt,
             )
+
+        if stale_recipient_route:
+            stale_channel_id, stale_thread_ts = stale_recipient_route
+            try:
+                unbind_agent_tmux_thread(
+                    profile,
+                    runtime_root=runtime_root,
+                    env_path=env_path,
+                    state_dir=state_dir,
+                    system_prompt_path=system_prompt_path,
+                    unit_name=unit_name,
+                    channel_id=stale_channel_id,
+                    thread_ts=stale_thread_ts,
+                    lock_timeout_seconds=(
+                        AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
+                    ),
+                )
+            except Exception as exc:
+                raise CodexHookRetryableError(
+                    "Codex hook delivery is durable but stale recipient "
+                    f"binding cleanup failed: {exc}"
+                ) from exc
 
         with _locked_codex_hook_finalization_state(state_path):
             state = read_json(state_path, {})

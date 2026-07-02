@@ -2193,6 +2193,14 @@ def test_codex_stop_hook_starts_new_thread_when_recipient_changes(
         thread_ts="2.000001",
     )
     assert binding["tmux_session"] == "codex-work"
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
 
 
 def test_codex_stop_hook_keeps_distinct_sessions_on_same_tmux_separate(
