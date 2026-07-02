@@ -5412,28 +5412,40 @@ def paste_agent_tmux_text(
             tmux_session=tmux_session,
             tmux_socket=tmux_socket,
         )
-    paste_result = subprocess.run(
-        [
-            *tmux_command,
-            "paste-buffer",
-            "-d",
-            "-p",
-            "-b",
-            buffer_name,
-            "-t",
-            tmux_target,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if paste_result.returncode != 0:
-        raise _tmux_run_error(
-            "paste-buffer",
-            paste_result,
-            tmux_session=tmux_session,
-            tmux_socket=tmux_socket,
+    try:
+        paste_result = subprocess.run(
+            [
+                *tmux_command,
+                "paste-buffer",
+                "-d",
+                "-p",
+                "-b",
+                buffer_name,
+                "-t",
+                tmux_target,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
         )
+        if paste_result.returncode != 0:
+            raise _tmux_run_error(
+                "paste-buffer",
+                paste_result,
+                tmux_session=tmux_session,
+                tmux_socket=tmux_socket,
+            )
+    except BaseException:
+        try:
+            subprocess.run(
+                [*tmux_command, "delete-buffer", "-b", buffer_name],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            pass
+        raise
     enter_result = subprocess.run(
         [*tmux_command, "send-keys", "-t", tmux_target, "Enter"],
         check=False,
@@ -6231,6 +6243,23 @@ def _locked_codex_hook_finalization_state(state_path: str):
         ) from exc
 
 
+@contextmanager
+def _locked_codex_hook_pre_delivery_state(state_path: str):
+    try:
+        with locked_agent_tmux_json_path(
+            state_path,
+            timeout_seconds=AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS,
+        ):
+            yield
+    except CodexHookRetryableError:
+        raise
+    except Exception as exc:
+        raise CodexHookRetryableError(
+            "Codex hook delivery has not started because state preparation "
+            f"failed: {exc}"
+        ) from exc
+
+
 def _render_codex_stop_notification(
     payload: dict[str, Any],
     binding: dict[str, str] | None,
@@ -6402,10 +6431,7 @@ def notify_codex_agent_stop(
         notify_user_id=notify_user_id,
         transcript_path=transcript_path,
     ) as (_, write_receipt_paths, receipt_paths, receipt):
-        with locked_agent_tmux_json_path(
-            state_path,
-            timeout_seconds=AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS,
-        ):
+        with _locked_codex_hook_pre_delivery_state(state_path):
             state = read_json(state_path, {})
             sessions = state.setdefault("sessions", {})
             key, entry, entry_migrated = _codex_hook_resolved_entry(
@@ -6481,6 +6507,7 @@ def notify_codex_agent_stop(
                 write_json_atomic(state_path, state)
 
         recovered_receipt = receipt is not None
+        receipt_write_error = None
         if receipt:
             channel_id = str(receipt["channel_id"])
             thread_ts = str(receipt["thread_ts"])
@@ -6702,10 +6729,13 @@ def notify_codex_agent_stop(
             receipt_paths = tuple(
                 sorted({*receipt_paths, route_receipt_path})
             )
-            _write_codex_hook_delivery_receipts(
-                write_receipt_paths,
-                receipt,
-            )
+            try:
+                _write_codex_hook_delivery_receipts(
+                    write_receipt_paths,
+                    receipt,
+                )
+            except Exception as exc:
+                receipt_write_error = exc
 
         if stale_recipient_route:
             stale_channel_id, stale_thread_ts = stale_recipient_route
@@ -6822,6 +6852,11 @@ def notify_codex_agent_stop(
                 "Codex hook delivery is durable but receipt cleanup "
                 f"failed: {exc}"
             ) from exc
+        if receipt_write_error is not None:
+            raise CodexHookRetryableError(
+                "Codex hook delivery was finalized but receipt persistence "
+                f"failed: {receipt_write_error}"
+            ) from receipt_write_error
     return {
         "status": "skipped" if recovered_receipt else "notified",
         "reason": "delivery_receipt" if recovered_receipt else None,
@@ -7230,7 +7265,9 @@ def install_codex_agent_hooks(
     webmux_script_path: str | None = None,
     include_webmux: bool = True,
 ) -> dict[str, Any]:
-    target = Path(hooks_path or (Path.home() / ".codex" / "hooks.json"))
+    target = Path(
+        hooks_path or (Path.home() / ".codex" / "hooks.json")
+    ).expanduser()
     if target.exists():
         try:
             config = json.loads(target.read_text(encoding="utf-8"))

@@ -3852,6 +3852,56 @@ def test_codex_stop_hook_times_out_waiting_for_resolver_lock(
             notify_codex_agent_stop(profile, payload)
 
 
+def test_codex_stop_hook_pre_delivery_state_timeout_is_retryable(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+
+    class FailingStateLock:
+        def __enter__(self):
+            raise SlackbotError("Timed out waiting for Slackbot state lock")
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "locked_agent_tmux_json_path",
+        lambda *args, **kwargs: FailingStateLock(),
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "post_slack_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("pre-delivery timeout must not post")
+        ),
+    )
+
+    with pytest.raises(
+        slackbot_module.CodexHookRetryableError,
+        match="state preparation failed",
+    ):
+        notify_codex_agent_stop(
+            profile,
+            json.dumps(
+                {
+                    "session_id": "codex-session-1",
+                    "turn_id": "turn-1",
+                    "last_assistant_message": "Ready for review.",
+                }
+            ),
+        )
+
+
 def test_codex_hook_delivery_locks_use_fixed_buckets(tmp_path):
     state_path = str(tmp_path / "agent-codex-hooks.json")
     lock_paths = {
@@ -4598,6 +4648,71 @@ def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
     assert len(calls) == 1
 
 
+def test_codex_stop_hook_finalizes_state_after_first_receipt_write_failure(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    env_path = Path(config.paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append((route, text))
+        return {"channel": "D111", "ts": "1.000001"}
+
+    original_write_json = slackbot_module.write_json_atomic
+
+    def fail_receipt_write(path, data, *args, **kwargs):
+        if str(path).endswith(".receipt.json"):
+            raise OSError("first receipt disk error")
+        return original_write_json(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(
+        slackbot_module,
+        "write_json_atomic",
+        fail_receipt_write,
+    )
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "turn_id": "turn-1",
+            "last_assistant_message": "Ready for review.",
+        }
+    )
+
+    with pytest.raises(
+        slackbot_module.CodexHookRetryableError,
+        match="receipt persistence failed",
+    ):
+        notify_codex_agent_stop(profile, payload)
+
+    entry = query_codex_agent_threads(profile)["hook_state"]["sessions"][
+        "session:codex-session-1"
+    ]
+    assert entry["channel_id"] == "D111"
+    assert entry["thread_ts"] == "1.000001"
+    assert len(entry["notifications"]) == 1
+
+    monkeypatch.setattr(
+        slackbot_module,
+        "write_json_atomic",
+        original_write_json,
+    )
+    retry = notify_codex_agent_stop(profile, payload)
+
+    assert retry["status"] == "skipped"
+    assert retry["reason"] == "duplicate"
+    assert len(calls) == 1
+
+
 def test_codex_stop_hook_rejects_mismatched_receipt_binding(
     tmp_path,
     monkeypatch,
@@ -5175,6 +5290,38 @@ def test_codex_agent_hooks_install_can_skip_webmux(tmp_path):
     assert result["installed"] == {"slack_stop": True, "webmux": False}
 
 
+def test_codex_agent_hooks_install_expands_tilde_before_backup(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    hooks_path = tmp_path / ".codex" / "hooks.json"
+    hooks_path.parent.mkdir(parents=True)
+    original = {
+        "hooks": {
+            "PostToolUse": [
+                {"hooks": [{"type": "command", "command": "python audit.py"}]}
+            ]
+        }
+    }
+    hooks_path.write_text(json.dumps(original), encoding="utf-8")
+
+    result = install_codex_agent_hooks(
+        hooks_path="~/.codex/hooks.json",
+        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        include_webmux=False,
+    )
+
+    installed = json.loads(hooks_path.read_text(encoding="utf-8"))
+    assert (
+        installed["hooks"]["PostToolUse"] == original["hooks"]["PostToolUse"]
+    )
+    assert Path(result["backup_path"]).read_text(encoding="utf-8") == (
+        json.dumps(original)
+    )
+    assert result["hooks_path"] == str(hooks_path)
+
+
 def test_codex_agent_hooks_install_replaces_custom_named_webmux_hooks(
     tmp_path,
 ):
@@ -5475,6 +5622,55 @@ def test_agent_tmux_paste_targets_bound_pane(tmp_path, monkeypatch):
     assert "-p" in calls[2][0]
     assert calls[2][0][-2:] == ["-t", "%7"]
     assert calls[3][0][-2:] == ["%7", "Enter"]
+
+
+def test_agent_tmux_paste_failure_deletes_loaded_buffer(
+    tmp_path, monkeypatch
+):
+    profile = replace(
+        make_profile(tmp_path),
+        default_codex_tmux_socket="codex",
+    )
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        if "display-message" in args:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="codex-work\n",
+                stderr="",
+            )
+        if "paste-buffer" in args:
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="paste failed",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(slackbot_module.subprocess, "run", fake_run)
+
+    with pytest.raises(SlackbotError, match="paste-buffer failed"):
+        paste_agent_tmux_text(
+            config,
+            {
+                "host": "localhost",
+                "tmux_session": "codex-work",
+                "tmux_socket": "codex",
+                "tmux_pane": "%7",
+            },
+            "literal text",
+        )
+
+    paste_call = next(call for call in calls if "paste-buffer" in call[0])
+    delete_call = next(call for call in calls if "delete-buffer" in call[0])
+    paste_buffer = paste_call[0][paste_call[0].index("-b") + 1]
+    delete_buffer = delete_call[0][delete_call[0].index("-b") + 1]
+    assert delete_buffer == paste_buffer
+    assert not any("send-keys" in call[0] for call in calls)
 
 
 def test_agent_tmux_paste_refuses_remote_host(tmp_path, monkeypatch):
