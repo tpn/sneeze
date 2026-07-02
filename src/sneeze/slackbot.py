@@ -138,7 +138,7 @@ AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS = 10.0
 AGENT_CODEX_HOOK_DELIVERY_LOCK_BUCKETS = 4096
 AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS = 120.0
 AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS = 600.0
-AGENT_CODEX_HOOK_COMMAND_TIMEOUT_SECONDS = 60
+AGENT_CODEX_HOOK_COMMAND_TIMEOUT_SECONDS = 150
 AGENT_CODEX_HOOK_SLACK_REQUEST_TIMEOUT_SECONDS = 2.0
 AGENT_CODEX_HOOK_SLACK_REQUEST_ATTEMPTS = 2
 AGENT_CODEX_HOOK_SLACK_RETRY_DELAY_SECONDS = 1.0
@@ -147,6 +147,7 @@ AGENT_CODEX_HOOK_COMMAND_MARKERS = (
     "slackbot-agent-stop-hook",
     "webmux-agent-status.js",
 )
+AGENT_CODEX_HOOK_WEBMUX_STATUS_MESSAGE = "Updating WebMux agent status"
 SLACK_API_REQUEST_POLICY: ContextVar[dict[str, float | int] | None] = (
     ContextVar("slack_api_request_policy", default=None)
 )
@@ -2482,7 +2483,7 @@ def _post_single_slack_message(
         payload["mrkdwn"] = mrkdwn
     client_msg_id = SLACK_CLIENT_MSG_ID.get()
     if client_msg_id:
-        # Slack handles retry duplicates; local receipts cover crash recovery.
+        # Keep client_msg_id stable; local receipts drive retry recovery.
         payload["client_msg_id"] = client_msg_id
     if blocks:
         payload["blocks"] = render_slack_blocks(blocks)
@@ -4417,13 +4418,20 @@ def codex_tmux_bin(config: SlackbotConfig) -> str:
     return resolved or value
 
 
-def codex_tmux_socket(config: SlackbotConfig) -> str:
+def _configured_codex_tmux_socket(
+    profile: SlackbotProfile,
+    env: dict[str, str],
+) -> str:
     return (
-        env_lookup(config.profile, config.env, "CODEX_TMUX_SOCKET")
-        or env_lookup(config.profile, config.env, "CONSOLE_TMUX_SOCKET")
-        or config.profile.default_codex_tmux_socket
+        env_lookup(profile, env, "CODEX_TMUX_SOCKET")
+        or env_lookup(profile, env, "CONSOLE_TMUX_SOCKET")
+        or profile.default_codex_tmux_socket
         or DEFAULT_TMUX_SOCKET
     )
+
+
+def codex_tmux_socket(config: SlackbotConfig) -> str:
+    return _configured_codex_tmux_socket(config.profile, config.env)
 
 
 def codex_tmux_conf(config: SlackbotConfig) -> str | None:
@@ -4490,6 +4498,13 @@ def is_local_tmux_host(host: str | None) -> bool:
     return normalized in local_host_aliases()
 
 
+def tmux_socket_display_name(value: str | None) -> str:
+    socket_name = str(value or DEFAULT_TMUX_SOCKET)
+    if socket_name == TMUX_DEFAULT_SERVER_SOCKET:
+        return "default"
+    return socket_name
+
+
 def tmux_command_for_binding(
     config: SlackbotConfig,
     binding: dict[str, Any],
@@ -4546,7 +4561,7 @@ def agent_tmux_target(
         if current_session is None:
             raise SlackbotError(
                 f"The bound tmux pane {tmux_pane} could not be found "
-                f"on socket {tmux_socket}"
+                f"on socket {tmux_socket_display_name(tmux_socket)}"
             )
         if current_session != tmux_session:
             raise SlackbotError(
@@ -4698,6 +4713,29 @@ def _resolve_tmux_pane_identity(
     return {"tmux_session": session, "tmux_pane": pane_id}
 
 
+def _codex_hook_tmux_pane_for_socket(
+    *,
+    payload_pane: str | None,
+    environment_pane: str | None,
+    explicit_session: bool,
+    selected_socket: str | None,
+    environment_socket: str | None,
+) -> str | None:
+    payload_pane = str(payload_pane or "").strip()
+    if payload_pane:
+        return payload_pane
+    environment_pane = str(environment_pane or "").strip()
+    if not environment_pane:
+        return None
+    if not explicit_session:
+        return environment_pane
+    if not selected_socket or not environment_socket:
+        return None
+    if _agent_tmux_sockets_same(selected_socket, environment_socket):
+        return environment_pane
+    return None
+
+
 def resolve_codex_agent_tmux_binding(
     config: SlackbotConfig,
     hook_payload: dict[str, Any] | None = None,
@@ -4730,11 +4768,21 @@ def resolve_codex_agent_tmux_binding(
     tmux_env_socket = _tmux_socket_path_from_env(os.environ.get("TMUX"))
     payload_pane_id = str(payload.get("tmux_pane") or "").strip()
     environment_pane_id = os.environ.get("TMUX_PANE")
-    pane_id = payload_pane_id or environment_pane_id
     if explicit_session:
-        session_socket = explicit_socket or tmux_env_socket or resolved_socket
+        # Named sessions belong to the explicit/configured agent server; the
+        # bot process may have inherited TMUX from an unrelated server.
+        session_socket = explicit_socket or resolved_socket
+        pane_id = _codex_hook_tmux_pane_for_socket(
+            payload_pane=payload_pane_id,
+            environment_pane=environment_pane_id,
+            explicit_session=True,
+            selected_socket=session_socket,
+            environment_socket=tmux_env_socket,
+        )
         session_conf = explicit_conf
-        if not session_conf and session_socket == resolved_socket:
+        if not session_conf:
+            # CODEX_TMUX_CONF is agent-wide and also applies to explicit
+            # sockets.
             session_conf = resolved_conf
         binding = {
             "host": host,
@@ -4763,53 +4811,69 @@ def resolve_codex_agent_tmux_binding(
                     )
                 return None
             else:
+                if raise_on_pane_mismatch:
+                    raise TmuxPaneMismatchError(
+                        f"tmux pane {pane_id} could not be resolved on "
+                        f"socket {session_socket}"
+                    )
                 return None
         return binding
 
+    pane_id = _codex_hook_tmux_pane_for_socket(
+        payload_pane=payload_pane_id,
+        environment_pane=environment_pane_id,
+        explicit_session=False,
+        selected_socket=None,
+        environment_socket=tmux_env_socket,
+    )
     if not pane_id:
         return None
     tmux_bin = codex_tmux_bin(config)
-    attempts: list[tuple[str | None, str | None]] = []
-    if (
-        not explicit_socket
-        and environment_pane_id
-        and not payload_pane_id
-        and tmux_env_socket
-    ):
-        attempts.append((tmux_env_socket, None))
-    attempts.append((resolved_socket, resolved_conf))
-    if not explicit_socket:
-        if tmux_env_socket:
-            attempts.append((tmux_env_socket, None))
-        attempts.append((None, None))
-    seen: set[tuple[str | None, str | None]] = set()
-    for socket_value, conf_value in attempts:
-        key = (socket_value, conf_value)
-        if key in seen:
-            continue
-        seen.add(key)
-        pane_identity = _resolve_tmux_pane_identity(
-            tmux_bin,
-            pane_id,
-            tmux_socket=socket_value,
-            tmux_conf=conf_value,
-        )
-        if not pane_identity:
-            continue
+    if payload_pane_id:
+        socket_value = explicit_socket or tmux_env_socket
+    else:
+        if (
+            explicit_socket
+            and tmux_env_socket
+            and not _agent_tmux_sockets_same(
+                explicit_socket,
+                tmux_env_socket,
+            )
+        ):
+            if raise_on_pane_mismatch:
+                raise TmuxPaneMismatchError(
+                    f"ambient tmux pane {pane_id} belongs to socket "
+                    f"{tmux_env_socket}, not {explicit_socket}"
+                )
+            return None
+        socket_value = tmux_env_socket
+    if not socket_value:
+        if raise_on_pane_mismatch:
+            raise TmuxPaneMismatchError(
+                f"tmux pane {pane_id} has no tmux socket provenance"
+            )
+        return None
+    conf_value = resolved_conf if explicit_socket else None
+    pane_identity = _resolve_tmux_pane_identity(
+        tmux_bin,
+        pane_id,
+        tmux_socket=socket_value,
+        tmux_conf=conf_value,
+    )
+    if pane_identity:
         binding = {
             "host": host,
-            "tmux_socket": (
-                socket_value
-                if socket_value is not None
-                else TMUX_DEFAULT_SERVER_SOCKET
-            ),
+            "tmux_socket": socket_value,
             **pane_identity,
         }
         if conf_value:
             binding["tmux_conf"] = conf_value
-        elif resolved_conf and socket_value == resolved_socket:
-            binding["tmux_conf"] = resolved_conf
         return binding
+    if raise_on_pane_mismatch:
+        raise TmuxPaneMismatchError(
+            f"tmux pane {pane_id} could not be resolved on socket "
+            f"{socket_value}"
+        )
     return None
 
 
@@ -4840,26 +4904,39 @@ def _agent_tmux_hosts_same(left: str, right: str) -> bool:
     return left == right or {left, right}.issubset(local_host_aliases())
 
 
+def _agent_tmux_socket_path(value: str) -> Path | None:
+    if value == TMUX_DEFAULT_SERVER_SOCKET:
+        value = "default"
+    if "/" not in value:
+        getuid = getattr(os, "getuid", None)
+        if getuid is None:
+            return None
+        uid = getuid()
+        socket_root = (
+            Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{uid}"
+        )
+        return socket_root / value
+    return Path(value).expanduser().absolute()
+
+
+def _canonical_tmux_socket_identity(value: str | None) -> str:
+    socket_value = str(value or "").strip()
+    if not socket_value:
+        return ""
+    socket_path = _agent_tmux_socket_path(socket_value)
+    if socket_path is not None:
+        return str(socket_path)
+    if socket_value == TMUX_DEFAULT_SERVER_SOCKET:
+        return "default"
+    return socket_value
+
+
 def _agent_tmux_sockets_same(left: str, right: str) -> bool:
     if not left or not right:
         return left == right
 
-    def socket_path(value: str) -> Path | None:
-        if value == TMUX_DEFAULT_SERVER_SOCKET:
-            value = "default"
-        if "/" not in value:
-            getuid = getattr(os, "getuid", None)
-            if getuid is None:
-                return None
-            uid = getuid()
-            socket_root = (
-                Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{uid}"
-            )
-            return socket_root / value
-        return Path(value).expanduser().absolute()
-
-    left_path = socket_path(left)
-    right_path = socket_path(right)
+    left_path = _agent_tmux_socket_path(left)
+    right_path = _agent_tmux_socket_path(right)
     if left_path is None or right_path is None:
         left_name = "default" if left == TMUX_DEFAULT_SERVER_SOCKET else left
         right_name = (
@@ -4872,6 +4949,8 @@ def _agent_tmux_sockets_same(left: str, right: str) -> bool:
 def _agent_tmux_bindings_same_target(
     left: dict[str, Any],
     right: dict[str, Any],
+    *,
+    default_socket: str | None = None,
 ) -> bool:
     if not _agent_tmux_hosts_same(
         str(left.get("host") or ""),
@@ -4900,8 +4979,8 @@ def _agent_tmux_bindings_same_target(
     ):
         return False
     if not _agent_tmux_sockets_same(
-        str(left.get("tmux_socket") or ""),
-        str(right.get("tmux_socket") or ""),
+        str(left.get("tmux_socket") or default_socket or ""),
+        str(right.get("tmux_socket") or default_socket or ""),
     ):
         return False
     left_pane = str(left.get("tmux_pane") or "")
@@ -5437,9 +5516,8 @@ def _codex_hook_client_msg_id(
         "transcript_path": transcript_path,
     }
     if turn_id is None:
-        identity["dedupe_bucket"] = int(
-            time.time() // AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS
-        )
+        # The caller persists this nonce before performing any Slack request.
+        identity["delivery_nonce"] = uuid.uuid4().hex
     value = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     return str(uuid.uuid5(uuid.NAMESPACE_URL, value))
 
@@ -5454,7 +5532,7 @@ def _codex_hook_state_key(
     if binding:
         parts = [
             binding.get("host") or "",
-            binding.get("tmux_socket") or "",
+            _canonical_tmux_socket_identity(binding.get("tmux_socket")),
             binding.get("tmux_session") or "",
         ]
         tmux_pane = binding.get("tmux_pane") or ""
@@ -5479,11 +5557,16 @@ def _codex_hook_entry_fallback_keys(
     if not host or not tmux_session:
         return fallback_keys
     tmux_socket = str(entry.get("tmux_socket") or "").strip()
-    legacy_key = "tmux:" + ":".join((host, tmux_socket, tmux_session))
-    fallback_keys.add(legacy_key)
+    socket_aliases = {
+        tmux_socket,
+        _canonical_tmux_socket_identity(tmux_socket),
+    }
     tmux_pane = str(entry.get("tmux_pane") or "").strip()
-    if tmux_pane:
-        fallback_keys.add(f"{legacy_key}:{tmux_pane}")
+    for socket_alias in socket_aliases:
+        legacy_key = "tmux:" + ":".join((host, socket_alias, tmux_session))
+        fallback_keys.add(legacy_key)
+        if tmux_pane:
+            fallback_keys.add(f"{legacy_key}:{tmux_pane}")
     return fallback_keys
 
 
@@ -5491,14 +5574,17 @@ def _codex_hook_entry_fallback_key(
     entry: dict[str, Any],
 ) -> str | None:
     fallback_keys = _codex_hook_entry_fallback_keys(entry)
+    host = str(entry.get("host") or "").strip()
+    tmux_session = str(entry.get("tmux_session") or "").strip()
     tmux_pane = str(entry.get("tmux_pane") or "").strip()
-    if tmux_pane:
-        pane_suffix = f":{tmux_pane}"
-        pane_keys = [
-            key for key in fallback_keys if key.endswith(pane_suffix)
-        ]
-        if pane_keys:
-            return sorted(pane_keys)[0]
+    if host and tmux_session:
+        tmux_socket = _canonical_tmux_socket_identity(
+            str(entry.get("tmux_socket") or "").strip()
+        )
+        parts = [host, tmux_socket, tmux_session]
+        if tmux_pane:
+            parts.append(tmux_pane)
+        return "tmux:" + ":".join(parts)
     configured_key = str(entry.get("fallback_key") or "").strip()
     if configured_key:
         return configured_key
@@ -5534,6 +5620,15 @@ def _clear_codex_hook_entry_binding(entry: dict[str, Any]) -> None:
     entry.pop("fallback_key", None)
 
 
+def _replace_codex_hook_entry_binding(
+    entry: dict[str, Any],
+    binding: dict[str, Any],
+) -> None:
+    for key in AGENT_TMUX_BINDING_KEYS:
+        entry.pop(key, None)
+    entry.update(binding)
+
+
 def _codex_hook_requested_tmux_sockets(
     config: SlackbotConfig,
     payload: dict[str, Any],
@@ -5555,21 +5650,23 @@ def _codex_hook_requested_tmux_sockets(
     )
     tmux_env_socket = _tmux_socket_path_from_env(os.environ.get("TMUX"))
     if explicit_session:
-        return (explicit_socket or tmux_env_socket or resolved_socket,)
-    if explicit_socket:
-        return (explicit_socket,)
+        # Keep state lookup aligned with resolve_codex_agent_tmux_binding().
+        return (explicit_socket or resolved_socket,)
     payload_pane = str(payload.get("tmux_pane") or "").strip()
     environment_pane = str(os.environ.get("TMUX_PANE") or "").strip()
     if not (payload_pane or environment_pane):
+        return (explicit_socket,) if explicit_socket else ()
+    if payload_pane:
+        selected_socket = explicit_socket or tmux_env_socket
+        return (selected_socket,) if selected_socket else ()
+    if not tmux_env_socket:
         return ()
-    candidates = []
-    if environment_pane and not payload_pane and tmux_env_socket:
-        candidates.append(tmux_env_socket)
-    candidates.append(resolved_socket)
-    if tmux_env_socket:
-        candidates.append(tmux_env_socket)
-    candidates.append(TMUX_DEFAULT_SERVER_SOCKET)
-    return tuple(OrderedDict.fromkeys(candidates))
+    if explicit_socket and not _agent_tmux_sockets_same(
+        explicit_socket,
+        tmux_env_socket,
+    ):
+        return ()
+    return (tmux_env_socket,)
 
 
 def _codex_hook_requested_state_key(
@@ -5580,7 +5677,11 @@ def _codex_hook_requested_state_key(
 ) -> str | None:
     if not tmux_session or len(tmux_sockets) != 1:
         return None
-    parts = [socket.gethostname(), tmux_sockets[0], tmux_session]
+    parts = [
+        socket.gethostname(),
+        _canonical_tmux_socket_identity(tmux_sockets[0]),
+        tmux_session,
+    ]
     if tmux_pane:
         parts.append(tmux_pane)
     return "tmux:" + ":".join(parts)
@@ -5848,6 +5949,50 @@ def _codex_hook_delivery_receipt(
     return None
 
 
+def _codex_hook_pending_client_msg_id(
+    receipt_paths: Iterable[str],
+    *,
+    desired_key: str,
+    turn_id: str | None,
+    message_hash: str,
+    notify_user_id: str,
+    transcript_path: str | None,
+) -> str | None:
+    # Sessionless retries with different tmux provenance are distinct
+    # deliveries and therefore use different receipt paths.
+    for receipt_path in receipt_paths:
+        pending = read_json(receipt_path, {})
+        if not isinstance(pending, dict):
+            continue
+        if pending.get("delivery_state") != "pending":
+            continue
+        pending_key = str(pending.get("key") or "")
+        pending_fallback_key = str(pending.get("fallback_key") or "")
+        if desired_key.startswith("session:"):
+            if pending_key != desired_key:
+                continue
+        elif desired_key not in (pending_key, pending_fallback_key):
+            continue
+        if (
+            pending.get("turn_id") != turn_id
+            or pending.get("message_sha256") != message_hash
+            or pending.get("notify_user_id") != notify_user_id
+            or pending.get("transcript_path") != transcript_path
+        ):
+            continue
+        elapsed = _agent_tmux_elapsed_since(pending.get("pending_at"))
+        if (
+            elapsed is None
+            or elapsed > AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS
+        ):
+            Path(receipt_path).unlink(missing_ok=True)
+            continue
+        client_msg_id = str(pending.get("client_msg_id") or "").strip()
+        if client_msg_id:
+            return client_msg_id
+    return None
+
+
 def _write_codex_hook_delivery_receipts(
     receipt_paths: Iterable[str],
     receipt: dict[str, Any],
@@ -5949,7 +6094,7 @@ def _locked_codex_hook_delivery_aliases(
         candidate_locks.close()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise SlackbotError(
+            raise CodexHookRetryableError(
                 "Timed out waiting for another Codex hook notification "
                 "to finish"
             )
@@ -6099,26 +6244,26 @@ def _render_codex_stop_notification(
     cwd = _codex_hook_text_value(payload, "cwd")
     details = []
     if session_id:
-        details.append(f"session `{session_id}`")
+        details.append(f"session {session_id}")
     if turn_id:
-        details.append(f"turn `{turn_id}`")
+        details.append(f"turn {turn_id}")
     if cwd:
-        details.append(f"cwd `{cwd}`")
+        details.append(f"cwd {cwd}")
     if binding:
-        tmux_socket = binding.get("tmux_socket") or DEFAULT_TMUX_SOCKET
+        tmux_socket = tmux_socket_display_name(binding.get("tmux_socket"))
         tmux_pane = binding.get("tmux_pane")
-        pane_detail = f" pane `{tmux_pane}`" if tmux_pane else ""
+        pane_detail = f" pane {tmux_pane}" if tmux_pane else ""
         details.append(
             "tmux "
-            f"`{binding.get('host')}:{binding.get('tmux_session')}` "
-            f"socket `{tmux_socket}`{pane_detail}"
+            f"{binding.get('host')}:{binding.get('tmux_session')} "
+            f"socket {tmux_socket}{pane_detail}"
         )
     if details:
         lines.append(" | ".join(details))
     if first_message and binding:
         lines.append(
             "Reply in this thread to send text to the bound tmux pane "
-            "when it is idle. `status`, `tail`, `p`, `n`, and `cancel` "
+            "when it is idle. status, tail, p, n, and cancel "
             "keep their tmux controls."
         )
     elif first_message:
@@ -6192,11 +6337,6 @@ def notify_codex_agent_stop(
             "Missing required Slack notification config: "
             f"{profile.env_name(AGENT_CODEX_HOOK_NOTIFY_USER_KEY)}"
         )
-    requested_pane = (
-        str(payload.get("tmux_pane") or "").strip()
-        or str(os.environ.get("TMUX_PANE") or "").strip()
-        or None
-    )
     requested_session = (
         tmux_session
         or str(payload.get("tmux_session") or "").strip()
@@ -6209,6 +6349,15 @@ def notify_codex_agent_stop(
         tmux_session=tmux_session,
         tmux_socket=tmux_socket,
     )
+    requested_pane = _codex_hook_tmux_pane_for_socket(
+        payload_pane=str(payload.get("tmux_pane") or "").strip(),
+        environment_pane=os.environ.get("TMUX_PANE"),
+        explicit_session=bool(requested_session),
+        selected_socket=(
+            requested_sockets[0] if len(requested_sockets) == 1 else None
+        ),
+        environment_socket=_tmux_socket_path_from_env(os.environ.get("TMUX")),
+    )
     pane_binding_rejected = False
     try:
         binding = resolve_codex_agent_tmux_binding(
@@ -6219,7 +6368,8 @@ def notify_codex_agent_stop(
             tmux_conf=tmux_conf,
             raise_on_pane_mismatch=True,
         )
-    except TmuxPaneMismatchError:
+    except (TmuxPaneMismatchError, OSError):
+        # Requested panes fail closed, even when lookup failure is transient.
         binding = None
         pane_binding_rejected = True
     session_id = _codex_hook_text_value(payload, "session_id")
@@ -6229,22 +6379,13 @@ def notify_codex_agent_stop(
         tmux_session=requested_session,
         tmux_sockets=requested_sockets,
     )
-    if session_id or binding:
-        desired_key = _codex_hook_state_key(payload, binding)
-    elif requested_state_key:
+    if requested_state_key and not (session_id or binding):
         desired_key = requested_state_key
     else:
         desired_key = _codex_hook_state_key(payload, binding)
     turn_id = _codex_hook_text_value(payload, "turn_id")
     message = _codex_hook_message_text(payload)
     message_hash = _codex_hook_message_hash(message)
-    client_msg_id = _codex_hook_client_msg_id(
-        key=desired_key,
-        turn_id=turn_id,
-        message_hash=message_hash,
-        notify_user_id=notify_user_id,
-        transcript_path=transcript_path,
-    )
     state_path = agent_codex_hook_state_path(config.paths)
     fallback_key = (
         _codex_hook_state_key({}, binding) if binding else requested_state_key
@@ -6335,7 +6476,7 @@ def notify_codex_agent_stop(
                     }
                 )
                 if binding:
-                    entry.update(binding)
+                    _replace_codex_hook_entry_binding(entry, binding)
                 sessions[key] = entry
                 write_json_atomic(state_path, state)
 
@@ -6402,7 +6543,6 @@ def notify_codex_agent_stop(
                     receipt_paths = tuple(
                         sorted({*receipt_paths, route_receipt_path})
                     )
-                _remove_codex_hook_delivery_receipts(receipt_paths)
                 if binding and channel_id and thread_ts:
                     current_binding = query_agent_tmux_thread(
                         profile,
@@ -6443,6 +6583,7 @@ def notify_codex_agent_stop(
                                 AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
                             ),
                         )
+                _remove_codex_hook_delivery_receipts(receipt_paths)
             except Exception as exc:
                 raise CodexHookRetryableError(
                     "Codex hook delivery is durable but duplicate "
@@ -6456,6 +6597,41 @@ def notify_codex_agent_stop(
             }
 
         if not receipt:
+            if turn_id is None:
+                client_msg_id = _codex_hook_pending_client_msg_id(
+                    receipt_paths,
+                    desired_key=desired_key,
+                    turn_id=turn_id,
+                    message_hash=message_hash,
+                    notify_user_id=notify_user_id,
+                    transcript_path=transcript_path,
+                )
+            else:
+                client_msg_id = None
+            if not client_msg_id:
+                client_msg_id = _codex_hook_client_msg_id(
+                    key=desired_key,
+                    turn_id=turn_id,
+                    message_hash=message_hash,
+                    notify_user_id=notify_user_id,
+                    transcript_path=transcript_path,
+                )
+                if turn_id is None:
+                    _write_codex_hook_delivery_receipts(
+                        write_receipt_paths,
+                        {
+                            "version": 1,
+                            "delivery_state": "pending",
+                            "key": desired_key,
+                            "fallback_key": fallback_key,
+                            "notify_user_id": notify_user_id,
+                            "turn_id": turn_id,
+                            "message_sha256": message_hash,
+                            "transcript_path": transcript_path,
+                            "client_msg_id": client_msg_id,
+                            "pending_at": utcnow_iso(),
+                        },
+                    )
             first_message = not (channel_id and thread_ts)
             route = (
                 SlackbotRoute(channel_id=channel_id, thread_ts=thread_ts)
@@ -6509,6 +6685,7 @@ def notify_codex_agent_stop(
                 "message_sha256": message_hash,
                 "tmux_binding": binding,
                 "transcript_path": transcript_path,
+                "client_msg_id": client_msg_id,
                 "notified_at": utcnow_iso(),
             }
             route_receipt_path = _codex_hook_delivery_route_receipt_path(
@@ -6606,17 +6783,9 @@ def notify_codex_agent_stop(
             if "created_at" not in entry:
                 entry["created_at"] = now
             if binding:
-                entry.update(binding)
+                _replace_codex_hook_entry_binding(entry, binding)
             sessions[key] = entry
             write_json_atomic(state_path, state)
-        try:
-            _remove_codex_hook_delivery_receipts(receipt_paths)
-        except Exception as exc:
-            raise CodexHookRetryableError(
-                "Codex hook delivery is durable but receipt cleanup "
-                f"failed: {exc}"
-            ) from exc
-
         if binding:
             try:
                 bind_agent_tmux_thread(
@@ -6646,6 +6815,13 @@ def notify_codex_agent_stop(
                     "Codex hook delivery is durable but tmux binding "
                     f"failed: {exc}"
                 ) from exc
+        try:
+            _remove_codex_hook_delivery_receipts(receipt_paths)
+        except Exception as exc:
+            raise CodexHookRetryableError(
+                "Codex hook delivery is durable but receipt cleanup "
+                f"failed: {exc}"
+            ) from exc
     return {
         "status": "skipped" if recovered_receipt else "notified",
         "reason": "delivery_receipt" if recovered_receipt else None,
@@ -6996,9 +7172,29 @@ def _is_managed_agent_hook(handler: Any) -> bool:
     if handler.get("type") != "command":
         return False
     command = str(handler.get("command") or "")
-    return any(
-        marker in command for marker in AGENT_CODEX_HOOK_COMMAND_MARKERS
-    )
+    if any(marker in command for marker in AGENT_CODEX_HOOK_COMMAND_MARKERS):
+        return True
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if handler.get("statusMessage") != AGENT_CODEX_HOOK_WEBMUX_STATUS_MESSAGE:
+        return False
+    if len(argv) < 2 or Path(argv[0]).name not in {"node", "nodejs"}:
+        return False
+
+    def option_value(name: str) -> str | None:
+        for index, value in enumerate(argv):
+            if value == name:
+                return argv[index + 1] if index + 1 < len(argv) else None
+            if value.startswith(f"{name}="):
+                return value.split("=", 1)[1]
+        return None
+
+    return option_value("--kind") == "codex" and option_value("--status") in {
+        "working",
+        "waiting",
+    }
 
 
 def _remove_managed_agent_hooks(
@@ -7048,7 +7244,11 @@ def install_codex_agent_hooks(
     if not isinstance(hooks, dict):
         raise SlackbotError(f"{target} field 'hooks' must be a JSON object")
     for event in ("UserPromptSubmit", "Stop"):
-        hooks[event] = _remove_managed_agent_hooks(hooks.get(event))
+        cleaned = _remove_managed_agent_hooks(hooks.get(event))
+        if cleaned:
+            hooks[event] = cleaned
+        else:
+            hooks.pop(event, None)
 
     installed: dict[str, Any] = {"slack_stop": True, "webmux": False}
     commands = [slack_stop_command]
@@ -7073,7 +7273,7 @@ def install_codex_agent_hooks(
             "waiting",
         )
         commands.extend([working, waiting])
-        hooks["UserPromptSubmit"].append(
+        hooks.setdefault("UserPromptSubmit", []).append(
             {
                 "hooks": [
                     {
@@ -7081,12 +7281,14 @@ def install_codex_agent_hooks(
                             working,
                             timeout=10,
                         ),
-                        "statusMessage": "Updating WebMux agent status",
+                        "statusMessage": (
+                            AGENT_CODEX_HOOK_WEBMUX_STATUS_MESSAGE
+                        ),
                     }
                 ]
             }
         )
-        hooks["Stop"].append(
+        hooks.setdefault("Stop", []).append(
             {
                 "hooks": [
                     {
@@ -7094,7 +7296,9 @@ def install_codex_agent_hooks(
                             waiting,
                             timeout=10,
                         ),
-                        "statusMessage": "Updating WebMux agent status",
+                        "statusMessage": (
+                            AGENT_CODEX_HOOK_WEBMUX_STATUS_MESSAGE
+                        ),
                     }
                 ]
             }
@@ -7109,7 +7313,7 @@ def install_codex_agent_hooks(
             warnings.append(
                 "WebMux hooks requested without a status script path"
             )
-    hooks["Stop"].append(
+    hooks.setdefault("Stop", []).append(
         {
             "hooks": [
                 {
@@ -7206,7 +7410,7 @@ def render_agent_tmux_capture(result: dict[str, Any]) -> str:
     binding = dict(result.get("binding") or {})
     host = str(binding.get("host") or "localhost")
     tmux_session = str(binding.get("tmux_session") or "(unknown)")
-    tmux_socket = str(binding.get("tmux_socket") or DEFAULT_TMUX_SOCKET)
+    tmux_socket = tmux_socket_display_name(binding.get("tmux_socket"))
     tmux_pane = str(binding.get("tmux_pane") or "")
     pane_detail = f" pane `{tmux_pane}`" if tmux_pane else ""
     line_count = int(result.get("line_count") or 0)
@@ -7229,7 +7433,7 @@ def render_agent_tmux_status(
     lines = [
         "Thread tmux binding: "
         f"`{binding.get('host')}:{binding.get('tmux_session')}` "
-        f"on socket `{binding.get('tmux_socket') or DEFAULT_TMUX_SOCKET}`"
+        f"on socket `{tmux_socket_display_name(binding.get('tmux_socket'))}`"
         f"{pane_detail}.",
         "State: " + ("working" if state.working else "idle / waiting"),
     ]
@@ -8027,12 +8231,16 @@ class SlackSocketBot:
             channel_type == "im"
             and self._is_agent_notify_thread(route, slack_user_id)
         )
+        is_normally_authorized = self._is_authorized(
+            slack_user_id,
+            channel,
+            channel_type=channel_type,
+        )
+        notification_binding_only = (
+            is_agent_notify_thread and not is_normally_authorized
+        )
         if event_type == "message" and channel_type not in {"im", "mpim"}:
-            if not thread_ts or not self._is_authorized(
-                slack_user_id,
-                channel,
-                channel_type=channel_type,
-            ):
+            if not thread_ts or not is_normally_authorized:
                 return
             self._maybe_handle_agent_tmux(text, route)
             return
@@ -8043,13 +8251,28 @@ class SlackSocketBot:
         ):
             self._post_unauthorized(route)
             return
-        if is_agent_notify_thread and not is_bound_notify_thread:
+        if notification_binding_only and not is_bound_notify_thread:
             post_slack_message(
                 self.config,
                 route,
                 "No tmux pane is bound to this notification thread. "
                 "Replies are read-only.",
             )
+            return
+        if notification_binding_only:
+            if self._maybe_handle_agent_tmux(
+                text,
+                route,
+                allow_generic_commands=False,
+            ):
+                return
+            if self._maybe_mirror_agent_tmux_reply(
+                event.get("text") or "",
+                route,
+                slack_user_id,
+            ):
+                return
+            self._post_unauthorized(route)
             return
         if channel_type == "im" and self._maybe_handle_user_config(
             text,
@@ -8061,9 +8284,7 @@ class SlackSocketBot:
             route,
         ):
             return
-        if not is_agent_notify_thread and not self._is_authorized(
-            slack_user_id, channel, channel_type=channel_type
-        ):
+        if not is_agent_notify_thread and not is_normally_authorized:
             self._post_unauthorized(route)
             return
         if channel_type != "im" and self._maybe_handle_static_response(
@@ -8071,12 +8292,16 @@ class SlackSocketBot:
             route,
         ):
             return
+        agent_tmux_checked = False
         if channel_type == "im" and self._has_agent_tmux_thread(route):
+            agent_tmux_checked = True
             if self._maybe_handle_agent_tmux(text, route):
                 return
         if self._maybe_handle_control_command(text, route, slack_user_id):
             return
-        if self._maybe_handle_agent_tmux(text, route):
+        if not agent_tmux_checked and self._maybe_handle_agent_tmux(
+            text, route
+        ):
             return
         if channel_type == "im" and self._maybe_mirror_agent_tmux_reply(
             event.get("text") or "",
@@ -9765,6 +9990,8 @@ class SlackSocketBot:
         self,
         text: str,
         route: SlackbotRoute,
+        *,
+        allow_generic_commands: bool = True,
     ) -> bool:
         if not route.channel_id or not route.thread_ts:
             return False
@@ -9792,6 +10019,15 @@ class SlackSocketBot:
             channel_id=route.channel_id,
             thread_ts=route.thread_ts,
         )
+        generic_command = command in {"?", "help", "jobs", "use"}
+        if not allow_generic_commands and generic_command:
+            post_slack_message(
+                self.config,
+                route,
+                "This notification thread may only control its existing "
+                "tmux binding.",
+            )
+            return True
         if not prefixed:
             if command == "use":
                 if len(tokens) not in (3, 4):
@@ -9850,7 +10086,8 @@ class SlackSocketBot:
                 (
                     "Bound this thread to "
                     f"{binding['host']}:{binding['tmux_session']} "
-                    f"on tmux socket `{binding['tmux_socket']}`."
+                    "on tmux socket "
+                    f"`{tmux_socket_display_name(binding['tmux_socket'])}`."
                 ),
             )
             return True
@@ -10263,6 +10500,10 @@ def bind_agent_tmux_thread(
         system_prompt_path=system_prompt_path,
         unit_name=unit_name,
     )
+    default_tmux_socket = _configured_codex_tmux_socket(
+        profile,
+        dict(read_env_file(paths.env_path)),
+    )
     key = f"{channel_id}:{thread_ts}"
     with locked_agent_tmux_json_path(
         paths.agent_tmux_bindings_path,
@@ -10296,7 +10537,11 @@ def bind_agent_tmux_thread(
                 if (
                     candidate_key != key
                     and isinstance(candidate, dict)
-                    and _agent_tmux_bindings_same_target(binding, candidate)
+                    and _agent_tmux_bindings_same_target(
+                        binding,
+                        candidate,
+                        default_socket=default_tmux_socket,
+                    )
                 )
             ]
             if claim_target_if_unbound and (key in data or target_routes):

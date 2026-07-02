@@ -133,6 +133,7 @@ class ProfiledSlackbotCommand(InvariantAwareCommand):
         for suffix in (
             "slackbot-service-install",
             "slackbot-schedule-upsert",
+            "slackbot-agent-hooks-install",
         ):
             if display_name.endswith(suffix):
                 return f"{display_name[: -len(suffix)]}{canonical_name}"
@@ -1164,7 +1165,7 @@ class SlackbotAgentHooksInstallBase(ProfiledSlackbotCommand):
         stop_command = shlex.join(
             [
                 cli_bin,
-                "slackbot-agent-stop-hook",
+                self._sibling_subcommand("slackbot-agent-stop-hook"),
                 *runtime_cli_args(paths),
             ]
         )
