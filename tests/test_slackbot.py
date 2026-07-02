@@ -1380,6 +1380,63 @@ def test_agent_tmux_exclusive_binding_overlaps_session_and_pane_targets(
     )
 
 
+def test_agent_tmux_target_overlap_checks_server_identity_without_pane():
+    assert not slackbot_module._agent_tmux_bindings_same_target(
+        {
+            "host": "localhost",
+            "tmux_session": "codex-work",
+            "tmux_socket": "codex",
+            "tmux_session_created": "101",
+            "tmux_server_pid": "202",
+        },
+        {
+            "host": "localhost",
+            "tmux_session": "codex-work",
+            "tmux_socket": "codex",
+            "tmux_pane": "%1",
+            "tmux_session_created": "303",
+            "tmux_server_pid": "404",
+        },
+    )
+
+
+def test_agent_tmux_claim_does_not_overwrite_existing_route(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile)
+    bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_pane="%2",
+        tmux_server_pid="202",
+    )
+
+    claimed = bind_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+        host="localhost",
+        tmux_session="codex-work",
+        tmux_socket="codex",
+        tmux_pane="%1",
+        tmux_server_pid="101",
+        exclusive_target=True,
+        claim_target_if_unbound=True,
+    )
+
+    assert claimed is None
+    binding = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    assert binding["tmux_pane"] == "%2"
+    assert binding["tmux_server_pid"] == "202"
+
+
 def test_tmux_binding_uses_absolute_socket_path(tmp_path):
     profile = replace(
         make_profile(tmp_path),

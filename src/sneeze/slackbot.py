@@ -4840,8 +4840,6 @@ def _agent_tmux_bindings_same_target(
     right_pane = str(right.get("tmux_pane") or "")
     if left_pane and right_pane and left_pane != right_pane:
         return False
-    if not (left_pane and right_pane):
-        return True
     for key in AGENT_TMUX_PANE_IDENTITY_KEYS:
         left_value = str(left.get(key) or "")
         right_value = str(right.get(key) or "")
@@ -10228,7 +10226,7 @@ def bind_agent_tmux_thread(
                     and _agent_tmux_bindings_same_target(binding, candidate)
                 )
             ]
-            if claim_target_if_unbound and target_routes:
+            if claim_target_if_unbound and (key in data or target_routes):
                 return None
             for candidate_key in target_routes:
                 data.pop(candidate_key, None)
