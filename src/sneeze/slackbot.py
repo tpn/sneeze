@@ -5570,6 +5570,7 @@ def _codex_hook_delivery_receipt(
                 continue
         elif desired_key not in (receipt_key, receipt_fallback_key):
             continue
+        requires_bounded_dedupe = turn_id is None
         if transcript_path:
             stored_transcript_path = receipt.get("transcript_path")
             if stored_transcript_path not in (None, transcript_path):
@@ -5577,15 +5578,10 @@ def _codex_hook_delivery_receipt(
             if stored_transcript_path is None and not desired_key.startswith(
                 "session:"
             ):
-                elapsed = _agent_tmux_elapsed_since(
-                    receipt.get("notified_at")
-                )
-                if (
-                    elapsed is None
-                    or elapsed > AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS
-                ):
-                    continue
+                requires_bounded_dedupe = True
         elif not desired_key.startswith("session:"):
+            requires_bounded_dedupe = True
+        if requires_bounded_dedupe:
             elapsed = _agent_tmux_elapsed_since(receipt.get("notified_at"))
             if (
                 elapsed is None
@@ -5903,7 +5899,7 @@ def _codex_hook_notification_seen(
             if transcript_path:
                 if item.get("transcript_path") != transcript_path:
                     continue
-            elif not session_id:
+            if turn_id is None or (not transcript_path and not session_id):
                 elapsed = _agent_tmux_elapsed_since(item.get("notified_at"))
                 if (
                     elapsed is None
@@ -6746,9 +6742,10 @@ def install_codex_agent_hooks(
     if target.exists():
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         backup = target.with_name(f"{target.name}.{timestamp}.bak")
-        backup.write_text(
+        write_text(
+            backup,
             target.read_text(encoding="utf-8"),
-            encoding="utf-8",
+            mode=0o600,
         )
         backup_path = str(backup)
     write_json_atomic(target, config)

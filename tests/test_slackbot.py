@@ -1608,6 +1608,49 @@ def test_codex_stop_hook_posts_long_notification_once(tmp_path, monkeypatch):
     )
 
 
+def test_codex_stop_hook_bounds_dedupe_without_turn_id(tmp_path, monkeypatch):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append(route)
+        return {"channel": "D111", "ts": f"{len(calls)}.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    payload = json.dumps(
+        {
+            "session_id": "codex-session-1",
+            "transcript_path": "/tmp/codex-session-1.jsonl",
+            "last_assistant_message": "Waiting for input.",
+        }
+    )
+
+    first = notify_codex_agent_stop(profile, payload)
+    immediate = notify_codex_agent_stop(profile, payload)
+    status = query_codex_agent_threads(profile)
+    entry = status["hook_state"]["sessions"]["session:codex-session-1"]
+    entry["notifications"][-1]["notified_at"] = "2020-01-01T00:00:00Z"
+    Path(status["hook_state_path"]).write_text(
+        json.dumps(status["hook_state"]),
+        encoding="utf-8",
+    )
+    after_window = notify_codex_agent_stop(profile, payload)
+
+    assert first["status"] == "notified"
+    assert immediate["status"] == "skipped"
+    assert after_window["status"] == "notified"
+    assert len(calls) == 2
+    assert calls[1].channel_id == "D111"
+    assert calls[1].thread_ts == "1.000001"
+
+
 def test_codex_stop_hook_starts_new_thread_when_recipient_changes(
     tmp_path,
     monkeypatch,
@@ -2474,6 +2517,54 @@ def test_codex_stop_hook_recovers_legacy_receipt_identity(
     ]
     assert entry["channel_id"] == "D111"
     assert not Path(legacy_receipt_path).exists()
+
+
+def test_codex_hook_receipt_dedupe_without_turn_id_expires(tmp_path):
+    state_path = str(tmp_path / "agent-codex-hooks.json")
+    message_hash = "message-hash"
+    receipt_path = slackbot_module._codex_hook_delivery_receipt_paths(
+        state_path,
+        {"session:codex-session-1"},
+        turn_id=None,
+        message_hash=message_hash,
+        notify_user_id="U111",
+        transcript_path="/tmp/codex-session-1.jsonl",
+    )[0]
+    receipt = {
+        "version": 1,
+        "key": "session:codex-session-1",
+        "fallback_key": None,
+        "notify_user_id": "U111",
+        "channel_id": "D111",
+        "thread_ts": "1.000001",
+        "turn_id": None,
+        "message_sha256": message_hash,
+        "transcript_path": "/tmp/codex-session-1.jsonl",
+        "notified_at": "2020-01-01T00:00:00Z",
+    }
+    slackbot_module.write_json_atomic(receipt_path, receipt)
+
+    expired = slackbot_module._codex_hook_delivery_receipt(
+        [receipt_path],
+        desired_key="session:codex-session-1",
+        turn_id=None,
+        message_hash=message_hash,
+        notify_user_id="U111",
+        transcript_path="/tmp/codex-session-1.jsonl",
+    )
+    receipt["notified_at"] = slackbot_module.utcnow_iso()
+    slackbot_module.write_json_atomic(receipt_path, receipt)
+    fresh = slackbot_module._codex_hook_delivery_receipt(
+        [receipt_path],
+        desired_key="session:codex-session-1",
+        turn_id=None,
+        message_hash=message_hash,
+        notify_user_id="U111",
+        transcript_path="/tmp/codex-session-1.jsonl",
+    )
+
+    assert expired is None
+    assert fresh == receipt
 
 
 def test_codex_hook_migrates_legacy_receipt_among_unrelated_state_files(
@@ -3412,6 +3503,7 @@ def test_codex_agent_hooks_install_preserves_unrelated_hooks(tmp_path):
         ),
         encoding="utf-8",
     )
+    hooks_path.chmod(0o644)
 
     result = install_codex_agent_hooks(
         hooks_path=str(hooks_path),
@@ -3446,7 +3538,9 @@ def test_codex_agent_hooks_install_preserves_unrelated_hooks(tmp_path):
         for handler in group["hooks"]
     ]
 
-    assert Path(result["backup_path"]).exists()
+    backup_path = Path(result["backup_path"])
+    assert backup_path.exists()
+    assert backup_path.stat().st_mode & 0o777 == 0o600
     assert "python keep.py" in stop_commands
     assert stop_commands.count("trentn-bot slackbot-agent-stop-hook") == 1
     assert any(str(webmux_script) in command for command in stop_commands)
