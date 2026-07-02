@@ -5463,6 +5463,8 @@ def _codex_hook_requested_tmux_sockets(
     tmux_env_socket = _tmux_socket_path_from_env(os.environ.get("TMUX"))
     if explicit_session:
         return (explicit_socket or tmux_env_socket or resolved_socket,)
+    if explicit_socket:
+        return (explicit_socket,)
     payload_pane = str(payload.get("tmux_pane") or "").strip()
     environment_pane = str(os.environ.get("TMUX_PANE") or "").strip()
     if not (payload_pane or environment_pane):
