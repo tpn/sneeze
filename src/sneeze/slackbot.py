@@ -5458,6 +5458,24 @@ def _codex_hook_binding_matches_request(
     return True
 
 
+def _codex_hook_persisted_binding(
+    value: dict[str, Any],
+    *,
+    tmux_pane: str | None,
+    tmux_session: str | None,
+    tmux_socket: str | None,
+) -> tuple[dict[str, str] | None, bool]:
+    binding = _codex_hook_entry_binding(value)
+    if binding and not _codex_hook_binding_matches_request(
+        binding,
+        tmux_pane=tmux_pane,
+        tmux_session=tmux_session,
+        tmux_socket=tmux_socket,
+    ):
+        return None, True
+    return binding, False
+
+
 def _codex_hook_existing_entry(
     sessions: dict[str, Any],
     key: str,
@@ -6039,6 +6057,7 @@ def notify_codex_agent_stop(
         tmux_socket
         or str(payload.get("tmux_socket") or "").strip()
         or os.environ.get("CODEX_TMUX_SOCKET")
+        or _tmux_socket_path_from_env(os.environ.get("TMUX"))
     )
     pane_binding_rejected = False
     try:
@@ -6095,15 +6114,15 @@ def notify_codex_agent_stop(
                     sessions[key] = entry
                     write_json_atomic(state_path, state)
             elif not binding:
-                persisted_binding = _codex_hook_entry_binding(entry)
-                if persisted_binding and not (
-                    _codex_hook_binding_matches_request(
-                        persisted_binding,
+                persisted_binding, binding_rejected = (
+                    _codex_hook_persisted_binding(
+                        entry,
                         tmux_pane=requested_pane,
                         tmux_session=requested_session,
                         tmux_socket=requested_socket,
                     )
-                ):
+                )
+                if binding_rejected:
                     pane_binding_rejected = True
                     _clear_codex_hook_entry_binding(entry)
                     sessions[key] = entry
@@ -6158,20 +6177,20 @@ def notify_codex_agent_stop(
             if not binding and not pane_binding_rejected:
                 receipt_binding = receipt.get("tmux_binding")
                 if isinstance(receipt_binding, dict):
-                    persisted_binding = _codex_hook_entry_binding(
-                        receipt_binding
-                    )
-                    if persisted_binding and not (
-                        _codex_hook_binding_matches_request(
-                            persisted_binding,
+                    persisted_binding, binding_rejected = (
+                        _codex_hook_persisted_binding(
+                            receipt_binding,
                             tmux_pane=requested_pane,
                             tmux_session=requested_session,
                             tmux_socket=requested_socket,
                         )
-                    ):
+                    )
+                    if binding_rejected:
                         pane_binding_rejected = True
                     else:
                         binding = persisted_binding
+            if pane_binding_rejected:
+                fallback_key = None
 
         if pane_binding_rejected and channel_id and thread_ts:
             try:
