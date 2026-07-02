@@ -122,7 +122,7 @@ AGENT_TMUX_PANE_IDENTITY_KEYS = (
 AGENT_CODEX_HOOK_STATE_FILENAME = "agent-codex-hooks.json"
 AGENT_CODEX_HOOK_NOTIFY_USER_KEY = "AGENT_NOTIFY_SLACK_USER_ID"
 AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS = 10.0
-AGENT_CODEX_HOOK_DELIVERY_LOCK_BUCKETS = 256
+AGENT_CODEX_HOOK_DELIVERY_LOCK_BUCKETS = 4096
 AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS = 120.0
 AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS = 600.0
 AGENT_CODEX_HOOK_COMMAND_TIMEOUT_SECONDS = 60
@@ -139,6 +139,10 @@ SLACK_API_REQUEST_POLICY: ContextVar[dict[str, float | int] | None] = (
 )
 SLACK_SINGLE_MESSAGE_MAX_CHARS: ContextVar[int | None] = ContextVar(
     "slack_single_message_max_chars",
+    default=None,
+)
+SLACK_SINGLE_MESSAGE_MRKDWN: ContextVar[bool | None] = ContextVar(
+    "slack_single_message_mrkdwn",
     default=None,
 )
 USER_CONFIG_MODAL_CALLBACK_ID = "sneeze_user_config"
@@ -2108,12 +2112,15 @@ def slack_api_request_policy(
 def slack_single_message_policy(
     *,
     max_chars: int = MAX_SLACK_TEXT_CHARS,
+    mrkdwn: bool | None = None,
 ):
-    token = SLACK_SINGLE_MESSAGE_MAX_CHARS.set(max_chars)
+    max_chars_token = SLACK_SINGLE_MESSAGE_MAX_CHARS.set(max_chars)
+    mrkdwn_token = SLACK_SINGLE_MESSAGE_MRKDWN.set(mrkdwn)
     try:
         yield
     finally:
-        SLACK_SINGLE_MESSAGE_MAX_CHARS.reset(token)
+        SLACK_SINGLE_MESSAGE_MRKDWN.reset(mrkdwn_token)
+        SLACK_SINGLE_MESSAGE_MAX_CHARS.reset(max_chars_token)
 
 
 def slack_api_post(
@@ -2445,8 +2452,9 @@ def _post_single_slack_message(
             )
         return None
     payload: dict[str, Any] = {"channel": channel, "text": text}
-    if SLACK_SINGLE_MESSAGE_MAX_CHARS.get() is not None:
-        payload["mrkdwn"] = False
+    mrkdwn = SLACK_SINGLE_MESSAGE_MRKDWN.get()
+    if mrkdwn is not None:
+        payload["mrkdwn"] = mrkdwn
     if blocks:
         payload["blocks"] = render_slack_blocks(blocks)
     if route.thread_ts:
@@ -6110,7 +6118,7 @@ def notify_codex_agent_stop(
                         AGENT_CODEX_HOOK_SLACK_TOTAL_TIMEOUT_SECONDS
                     ),
                 ),
-                slack_single_message_policy(),
+                slack_single_message_policy(mrkdwn=False),
             ):
                 response = post_slack_message(
                     config,
@@ -6327,22 +6335,72 @@ def _index_codex_hook_receipt_route(
     write_json_atomic(receipt_path, receipt)
 
 
-def _index_pending_codex_hook_receipt_routes(state_path: str) -> None:
+def _index_pending_codex_hook_receipt_routes(
+    state_path: str,
+    *,
+    channel_id: str,
+    thread_ts: str,
+    notify_user_id: str,
+) -> dict[str, Any] | None:
     alias_dir = _codex_hook_delivery_alias_receipt_dir(state_path)
     if not alias_dir.exists():
-        return
+        return None
+    requested_route_name = Path(
+        _codex_hook_delivery_route_receipt_path(
+            state_path,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            notify_user_id=notify_user_id,
+        )
+    ).name
     marker_path = (
         _codex_hook_delivery_receipt_root(state_path)
         / "pending-alias-route-index-v1.json"
     )
     with locked_json_path(marker_path):
         if not alias_dir.exists():
-            return
+            return None
         alias_dir_mtime_ns = alias_dir.stat().st_mtime_ns
-        marker = read_json(marker_path, {})
+        try:
+            marker = read_json(marker_path, {})
+        except OSError:
+            marker = {}
+        if not isinstance(marker, dict):
+            marker = {}
+        marker_routes = marker.get("routes")
+        if not isinstance(marker_routes, dict):
+            marker_routes = {}
         if marker.get("alias_dir_mtime_ns") == alias_dir_mtime_ns:
-            return
+            alias_name = marker_routes.get(requested_route_name)
+            if not isinstance(alias_name, str):
+                return None
+            alias_path = alias_dir / Path(alias_name).name
+            if alias_path.name != alias_name:
+                return None
+            try:
+                age = time.time() - alias_path.stat().st_mtime
+                receipt = read_json(alias_path, {})
+            except OSError:
+                return None
+            if (
+                age > AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS
+                or not _codex_hook_receipt_matches_route(
+                    receipt,
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    notify_user_id=notify_user_id,
+                )
+            ):
+                return None
+            try:
+                _index_codex_hook_receipt_route(state_path, receipt)
+            except OSError:
+                pass
+            return receipt
+
         now = time.time()
+        matching_receipt = None
+        route_aliases = {}
         for alias_path in alias_dir.iterdir():
             if not alias_path.name.endswith(".receipt.json"):
                 continue
@@ -6352,17 +6410,56 @@ def _index_pending_codex_hook_receipt_routes(state_path: str) -> None:
                 continue
             if age > AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS:
                 continue
-            receipt = read_json(alias_path, {})
-            if isinstance(receipt, dict):
+            try:
+                receipt = read_json(alias_path, {})
+            except OSError:
+                continue
+            if not isinstance(receipt, dict):
+                continue
+            receipt_channel_id = str(receipt.get("channel_id") or "")
+            receipt_thread_ts = str(receipt.get("thread_ts") or "")
+            receipt_user_id = str(receipt.get("notify_user_id") or "")
+            if (
+                not receipt_channel_id
+                or not receipt_thread_ts
+                or not receipt_user_id
+            ):
+                continue
+            route_name = Path(
+                _codex_hook_delivery_route_receipt_path(
+                    state_path,
+                    channel_id=receipt_channel_id,
+                    thread_ts=receipt_thread_ts,
+                    notify_user_id=receipt_user_id,
+                )
+            ).name
+            route_aliases[route_name] = alias_path.name
+            if route_name == requested_route_name and (
+                _codex_hook_receipt_matches_route(
+                    receipt,
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    notify_user_id=notify_user_id,
+                )
+            ):
+                matching_receipt = receipt
+            try:
                 _index_codex_hook_receipt_route(state_path, receipt)
-        write_json_atomic(
-            marker_path,
-            {
-                "version": 1,
-                "alias_dir_mtime_ns": alias_dir_mtime_ns,
-                "indexed_at": utcnow_iso(),
-            },
-        )
+            except OSError:
+                continue
+        try:
+            write_json_atomic(
+                marker_path,
+                {
+                    "version": 1,
+                    "alias_dir_mtime_ns": alias_dir_mtime_ns,
+                    "routes": route_aliases,
+                    "indexed_at": utcnow_iso(),
+                },
+            )
+        except OSError:
+            pass
+        return matching_receipt
 
 
 def _migrate_legacy_codex_hook_receipt_routes(state_path: str) -> None:
@@ -6429,9 +6526,16 @@ def codex_hook_delivery_receipt_for_route(
         return receipt
 
     try:
-        _index_pending_codex_hook_receipt_routes(state_path)
+        pending_receipt = _index_pending_codex_hook_receipt_routes(
+            state_path,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            notify_user_id=notify_user_id,
+        )
     except OSError:
-        pass
+        pending_receipt = None
+    if pending_receipt is not None:
+        return pending_receipt
     receipt = read_json(receipt_path, {})
     if _codex_hook_receipt_matches_route(
         receipt,
