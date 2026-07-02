@@ -5441,20 +5441,56 @@ def _clear_codex_hook_entry_binding(entry: dict[str, Any]) -> None:
     entry.pop("fallback_key", None)
 
 
+def _codex_hook_requested_tmux_sockets(
+    config: SlackbotConfig,
+    payload: dict[str, Any],
+    *,
+    tmux_session: str | None,
+    tmux_socket: str | None,
+) -> tuple[str, ...]:
+    explicit_socket = (
+        tmux_socket
+        or str(payload.get("tmux_socket") or "").strip()
+        or os.environ.get("CODEX_TMUX_SOCKET")
+    )
+    resolved_socket = explicit_socket or codex_tmux_socket(config)
+    explicit_session = (
+        tmux_session
+        or str(payload.get("tmux_session") or "").strip()
+        or os.environ.get("WEBMUX_AGENT_SESSION")
+        or os.environ.get("CODEX_TMUX_SESSION_NAME")
+    )
+    tmux_env_socket = _tmux_socket_path_from_env(os.environ.get("TMUX"))
+    if explicit_session:
+        return (explicit_socket or tmux_env_socket or resolved_socket,)
+    payload_pane = str(payload.get("tmux_pane") or "").strip()
+    environment_pane = str(os.environ.get("TMUX_PANE") or "").strip()
+    if not (payload_pane or environment_pane):
+        return ()
+    candidates = []
+    if environment_pane and not payload_pane and tmux_env_socket:
+        candidates.append(tmux_env_socket)
+    candidates.append(resolved_socket)
+    if tmux_env_socket:
+        candidates.append(tmux_env_socket)
+    return tuple(OrderedDict.fromkeys(candidates))
+
+
 def _codex_hook_binding_matches_request(
     binding: dict[str, str],
     *,
     tmux_pane: str | None,
     tmux_session: str | None,
-    tmux_socket: str | None,
+    tmux_sockets: tuple[str, ...],
 ) -> bool:
     for key, requested in (
         ("tmux_pane", tmux_pane),
         ("tmux_session", tmux_session),
-        ("tmux_socket", tmux_socket),
     ):
         if requested and binding.get(key) != requested:
             return False
+    if tmux_sockets and binding.get("tmux_socket") not in tmux_sockets:
+        return False
     return True
 
 
@@ -5463,14 +5499,14 @@ def _codex_hook_persisted_binding(
     *,
     tmux_pane: str | None,
     tmux_session: str | None,
-    tmux_socket: str | None,
+    tmux_sockets: tuple[str, ...],
 ) -> tuple[dict[str, str] | None, bool]:
     binding = _codex_hook_entry_binding(value)
     if binding and not _codex_hook_binding_matches_request(
         binding,
         tmux_pane=tmux_pane,
         tmux_session=tmux_session,
-        tmux_socket=tmux_socket,
+        tmux_sockets=tmux_sockets,
     ):
         return None, True
     return binding, False
@@ -6053,11 +6089,11 @@ def notify_codex_agent_stop(
         or os.environ.get("WEBMUX_AGENT_SESSION")
         or os.environ.get("CODEX_TMUX_SESSION_NAME")
     )
-    requested_socket = (
-        tmux_socket
-        or str(payload.get("tmux_socket") or "").strip()
-        or os.environ.get("CODEX_TMUX_SOCKET")
-        or _tmux_socket_path_from_env(os.environ.get("TMUX"))
+    requested_sockets = _codex_hook_requested_tmux_sockets(
+        config,
+        payload,
+        tmux_session=tmux_session,
+        tmux_socket=tmux_socket,
     )
     pane_binding_rejected = False
     try:
@@ -6119,7 +6155,7 @@ def notify_codex_agent_stop(
                         entry,
                         tmux_pane=requested_pane,
                         tmux_session=requested_session,
-                        tmux_socket=requested_socket,
+                        tmux_sockets=requested_sockets,
                     )
                 )
                 if binding_rejected:
@@ -6182,7 +6218,7 @@ def notify_codex_agent_stop(
                             receipt_binding,
                             tmux_pane=requested_pane,
                             tmux_session=requested_session,
-                            tmux_socket=requested_socket,
+                            tmux_sockets=requested_sockets,
                         )
                     )
                     if binding_rejected:
