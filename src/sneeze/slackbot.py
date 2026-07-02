@@ -2453,6 +2453,8 @@ def _post_single_slack_message(
         return None
     payload: dict[str, Any] = {"channel": channel, "text": text}
     mrkdwn = SLACK_SINGLE_MESSAGE_MRKDWN.get()
+    if mrkdwn is None and SLACK_SINGLE_MESSAGE_MAX_CHARS.get() is not None:
+        mrkdwn = False
     if mrkdwn is not None:
         payload["mrkdwn"] = mrkdwn
     if blocks:
@@ -6370,42 +6372,47 @@ def _index_pending_codex_hook_receipt_routes(
         marker_routes = marker.get("routes")
         if not isinstance(marker_routes, dict):
             marker_routes = {}
-        if marker.get("alias_dir_mtime_ns") == alias_dir_mtime_ns:
-            alias_name = marker_routes.get(requested_route_name)
-            if not isinstance(alias_name, str):
+        if (
+            marker.get("version") == 2
+            and marker.get("alias_dir_mtime_ns") == alias_dir_mtime_ns
+        ):
+            if requested_route_name not in marker_routes:
                 return None
-            alias_path = alias_dir / Path(alias_name).name
-            if alias_path.name != alias_name:
-                return None
-            try:
-                age = time.time() - alias_path.stat().st_mtime
-                receipt = read_json(alias_path, {})
-            except OSError:
-                return None
-            if (
-                age > AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS
-                or not _codex_hook_receipt_matches_route(
-                    receipt,
-                    channel_id=channel_id,
-                    thread_ts=thread_ts,
-                    notify_user_id=notify_user_id,
-                )
-            ):
-                return None
-            try:
-                _index_codex_hook_receipt_route(state_path, receipt)
-            except OSError:
-                pass
-            return receipt
+            alias_name = marker_routes[requested_route_name]
+            if isinstance(alias_name, str):
+                alias_path = alias_dir / Path(alias_name).name
+                age = float("inf")
+                try:
+                    age = time.time() - alias_path.stat().st_mtime
+                    receipt = read_json(alias_path, {})
+                except OSError:
+                    receipt = None
+                if (
+                    alias_path.name == alias_name
+                    and age <= AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS
+                    and _codex_hook_receipt_matches_route(
+                        receipt,
+                        channel_id=channel_id,
+                        thread_ts=thread_ts,
+                        notify_user_id=notify_user_id,
+                    )
+                ):
+                    try:
+                        _index_codex_hook_receipt_route(state_path, receipt)
+                    except OSError:
+                        pass
+                    return receipt
 
         now = time.time()
         matching_receipt = None
+        matching_modified_at = float("-inf")
         route_aliases = {}
         for alias_path in alias_dir.iterdir():
             if not alias_path.name.endswith(".receipt.json"):
                 continue
             try:
-                age = now - alias_path.stat().st_mtime
+                modified_at = alias_path.stat().st_mtime
+                age = now - modified_at
             except OSError:
                 continue
             if age > AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS:
@@ -6433,7 +6440,9 @@ def _index_pending_codex_hook_receipt_routes(
                     notify_user_id=receipt_user_id,
                 )
             ).name
-            route_aliases[route_name] = alias_path.name
+            indexed_alias = route_aliases.get(route_name)
+            if indexed_alias is None or modified_at > indexed_alias[0]:
+                route_aliases[route_name] = (modified_at, alias_path.name)
             if route_name == requested_route_name and (
                 _codex_hook_receipt_matches_route(
                     receipt,
@@ -6441,8 +6450,10 @@ def _index_pending_codex_hook_receipt_routes(
                     thread_ts=thread_ts,
                     notify_user_id=notify_user_id,
                 )
+                and modified_at > matching_modified_at
             ):
                 matching_receipt = receipt
+                matching_modified_at = modified_at
             try:
                 _index_codex_hook_receipt_route(state_path, receipt)
             except OSError:
@@ -6451,9 +6462,15 @@ def _index_pending_codex_hook_receipt_routes(
             write_json_atomic(
                 marker_path,
                 {
-                    "version": 1,
+                    "version": 2,
                     "alias_dir_mtime_ns": alias_dir_mtime_ns,
-                    "routes": route_aliases,
+                    "routes": {
+                        route_name: alias_name
+                        for route_name, (
+                            _,
+                            alias_name,
+                        ) in route_aliases.items()
+                    },
                     "indexed_at": utcnow_iso(),
                 },
             )

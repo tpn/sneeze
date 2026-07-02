@@ -2736,6 +2736,123 @@ def test_codex_hook_recovers_alias_when_route_index_writes_fail(
     assert recovered == receipt
 
 
+def test_codex_hook_rebuilds_preupgrade_pending_alias_marker(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    receipt = {
+        "version": 1,
+        "key": "session:codex-session-1",
+        "fallback_key": None,
+        "channel_id": "D111",
+        "thread_ts": "1.000001",
+        "notify_user_id": "U111",
+        "turn_id": "turn-1",
+        "message_sha256": "message-hash",
+        "tmux_binding": None,
+        "notified_at": slackbot_module.utcnow_iso(),
+    }
+    receipt_path = slackbot_module._codex_hook_delivery_receipt_paths(
+        state_path,
+        {receipt["key"]},
+        turn_id="turn-1",
+        message_hash="message-hash",
+        notify_user_id="U111",
+        transcript_path=None,
+    )[0]
+    slackbot_module.write_json_atomic(receipt_path, receipt)
+    alias_dir = slackbot_module._codex_hook_delivery_alias_receipt_dir(
+        state_path
+    )
+    marker_path = (
+        slackbot_module._codex_hook_delivery_receipt_root(state_path)
+        / "pending-alias-route-index-v1.json"
+    )
+    slackbot_module.write_json_atomic(
+        marker_path,
+        {
+            "version": 1,
+            "alias_dir_mtime_ns": alias_dir.stat().st_mtime_ns,
+            "indexed_at": slackbot_module.utcnow_iso(),
+        },
+    )
+
+    recovered = slackbot_module.codex_hook_delivery_receipt_for_route(
+        config.paths,
+        channel_id="D111",
+        thread_ts="1.000001",
+        notify_user_id="U111",
+    )
+
+    assert recovered == receipt
+    marker = slackbot_module.read_json(marker_path, {})
+    assert marker["version"] == 2
+    assert marker["routes"]
+
+
+def test_codex_hook_rebuilds_invalid_pending_alias_mapping(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    route = {
+        "channel_id": "D111",
+        "thread_ts": "1.000001",
+        "notify_user_id": "U111",
+    }
+    receipt = {
+        "version": 1,
+        "key": "session:codex-session-1",
+        "fallback_key": None,
+        **route,
+        "turn_id": "turn-1",
+        "message_sha256": "message-hash",
+        "tmux_binding": None,
+        "notified_at": slackbot_module.utcnow_iso(),
+    }
+    receipt_path = slackbot_module._codex_hook_delivery_receipt_paths(
+        state_path,
+        {receipt["key"]},
+        turn_id="turn-1",
+        message_hash="message-hash",
+        notify_user_id="U111",
+        transcript_path=None,
+    )[0]
+    slackbot_module.write_json_atomic(receipt_path, receipt)
+    alias_dir = slackbot_module._codex_hook_delivery_alias_receipt_dir(
+        state_path
+    )
+    marker_path = (
+        slackbot_module._codex_hook_delivery_receipt_root(state_path)
+        / "pending-alias-route-index-v1.json"
+    )
+    route_name = Path(
+        slackbot_module._codex_hook_delivery_route_receipt_path(
+            state_path,
+            **route,
+        )
+    ).name
+    slackbot_module.write_json_atomic(
+        marker_path,
+        {
+            "version": 2,
+            "alias_dir_mtime_ns": alias_dir.stat().st_mtime_ns,
+            "routes": {route_name: "missing.receipt.json"},
+            "indexed_at": slackbot_module.utcnow_iso(),
+        },
+    )
+
+    recovered = slackbot_module.codex_hook_delivery_receipt_for_route(
+        config.paths,
+        **route,
+    )
+
+    assert recovered == receipt
+    marker = slackbot_module.read_json(marker_path, {})
+    assert marker["routes"][route_name] == Path(receipt_path).name
+
+
 def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
     tmp_path,
     monkeypatch,
