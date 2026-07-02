@@ -1719,7 +1719,7 @@ def test_codex_stop_hook_rejected_pane_clears_stale_binding(
     assert calls[2].thread_ts is None
 
 
-def test_codex_stop_hook_transient_pane_query_keeps_binding(
+def test_codex_stop_hook_transient_query_only_keeps_matching_binding(
     tmp_path,
     monkeypatch,
 ):
@@ -1782,6 +1782,27 @@ def test_codex_stop_hook_transient_pane_query_keeps_binding(
         thread_ts="1.000001",
     )
     assert binding["tmux_pane"] == "%1"
+    payload.update(
+        {
+            "turn_id": "turn-3",
+            "last_assistant_message": "Different unavailable pane.",
+            "tmux_pane": "%2",
+        }
+    )
+
+    changed = notify_codex_agent_stop(profile, json.dumps(payload))
+
+    assert changed["tmux_binding"] is None
+    assert calls[2].channel_id == "D111"
+    assert calls[2].thread_ts == "1.000001"
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
 
 
 def test_codex_stop_hook_bounds_dedupe_without_turn_id(tmp_path, monkeypatch):

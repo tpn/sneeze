@@ -5441,6 +5441,23 @@ def _clear_codex_hook_entry_binding(entry: dict[str, Any]) -> None:
     entry.pop("fallback_key", None)
 
 
+def _codex_hook_binding_matches_request(
+    binding: dict[str, str],
+    *,
+    tmux_pane: str | None,
+    tmux_session: str | None,
+    tmux_socket: str | None,
+) -> bool:
+    for key, requested in (
+        ("tmux_pane", tmux_pane),
+        ("tmux_session", tmux_session),
+        ("tmux_socket", tmux_socket),
+    ):
+        if requested and binding.get(key) != requested:
+            return False
+    return True
+
+
 def _codex_hook_existing_entry(
     sessions: dict[str, Any],
     key: str,
@@ -6007,6 +6024,22 @@ def notify_codex_agent_stop(
             "Missing required Slack notification config: "
             f"{profile.env_name(AGENT_CODEX_HOOK_NOTIFY_USER_KEY)}"
         )
+    requested_pane = (
+        str(payload.get("tmux_pane") or "").strip()
+        or str(os.environ.get("TMUX_PANE") or "").strip()
+        or None
+    )
+    requested_session = (
+        tmux_session
+        or str(payload.get("tmux_session") or "").strip()
+        or os.environ.get("WEBMUX_AGENT_SESSION")
+        or os.environ.get("CODEX_TMUX_SESSION_NAME")
+    )
+    requested_socket = (
+        tmux_socket
+        or str(payload.get("tmux_socket") or "").strip()
+        or os.environ.get("CODEX_TMUX_SOCKET")
+    )
     pane_binding_rejected = False
     try:
         binding = resolve_codex_agent_tmux_binding(
@@ -6062,7 +6095,21 @@ def notify_codex_agent_stop(
                     sessions[key] = entry
                     write_json_atomic(state_path, state)
             elif not binding:
-                binding = _codex_hook_entry_binding(entry)
+                persisted_binding = _codex_hook_entry_binding(entry)
+                if persisted_binding and not (
+                    _codex_hook_binding_matches_request(
+                        persisted_binding,
+                        tmux_pane=requested_pane,
+                        tmux_session=requested_session,
+                        tmux_socket=requested_socket,
+                    )
+                ):
+                    pane_binding_rejected = True
+                    _clear_codex_hook_entry_binding(entry)
+                    sessions[key] = entry
+                    write_json_atomic(state_path, state)
+                else:
+                    binding = persisted_binding
             recipient_matches = (
                 str(entry.get("notify_user_id") or "").strip()
                 == notify_user_id
@@ -6111,7 +6158,20 @@ def notify_codex_agent_stop(
             if not binding and not pane_binding_rejected:
                 receipt_binding = receipt.get("tmux_binding")
                 if isinstance(receipt_binding, dict):
-                    binding = _codex_hook_entry_binding(receipt_binding)
+                    persisted_binding = _codex_hook_entry_binding(
+                        receipt_binding
+                    )
+                    if persisted_binding and not (
+                        _codex_hook_binding_matches_request(
+                            persisted_binding,
+                            tmux_pane=requested_pane,
+                            tmux_session=requested_session,
+                            tmux_socket=requested_socket,
+                        )
+                    ):
+                        pane_binding_rejected = True
+                    else:
+                        binding = persisted_binding
 
         if pane_binding_rejected and channel_id and thread_ts:
             try:
