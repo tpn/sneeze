@@ -6406,7 +6406,7 @@ def _index_pending_codex_hook_receipt_routes(
         now = time.time()
         matching_receipt = None
         matching_modified_at = float("-inf")
-        route_aliases = {}
+        route_receipts = {}
         for alias_path in alias_dir.iterdir():
             if not alias_path.name.endswith(".receipt.json"):
                 continue
@@ -6440,9 +6440,13 @@ def _index_pending_codex_hook_receipt_routes(
                     notify_user_id=receipt_user_id,
                 )
             ).name
-            indexed_alias = route_aliases.get(route_name)
+            indexed_alias = route_receipts.get(route_name)
             if indexed_alias is None or modified_at > indexed_alias[0]:
-                route_aliases[route_name] = (modified_at, alias_path.name)
+                route_receipts[route_name] = (
+                    modified_at,
+                    alias_path.name,
+                    receipt,
+                )
             if route_name == requested_route_name and (
                 _codex_hook_receipt_matches_route(
                     receipt,
@@ -6454,6 +6458,7 @@ def _index_pending_codex_hook_receipt_routes(
             ):
                 matching_receipt = receipt
                 matching_modified_at = modified_at
+        for _, _, receipt in route_receipts.values():
             try:
                 _index_codex_hook_receipt_route(state_path, receipt)
             except OSError:
@@ -6466,10 +6471,9 @@ def _index_pending_codex_hook_receipt_routes(
                     "alias_dir_mtime_ns": alias_dir_mtime_ns,
                     "routes": {
                         route_name: alias_name
-                        for route_name, (
-                            _,
-                            alias_name,
-                        ) in route_aliases.items()
+                        for route_name, (_, alias_name, _) in (
+                            route_receipts.items()
+                        )
                     },
                     "indexed_at": utcnow_iso(),
                 },

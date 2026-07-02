@@ -2690,6 +2690,54 @@ def test_codex_hook_indexes_every_fresh_pending_alias_receipt(tmp_path):
     assert Path(first_route_path).exists()
 
 
+def test_codex_hook_indexes_newest_pending_receipt_for_each_route(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    route = {
+        "channel_id": "D111",
+        "thread_ts": "1.000001",
+        "notify_user_id": "U111",
+    }
+    receipts = []
+    now = time.time()
+    for index, modified_at in enumerate((now - 10, now), start=1):
+        receipt = {
+            "version": 1,
+            "key": f"session:codex-session-{index}",
+            "fallback_key": None,
+            **route,
+            "turn_id": f"turn-{index}",
+            "message_sha256": f"message-hash-{index}",
+            "tmux_binding": None,
+            "notified_at": slackbot_module.utcnow_iso(),
+        }
+        receipt_path = slackbot_module._codex_hook_delivery_receipt_paths(
+            state_path,
+            {receipt["key"]},
+            turn_id=receipt["turn_id"],
+            message_hash=receipt["message_sha256"],
+            notify_user_id="U111",
+            transcript_path=None,
+        )[0]
+        slackbot_module.write_json_atomic(receipt_path, receipt)
+        os.utime(receipt_path, (modified_at, modified_at))
+        receipts.append(receipt)
+
+    first_lookup = slackbot_module.codex_hook_delivery_receipt_for_route(
+        config.paths,
+        **route,
+    )
+    second_lookup = slackbot_module.codex_hook_delivery_receipt_for_route(
+        config.paths,
+        **route,
+    )
+
+    assert first_lookup == receipts[-1]
+    assert second_lookup == receipts[-1]
+
+
 def test_codex_hook_recovers_alias_when_route_index_writes_fail(
     tmp_path,
     monkeypatch,
