@@ -119,6 +119,14 @@ AGENT_TMUX_PANE_IDENTITY_KEYS = (
     "tmux_session_created",
     "tmux_server_pid",
 )
+AGENT_TMUX_BINDING_KEYS = (
+    "host",
+    "tmux_session",
+    "tmux_socket",
+    "tmux_conf",
+    "tmux_pane",
+    *AGENT_TMUX_PANE_IDENTITY_KEYS,
+)
 AGENT_CODEX_HOOK_STATE_FILENAME = "agent-codex-hooks.json"
 AGENT_CODEX_HOOK_NOTIFY_USER_KEY = "AGENT_NOTIFY_SLACK_USER_ID"
 AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS = 10.0
@@ -143,6 +151,10 @@ SLACK_SINGLE_MESSAGE_MAX_CHARS: ContextVar[int | None] = ContextVar(
 )
 SLACK_SINGLE_MESSAGE_MRKDWN: ContextVar[bool | None] = ContextVar(
     "slack_single_message_mrkdwn",
+    default=None,
+)
+SLACK_CLIENT_MSG_ID: ContextVar[str | None] = ContextVar(
+    "slack_client_msg_id",
     default=None,
 )
 USER_CONFIG_MODAL_CALLBACK_ID = "sneeze_user_config"
@@ -2113,12 +2125,17 @@ def slack_single_message_policy(
     *,
     max_chars: int = MAX_SLACK_TEXT_CHARS,
     mrkdwn: bool | None = None,
+    client_msg_id: str | None = None,
 ):
+    if max_chars < 1:
+        raise ValueError("single Slack message limit must be positive")
     max_chars_token = SLACK_SINGLE_MESSAGE_MAX_CHARS.set(max_chars)
     mrkdwn_token = SLACK_SINGLE_MESSAGE_MRKDWN.set(mrkdwn)
+    client_msg_id_token = SLACK_CLIENT_MSG_ID.set(client_msg_id)
     try:
         yield
     finally:
+        SLACK_CLIENT_MSG_ID.reset(client_msg_id_token)
         SLACK_SINGLE_MESSAGE_MRKDWN.reset(mrkdwn_token)
         SLACK_SINGLE_MESSAGE_MAX_CHARS.reset(max_chars_token)
 
@@ -2299,6 +2316,7 @@ def post_slack_message(
     else:
         suffix = "\n\n[Notification truncated to fit one Slack message.]"
         if len(rendered_text) > single_message_max_chars:
+            suffix = suffix[:single_message_max_chars]
             prefix_length = max(0, single_message_max_chars - len(suffix))
             rendered_text = rendered_text[:prefix_length].rstrip() + suffix
         chunks = [rendered_text]
@@ -2457,6 +2475,9 @@ def _post_single_slack_message(
         mrkdwn = False
     if mrkdwn is not None:
         payload["mrkdwn"] = mrkdwn
+    client_msg_id = SLACK_CLIENT_MSG_ID.get()
+    if client_msg_id:
+        payload["client_msg_id"] = client_msg_id
     if blocks:
         payload["blocks"] = render_slack_blocks(blocks)
     if route.thread_ts:
@@ -5211,6 +5232,7 @@ def paste_agent_tmux_text(
             *tmux_command,
             "paste-buffer",
             "-d",
+            "-p",
             "-b",
             buffer_name,
             "-t",
@@ -5291,6 +5313,29 @@ def _codex_hook_message_text(payload: dict[str, Any]) -> str:
 
 def _codex_hook_message_hash(message: str) -> str:
     return hashlib.sha256(message.encode("utf-8")).hexdigest()
+
+
+def _codex_hook_client_msg_id(
+    *,
+    key: str,
+    turn_id: str | None,
+    message_hash: str,
+    notify_user_id: str,
+    transcript_path: str | None,
+) -> str:
+    identity = {
+        "key": key,
+        "turn_id": turn_id,
+        "message_sha256": message_hash,
+        "notify_user_id": notify_user_id,
+        "transcript_path": transcript_path,
+    }
+    if turn_id is None:
+        identity["dedupe_bucket"] = int(
+            time.time() // AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS
+        )
+    value = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, value))
 
 
 def _codex_hook_state_key(
@@ -5375,6 +5420,11 @@ def _codex_hook_entry_binding(
         if value:
             binding[key] = value
     return binding
+
+
+def _clear_codex_hook_entry_binding(entry: dict[str, Any]) -> None:
+    for key in AGENT_TMUX_BINDING_KEYS:
+        entry.pop(key, None)
 
 
 def _codex_hook_existing_entry(
@@ -5943,6 +5993,10 @@ def notify_codex_agent_stop(
             "Missing required Slack notification config: "
             f"{profile.env_name(AGENT_CODEX_HOOK_NOTIFY_USER_KEY)}"
         )
+    requested_pane = (
+        str(payload.get("tmux_pane") or "").strip()
+        or str(os.environ.get("TMUX_PANE") or "").strip()
+    )
     binding = resolve_codex_agent_tmux_binding(
         config,
         payload,
@@ -5950,12 +6004,20 @@ def notify_codex_agent_stop(
         tmux_socket=tmux_socket,
         tmux_conf=tmux_conf,
     )
+    pane_binding_rejected = bool(requested_pane and binding is None)
     session_id = _codex_hook_text_value(payload, "session_id")
     transcript_path = _codex_hook_text_value(payload, "transcript_path")
     desired_key = _codex_hook_state_key(payload, binding)
     turn_id = _codex_hook_text_value(payload, "turn_id")
     message = _codex_hook_message_text(payload)
     message_hash = _codex_hook_message_hash(message)
+    client_msg_id = _codex_hook_client_msg_id(
+        key=desired_key,
+        turn_id=turn_id,
+        message_hash=message_hash,
+        notify_user_id=notify_user_id,
+        transcript_path=transcript_path,
+    )
     state_path = agent_codex_hook_state_path(config.paths)
     fallback_key = _codex_hook_state_key({}, binding) if binding else None
 
@@ -5979,7 +6041,12 @@ def notify_codex_agent_stop(
                 desired_key,
                 fallback_key,
             )
-            if not binding:
+            if pane_binding_rejected:
+                if entry:
+                    _clear_codex_hook_entry_binding(entry)
+                    sessions[key] = entry
+                    write_json_atomic(state_path, state)
+            elif not binding:
                 binding = _codex_hook_entry_binding(entry)
             recipient_matches = (
                 str(entry.get("notify_user_id") or "").strip()
@@ -6026,10 +6093,31 @@ def notify_codex_agent_stop(
             fallback_key = (
                 str(receipt.get("fallback_key") or "").strip() or fallback_key
             )
-            if not binding:
+            if not binding and not pane_binding_rejected:
                 receipt_binding = receipt.get("tmux_binding")
                 if isinstance(receipt_binding, dict):
                     binding = _codex_hook_entry_binding(receipt_binding)
+
+        if pane_binding_rejected and channel_id and thread_ts:
+            try:
+                unbind_agent_tmux_thread(
+                    profile,
+                    runtime_root=runtime_root,
+                    env_path=env_path,
+                    state_dir=state_dir,
+                    system_prompt_path=system_prompt_path,
+                    unit_name=unit_name,
+                    channel_id=str(channel_id),
+                    thread_ts=str(thread_ts),
+                    lock_timeout_seconds=(
+                        AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS
+                    ),
+                )
+            except Exception as exc:
+                raise CodexHookRetryableError(
+                    "Rejected Codex pane but could not clear its stale "
+                    f"tmux binding: {exc}"
+                ) from exc
 
         if duplicate:
             try:
@@ -6116,7 +6204,10 @@ def notify_codex_agent_stop(
                         AGENT_CODEX_HOOK_SLACK_TOTAL_TIMEOUT_SECONDS
                     ),
                 ),
-                slack_single_message_policy(mrkdwn=False),
+                slack_single_message_policy(
+                    mrkdwn=False,
+                    client_msg_id=client_msg_id,
+                ),
             ):
                 response = post_slack_message(
                     config,
@@ -9904,6 +9995,38 @@ def bind_agent_tmux_thread(
                 data[key][identity_key] = value
         write_json_atomic(paths.agent_tmux_bindings_path, data)
         return data[key]
+
+
+def unbind_agent_tmux_thread(
+    profile: SlackbotProfile,
+    *,
+    channel_id: str,
+    thread_ts: str,
+    runtime_root: str | None = None,
+    env_path: str | None = None,
+    state_dir: str | None = None,
+    system_prompt_path: str | None = None,
+    unit_name: str | None = None,
+    lock_timeout_seconds: float | None = None,
+) -> bool:
+    paths = resolve_paths(
+        profile,
+        runtime_root=runtime_root,
+        env_path=env_path,
+        state_dir=state_dir,
+        system_prompt_path=system_prompt_path,
+        unit_name=unit_name,
+    )
+    key = agent_tmux_thread_key(channel_id, thread_ts)
+    with locked_agent_tmux_json_path(
+        paths.agent_tmux_bindings_path,
+        timeout_seconds=lock_timeout_seconds,
+    ):
+        data = read_json(paths.agent_tmux_bindings_path, {})
+        removed = data.pop(key, None) is not None
+        if removed:
+            write_json_atomic(paths.agent_tmux_bindings_path, data)
+        return removed
 
 
 def query_agent_tmux_thread(

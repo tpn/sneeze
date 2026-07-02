@@ -1220,9 +1220,12 @@ def test_slack_api_post_form_encodes_web_api_payloads(monkeypatch):
 def test_slack_api_request_policy_bounds_retries(monkeypatch):
     timeouts = []
     sleeps = []
+    client_msg_ids = []
 
     def fail_urlopen(request, timeout):
         timeouts.append(timeout)
+        payload = urllib.parse.parse_qs(request.data.decode("utf-8"))
+        client_msg_ids.append(payload["client_msg_id"][0])
         raise slackbot_module.urllib.error.URLError("offline")
 
     monkeypatch.setattr(
@@ -1241,10 +1244,15 @@ def test_slack_api_request_policy_bounds_retries(monkeypatch):
         total_timeout_seconds=10.0,
     ):
         with pytest.raises(SlackbotError, match="connection failed"):
-            slack_api_post("xoxb-test", "chat.postMessage", {"text": "hi"})
+            slack_api_post(
+                "xoxb-test",
+                "chat.postMessage",
+                {"text": "hi", "client_msg_id": "stable-message-id"},
+            )
 
     assert timeouts == [2.0, 2.0]
     assert sleeps == [0.25]
+    assert client_msg_ids == ["stable-message-id", "stable-message-id"]
 
 
 def test_extract_codex_session_id_ignores_event_id():
@@ -1602,10 +1610,99 @@ def test_codex_stop_hook_posts_long_notification_once(tmp_path, monkeypatch):
     assert result["status"] == "notified"
     assert len(calls) == 1
     assert calls[0]["mrkdwn"] is False
+    assert calls[0]["client_msg_id"] == (
+        slackbot_module._codex_hook_client_msg_id(
+            key="session:codex-session-long",
+            turn_id="turn-1",
+            message_hash=slackbot_module._codex_hook_message_hash("x" * 8000),
+            notify_user_id="U111",
+            transcript_path=None,
+        )
+    )
     assert len(calls[0]["text"]) == slackbot_module.MAX_SLACK_TEXT_CHARS
     assert calls[0]["text"].endswith(
         "[Notification truncated to fit one Slack message.]"
     )
+
+
+def test_codex_stop_hook_rejected_pane_clears_stale_binding(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+
+    def fake_pane_identity(tmux_bin, pane_id, **kwargs):
+        if pane_id != "%1":
+            return None
+        return {
+            "tmux_session": "codex-work",
+            "tmux_pane": pane_id,
+            "tmux_pane_pid": "101",
+            "tmux_session_created": "202",
+            "tmux_server_pid": "303",
+        }
+
+    monkeypatch.setattr(
+        "sneeze.slackbot._resolve_tmux_pane_identity",
+        fake_pane_identity,
+    )
+    calls = []
+
+    def fake_post(config, route, text):
+        calls.append(route)
+        return {"channel": "D111", "ts": f"{len(calls)}.000001"}
+
+    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    payload = {
+        "session_id": "codex-session-1",
+        "turn_id": "turn-1",
+        "last_assistant_message": "Initial stop.",
+        "tmux_session": "codex-work",
+        "tmux_socket": "codex",
+        "tmux_pane": "%1",
+    }
+    notify_codex_agent_stop(profile, json.dumps(payload))
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )["tmux_pane"]
+        == "%1"
+    )
+    payload.update(
+        {
+            "turn_id": "turn-2",
+            "last_assistant_message": "Replacement pane stop.",
+            "tmux_pane": "%2",
+        }
+    )
+
+    rejected = notify_codex_agent_stop(profile, json.dumps(payload))
+
+    assert rejected["tmux_binding"] is None
+    assert calls[1].channel_id == "D111"
+    assert calls[1].thread_ts == "1.000001"
+    assert (
+        query_agent_tmux_thread(
+            profile,
+            channel_id="D111",
+            thread_ts="1.000001",
+        )
+        is None
+    )
+    entry = query_codex_agent_threads(profile)["hook_state"]["sessions"][
+        "session:codex-session-1"
+    ]
+    assert "tmux_session" not in entry
+    assert "tmux_pane" not in entry
 
 
 def test_codex_stop_hook_bounds_dedupe_without_turn_id(tmp_path, monkeypatch):
@@ -3808,13 +3905,37 @@ def test_agent_tmux_paste_targets_bound_pane(tmp_path, monkeypatch):
             "tmux_socket": "codex",
             "tmux_pane": "%7",
         },
-        "literal $HOME; -- text",
+        "literal $HOME; -- text\nsecond line",
     )
 
     assert calls[1][0][3:5] == ["load-buffer", "-b"]
-    assert calls[1][1]["input"] == "literal $HOME; -- text"
+    assert calls[1][1]["input"] == "literal $HOME; -- text\nsecond line"
+    assert "-p" in calls[2][0]
     assert calls[2][0][-2:] == ["-t", "%7"]
     assert calls[3][0][-2:] == ["%7", "Enter"]
+
+
+def test_agent_tmux_paste_refuses_remote_host(tmp_path, monkeypatch):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    monkeypatch.setattr(
+        "sneeze.slackbot.subprocess.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("remote binding must not invoke tmux")
+        ),
+    )
+
+    with pytest.raises(SlackbotError, match="remote tmux host"):
+        paste_agent_tmux_text(
+            config,
+            {
+                "host": "remote.example.com",
+                "tmux_session": "codex-work",
+                "tmux_socket": "codex",
+            },
+            "do not paste",
+        )
 
 
 def test_agent_tmux_rejects_reused_pane_from_another_session(
