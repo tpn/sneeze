@@ -48,6 +48,10 @@ class CodexHookRetryableError(SlackbotError):
     pass
 
 
+class TmuxPaneMismatchError(SlackbotError):
+    pass
+
+
 class SlackApiError(SlackbotError):
     def __init__(self, method: str, result: dict[str, Any]):
         self.method = method
@@ -2477,6 +2481,7 @@ def _post_single_slack_message(
         payload["mrkdwn"] = mrkdwn
     client_msg_id = SLACK_CLIENT_MSG_ID.get()
     if client_msg_id:
+        # Slack handles retry duplicates; local receipts cover crash recovery.
         payload["client_msg_id"] = client_msg_id
     if blocks:
         payload["blocks"] = render_slack_blocks(blocks)
@@ -4699,6 +4704,7 @@ def resolve_codex_agent_tmux_binding(
     tmux_session: str | None = None,
     tmux_socket: str | None = None,
     tmux_conf: str | None = None,
+    raise_on_pane_mismatch: bool = False,
 ) -> dict[str, str] | None:
     payload = hook_payload or {}
     explicit_socket = (
@@ -4743,11 +4749,18 @@ def resolve_codex_agent_tmux_binding(
                 tmux_socket=session_socket,
                 tmux_conf=session_conf,
             )
-            if (
-                pane_identity
-                and pane_identity["tmux_session"] == explicit_session
+            if pane_identity and (
+                pane_identity["tmux_session"] == explicit_session
             ):
                 binding.update(pane_identity)
+            elif pane_identity:
+                if raise_on_pane_mismatch:
+                    raise TmuxPaneMismatchError(
+                        f"tmux pane {pane_id} belongs to session "
+                        f"{pane_identity['tmux_session']}, not "
+                        f"{explicit_session}"
+                    )
+                return None
             else:
                 return None
         return binding
@@ -5425,6 +5438,7 @@ def _codex_hook_entry_binding(
 def _clear_codex_hook_entry_binding(entry: dict[str, Any]) -> None:
     for key in AGENT_TMUX_BINDING_KEYS:
         entry.pop(key, None)
+    entry.pop("fallback_key", None)
 
 
 def _codex_hook_existing_entry(
@@ -5993,18 +6007,19 @@ def notify_codex_agent_stop(
             "Missing required Slack notification config: "
             f"{profile.env_name(AGENT_CODEX_HOOK_NOTIFY_USER_KEY)}"
         )
-    requested_pane = (
-        str(payload.get("tmux_pane") or "").strip()
-        or str(os.environ.get("TMUX_PANE") or "").strip()
-    )
-    binding = resolve_codex_agent_tmux_binding(
-        config,
-        payload,
-        tmux_session=tmux_session,
-        tmux_socket=tmux_socket,
-        tmux_conf=tmux_conf,
-    )
-    pane_binding_rejected = bool(requested_pane and binding is None)
+    pane_binding_rejected = False
+    try:
+        binding = resolve_codex_agent_tmux_binding(
+            config,
+            payload,
+            tmux_session=tmux_session,
+            tmux_socket=tmux_socket,
+            tmux_conf=tmux_conf,
+            raise_on_pane_mismatch=True,
+        )
+    except TmuxPaneMismatchError:
+        binding = None
+        pane_binding_rejected = True
     session_id = _codex_hook_text_value(payload, "session_id")
     transcript_path = _codex_hook_text_value(payload, "transcript_path")
     desired_key = _codex_hook_state_key(payload, binding)

@@ -1639,10 +1639,9 @@ def test_codex_stop_hook_rejected_pane_clears_stale_binding(
     )
 
     def fake_pane_identity(tmux_bin, pane_id, **kwargs):
-        if pane_id != "%1":
-            return None
+        session = "codex-work" if pane_id == "%1" else "different-session"
         return {
-            "tmux_session": "codex-work",
+            "tmux_session": session,
             "tmux_pane": pane_id,
             "tmux_pane_pid": "101",
             "tmux_session_created": "202",
@@ -1703,6 +1702,86 @@ def test_codex_stop_hook_rejected_pane_clears_stale_binding(
     ]
     assert "tmux_session" not in entry
     assert "tmux_pane" not in entry
+    assert entry.get("fallback_key") is None
+    payload.pop("session_id")
+    payload.update(
+        {
+            "turn_id": "turn-3",
+            "last_assistant_message": "Old pane starts separately.",
+            "tmux_pane": "%1",
+        }
+    )
+
+    restarted = notify_codex_agent_stop(profile, json.dumps(payload))
+
+    assert restarted["key"].startswith("tmux:")
+    assert calls[2].dm_user_id == "U111"
+    assert calls[2].thread_ts is None
+
+
+def test_codex_stop_hook_transient_pane_query_keeps_binding(
+    tmp_path,
+    monkeypatch,
+):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    env_path = Path(load_config(profile).paths.env_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
+        encoding="utf-8",
+    )
+    pane_available = True
+
+    def fake_pane_identity(tmux_bin, pane_id, **kwargs):
+        if not pane_available:
+            return None
+        return {
+            "tmux_session": "codex-work",
+            "tmux_pane": pane_id,
+            "tmux_pane_pid": "101",
+            "tmux_session_created": "202",
+            "tmux_server_pid": "303",
+        }
+
+    monkeypatch.setattr(
+        "sneeze.slackbot._resolve_tmux_pane_identity",
+        fake_pane_identity,
+    )
+    calls = []
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: calls.append(route)
+        or {"channel": "D111", "ts": f"{len(calls)}.000001"},
+    )
+    payload = {
+        "session_id": "codex-session-1",
+        "turn_id": "turn-1",
+        "last_assistant_message": "Initial stop.",
+        "tmux_session": "codex-work",
+        "tmux_socket": "codex",
+        "tmux_pane": "%1",
+    }
+    notify_codex_agent_stop(profile, json.dumps(payload))
+    pane_available = False
+    payload.update(
+        {
+            "turn_id": "turn-2",
+            "last_assistant_message": "Transient query failure.",
+        }
+    )
+
+    transient = notify_codex_agent_stop(profile, json.dumps(payload))
+
+    assert transient["tmux_binding"]["tmux_pane"] == "%1"
+    assert calls[1].channel_id == "D111"
+    assert calls[1].thread_ts == "1.000001"
+    binding = query_agent_tmux_thread(
+        profile,
+        channel_id="D111",
+        thread_ts="1.000001",
+    )
+    assert binding["tmux_pane"] == "%1"
 
 
 def test_codex_stop_hook_bounds_dedupe_without_turn_id(tmp_path, monkeypatch):
