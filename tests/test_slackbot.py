@@ -1575,15 +1575,17 @@ def test_codex_stop_hook_posts_long_notification_once(tmp_path, monkeypatch):
     )
     calls = []
 
-    def fake_post_single(config, route, text, **kwargs):
-        calls.append((route, text))
+    def fake_slack_api_post(token, method, payload):
+        if method == "conversations.open":
+            return {"ok": True, "channel": {"id": "D111"}}
+        calls.append(payload)
         if len(calls) > 1:
             raise SlackbotError("a second chunk must not be posted")
-        return {"channel": "D111", "ts": "1.000001"}
+        return {"ok": True, "channel": "D111", "ts": "1.000001"}
 
     monkeypatch.setattr(
-        "sneeze.slackbot._post_single_slack_message",
-        fake_post_single,
+        "sneeze.slackbot.slack_api_post",
+        fake_slack_api_post,
     )
 
     result = notify_codex_agent_stop(
@@ -1599,8 +1601,9 @@ def test_codex_stop_hook_posts_long_notification_once(tmp_path, monkeypatch):
 
     assert result["status"] == "notified"
     assert len(calls) == 1
-    assert len(calls[0][1]) == slackbot_module.MAX_SLACK_TEXT_CHARS
-    assert calls[0][1].endswith(
+    assert calls[0]["mrkdwn"] is False
+    assert len(calls[0]["text"]) == slackbot_module.MAX_SLACK_TEXT_CHARS
+    assert calls[0]["text"].endswith(
         "[Notification truncated to fit one Slack message.]"
     )
 
@@ -2620,6 +2623,58 @@ def test_codex_hook_does_not_route_or_delete_stale_alias_receipts(tmp_path):
 
     assert recovered is None
     assert all(Path(path).exists() for path in receipt_paths)
+
+
+def test_codex_hook_indexes_every_fresh_pending_alias_receipt(tmp_path):
+    profile = make_profile(tmp_path)
+    scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
+    config = load_config(profile)
+    state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
+    receipts = []
+    for index in range(300):
+        route = {
+            "channel_id": f"D{index:03d}",
+            "thread_ts": f"{index}.000001",
+            "notify_user_id": "U111",
+        }
+        receipt = {
+            "version": 1,
+            "key": f"session:codex-session-{index}",
+            "fallback_key": None,
+            **route,
+            "turn_id": "turn-1",
+            "message_sha256": "message-hash",
+            "tmux_binding": None,
+            "notified_at": slackbot_module.utcnow_iso(),
+        }
+        receipt_path = slackbot_module._codex_hook_delivery_receipt_paths(
+            state_path,
+            {receipt["key"]},
+            turn_id="turn-1",
+            message_hash="message-hash",
+            notify_user_id="U111",
+            transcript_path=None,
+        )[0]
+        slackbot_module.write_json_atomic(receipt_path, receipt)
+        receipts.append(receipt)
+
+    recovered = slackbot_module.codex_hook_delivery_receipt_for_route(
+        config.paths,
+        channel_id=receipts[-1]["channel_id"],
+        thread_ts=receipts[-1]["thread_ts"],
+        notify_user_id="U111",
+    )
+
+    assert recovered == receipts[-1]
+    first_route_path = (
+        slackbot_module._codex_hook_delivery_route_receipt_path(
+            state_path,
+            channel_id=receipts[0]["channel_id"],
+            thread_ts=receipts[0]["thread_ts"],
+            notify_user_id="U111",
+        )
+    )
+    assert Path(first_route_path).exists()
 
 
 def test_codex_stop_hook_wraps_post_receipt_state_io_failure(

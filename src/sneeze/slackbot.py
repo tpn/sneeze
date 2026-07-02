@@ -125,7 +125,6 @@ AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS = 10.0
 AGENT_CODEX_HOOK_DELIVERY_LOCK_BUCKETS = 256
 AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS = 120.0
 AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS = 600.0
-AGENT_CODEX_HOOK_PENDING_ALIAS_SCAN_LIMIT = 256
 AGENT_CODEX_HOOK_COMMAND_TIMEOUT_SECONDS = 60
 AGENT_CODEX_HOOK_SLACK_REQUEST_TIMEOUT_SECONDS = 2.0
 AGENT_CODEX_HOOK_SLACK_REQUEST_ATTEMPTS = 2
@@ -2446,6 +2445,8 @@ def _post_single_slack_message(
             )
         return None
     payload: dict[str, Any] = {"channel": channel, "text": text}
+    if SLACK_SINGLE_MESSAGE_MAX_CHARS.get() is not None:
+        payload["mrkdwn"] = False
     if blocks:
         payload["blocks"] = render_slack_blocks(blocks)
     if route.thread_ts:
@@ -6326,6 +6327,44 @@ def _index_codex_hook_receipt_route(
     write_json_atomic(receipt_path, receipt)
 
 
+def _index_pending_codex_hook_receipt_routes(state_path: str) -> None:
+    alias_dir = _codex_hook_delivery_alias_receipt_dir(state_path)
+    if not alias_dir.exists():
+        return
+    marker_path = (
+        _codex_hook_delivery_receipt_root(state_path)
+        / "pending-alias-route-index-v1.json"
+    )
+    with locked_json_path(marker_path):
+        if not alias_dir.exists():
+            return
+        alias_dir_mtime_ns = alias_dir.stat().st_mtime_ns
+        marker = read_json(marker_path, {})
+        if marker.get("alias_dir_mtime_ns") == alias_dir_mtime_ns:
+            return
+        now = time.time()
+        for alias_path in alias_dir.iterdir():
+            if not alias_path.name.endswith(".receipt.json"):
+                continue
+            try:
+                age = now - alias_path.stat().st_mtime
+            except OSError:
+                continue
+            if age > AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS:
+                continue
+            receipt = read_json(alias_path, {})
+            if isinstance(receipt, dict):
+                _index_codex_hook_receipt_route(state_path, receipt)
+        write_json_atomic(
+            marker_path,
+            {
+                "version": 1,
+                "alias_dir_mtime_ns": alias_dir_mtime_ns,
+                "indexed_at": utcnow_iso(),
+            },
+        )
+
+
 def _migrate_legacy_codex_hook_receipt_routes(state_path: str) -> None:
     state_target = Path(state_path)
     state_dir = state_target.parent
@@ -6389,39 +6428,18 @@ def codex_hook_delivery_receipt_for_route(
     ):
         return receipt
 
-    alias_dir = _codex_hook_delivery_alias_receipt_dir(state_path)
-    if alias_dir.exists():
-        now = time.time()
-        entries = []
-        try:
-            for alias_path in alias_dir.iterdir():
-                if not alias_path.name.endswith(".receipt.json"):
-                    continue
-                entries.append(alias_path)
-                if len(entries) >= AGENT_CODEX_HOOK_PENDING_ALIAS_SCAN_LIMIT:
-                    break
-        except OSError:
-            entries = ()
-        for alias_path in entries:
-            try:
-                age = now - alias_path.stat().st_mtime
-            except OSError:
-                continue
-            if age > AGENT_CODEX_HOOK_LEGACY_ROUTE_MAX_AGE_SECONDS:
-                continue
-            receipt = read_json(alias_path, {})
-            if not _codex_hook_receipt_matches_route(
-                receipt,
-                channel_id=channel_id,
-                thread_ts=thread_ts,
-                notify_user_id=notify_user_id,
-            ):
-                continue
-            try:
-                _index_codex_hook_receipt_route(state_path, receipt)
-            except OSError:
-                pass
-            return receipt
+    try:
+        _index_pending_codex_hook_receipt_routes(state_path)
+    except OSError:
+        pass
+    receipt = read_json(receipt_path, {})
+    if _codex_hook_receipt_matches_route(
+        receipt,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        notify_user_id=notify_user_id,
+    ):
+        return receipt
 
     try:
         _migrate_legacy_codex_hook_receipt_routes(state_path)
