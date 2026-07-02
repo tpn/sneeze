@@ -114,7 +114,7 @@ def test_scaffolded_plugin_is_discovered_by_namespace(tmp_path):
         init_git=False,
     )
     core_src = Path(sneeze.__file__).resolve().parents[1]
-    pythonpath = [str(core_src), str(path / "src")]
+    pythonpath = [str(path / "src"), str(core_src)]
     if os.environ.get("PYTHONPATH"):
         pythonpath.append(os.environ["PYTHONPATH"])
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(pythonpath)}
@@ -124,9 +124,12 @@ def test_scaffolded_plugin_is_discovered_by_namespace(tmp_path):
             sys.executable,
             "-c",
             (
-                "import json;"
+                "import json, sneeze;"
                 "from sneeze.plugin import discover_plugins;"
-                "print(json.dumps([p.__dict__ for p in discover_plugins()]))"
+                "print(json.dumps({"
+                "'version': sneeze.__version__,"
+                "'plugins': [p.__dict__ for p in discover_plugins()]"
+                "}))"
             ),
         ],
         check=True,
@@ -135,11 +138,13 @@ def test_scaffolded_plugin_is_discovered_by_namespace(tmp_path):
         env=env,
     )
 
+    payload = json.loads(result.stdout)
+    assert payload["version"] == sneeze.__version__
     assert {
         "username": "tpn",
         "package": "sneeze.tpn",
         "source": "namespace",
-    } in json.loads(result.stdout)
+    } in payload["plugins"]
 
 
 def test_import_plugin_modules_falls_back_when_config_module_absent(
