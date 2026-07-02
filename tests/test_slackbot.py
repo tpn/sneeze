@@ -1401,7 +1401,19 @@ def test_agent_tmux_target_overlap_checks_server_identity_without_pane():
 
 
 def test_agent_tmux_target_overlap_canonicalizes_local_aliases(tmp_path):
+    socket_root = (
+        Path(
+            os.environ.get("TMUX_TMPDIR")
+            or slackbot_module.tempfile.gettempdir()
+        )
+        / f"tmux-{os.getuid()}"
+    )
+    named_socket_path = socket_root / "codex"
     assert slackbot_module._agent_tmux_sockets_same(
+        "codex",
+        str(named_socket_path),
+    )
+    assert not slackbot_module._agent_tmux_sockets_same(
         "codex",
         str(tmp_path / "codex"),
     )
@@ -1417,7 +1429,7 @@ def test_agent_tmux_target_overlap_canonicalizes_local_aliases(tmp_path):
         {
             "host": slackbot_module.socket.gethostname(),
             "tmux_session": "new-session-name",
-            "tmux_socket": str(tmp_path / "codex"),
+            "tmux_socket": str(named_socket_path),
             "tmux_pane": "%9",
             "tmux_pane_pid": "101",
             "tmux_server_pid": "202",

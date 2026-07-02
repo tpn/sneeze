@@ -4841,15 +4841,18 @@ def _agent_tmux_hosts_same(left: str, right: str) -> bool:
 
 
 def _agent_tmux_sockets_same(left: str, right: str) -> bool:
-    if left == right:
-        return True
-    if left == TMUX_DEFAULT_SERVER_SOCKET:
-        return Path(right).name == "default"
-    if right == TMUX_DEFAULT_SERVER_SOCKET:
-        return Path(left).name == "default"
-    if ("/" in left) != ("/" in right):
-        return Path(left).name == Path(right).name
-    return False
+    def socket_path(value: str) -> Path:
+        if value == TMUX_DEFAULT_SERVER_SOCKET:
+            value = "default"
+        if "/" not in value:
+            socket_root = (
+                Path(os.environ.get("TMUX_TMPDIR") or tempfile.gettempdir())
+                / f"tmux-{os.getuid()}"
+            )
+            return socket_root / value
+        return Path(value).expanduser().absolute()
+
+    return socket_path(left) == socket_path(right)
 
 
 def _agent_tmux_bindings_same_target(
@@ -5582,7 +5585,11 @@ def _codex_hook_binding_matches_request(
     ):
         if requested and binding.get(key) != requested:
             return False
-    if tmux_sockets and binding.get("tmux_socket") not in tmux_sockets:
+    binding_socket = str(binding.get("tmux_socket") or "")
+    if tmux_sockets and not any(
+        _agent_tmux_sockets_same(binding_socket, requested_socket)
+        for requested_socket in tmux_sockets
+    ):
         return False
     return True
 
