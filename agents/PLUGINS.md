@@ -89,3 +89,36 @@ Scheduled Codex jobs are system-scoped. Ambient secret-named variables are
 scrubbed from scheduled runs too unless the plugin deliberately includes that
 variable in `child_env_scrub_allowlist`; prefer file-based tool config whenever
 possible.
+
+## Public Channel Collaboration
+
+Channel trust admits public app mentions, but it does not make every channel
+participant an operator. A participant who is not allowed by user ID receives
+an isolated, non-resumable app-server turn with an explicit empty environment
+list. Local, web, browser, app, plugin, computer, and shell tools are disabled;
+the turn has no user secrets, service adapters, tmux controls, slash commands,
+or config access.
+
+Profiles can define a narrower explicit admin list. When they do not,
+`load_config()` preserves the legacy fallback from allowed users to admins.
+
+Profiles can populate `known_collaborator_user_ids` to label familiar people in
+the contextual prompt. This is relationship context only; it grants no added
+authority. `codex_progress_update_seconds` enables periodic edits of the
+working placeholder, and `contextual_codex_timeout_seconds` bounds contextual
+turns. Only one contextual turn runs at a time, preserving worker capacity for
+operator requests; admission happens before Slack context is fetched.
+Nonoperator public socket events enter a separately bounded contextual
+dispatch path before the primary worker queue, and excess events are dropped
+at that boundary. Public context keeps the thread root plus an adaptive recent
+window, bounded to six
+logical Slack reads, a shared 12-attempt/15-second API budget, 50 messages, and
+a 24,000-character transcript. Contextual transcripts use stable IDs without
+profile lookups, and contextual replies neutralize Slack mention/control tokens
+before posting. Operator transcript rendering caches failed profile lookups and
+caps new identity lookups at 20 per context fetch.
+`contextual_codex_model` must name a model whose exposed tool surface is
+validated for the model-only path; contextual turns fail closed when it is not
+set or not present in the core validated-model allowlist. Contextual work uses
+a dedicated single-worker executor, so the primary executor remains exactly at
+the configured operator `worker_count` while public work runs separately.
