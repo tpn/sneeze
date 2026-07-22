@@ -22,6 +22,7 @@ from sneeze.codex_app_server import (
 )
 from sneeze.slackbot import (
     CodexAppController,
+    SlackbotError,
     SlackbotProfile,
     SlackbotRoute,
     SlackSocketBot,
@@ -575,7 +576,7 @@ def test_controller_closes_connection_when_initial_refresh_fails(
     assert controller.connection is None
 
 
-def test_recovery_restores_unexpired_pending_request(tmp_path, monkeypatch):
+def test_recovery_waits_for_fresh_pending_request_id(tmp_path, monkeypatch):
     bot = _bot(tmp_path, notification_only=False)
     route = SlackbotRoute(channel_id="D111", thread_ts="1.000001")
     binding = {
@@ -621,11 +622,142 @@ def test_recovery_restores_unexpired_pending_request(tmp_path, monkeypatch):
         lambda recovered, *, status: statuses.append(status),
     )
     monkeypatch.setattr(bot, "_audit_codex_app", lambda *args, **kwargs: None)
+    posts = []
+    monkeypatch.setattr(
+        slackbot_module,
+        "post_slack_message",
+        lambda config, recovered_route, text: posts.append(text),
+    )
 
     bot._recover_codex_app_jobs()
 
-    assert controller.pending_snapshot() == pending
-    assert statuses == ["pending-request"]
+    assert controller.pending_snapshot() is None
+    persisted = controller.pending_persistence_snapshot()
+    assert persisted == {
+        "request_id": None,
+        "method": pending["method"],
+        "turn_id": pending["turn_id"],
+        "expires_at": pending["expires_at"],
+    }
+    assert statuses == ["awaiting-request-replay"]
+
+    bot._handle_codex_app_server_request(
+        controller,
+        {
+            "id": 99,
+            "method": pending["method"],
+            "params": {
+                "threadId": "desktop-session",
+                "turnId": "turn-one",
+                "command": "git status",
+                "cwd": "/workspace/exact",
+            },
+        },
+    )
+
+    assert controller.pending_snapshot()["request_id"] == 99
+    assert statuses[-1] == "pending-request"
+    assert posts
+
+
+def test_stale_turn_completion_does_not_clear_newer_turn(
+    tmp_path,
+    monkeypatch,
+):
+    bot = _bot(tmp_path, notification_only=False)
+    controller = CodexAppController(
+        bot,
+        SlackbotRoute(channel_id="D111", thread_ts="1.000001"),
+        {
+            "kind": "codex_app_server",
+            "thread_id": "desktop-session",
+            "source": "vscode",
+            "cwd": "/workspace/exact",
+        },
+    )
+    with controller.lock:
+        controller.active_turn_id = "turn-new"
+        controller.thread_status = "active"
+        controller.terminal = False
+    controller.set_pending_request(
+        {
+            "request_id": 100,
+            "method": "item/commandExecution/requestApproval",
+            "turn_id": "turn-new",
+            "expires_at": time.time() + 60,
+        }
+    )
+    records = []
+    audits = []
+    monkeypatch.setattr(
+        bot,
+        "_record_codex_app_controller",
+        lambda *args, **kwargs: records.append(kwargs),
+    )
+    monkeypatch.setattr(
+        bot,
+        "_audit_codex_app",
+        lambda recovered, action, **fields: audits.append((action, fields)),
+    )
+
+    bot._handle_codex_app_notification(
+        controller,
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "desktop-session",
+                "turn": {"id": "turn-old"},
+            },
+        },
+    )
+
+    assert controller.active_turn_id == "turn-new"
+    assert controller.pending_snapshot()["request_id"] == 100
+    assert controller.terminal is False
+    assert records == []
+    assert audits == [
+        (
+            "stale_turn_completion_ignored",
+            {"turn_id": "turn-old", "active_turn_id": "turn-new"},
+        )
+    ]
+
+
+def test_malformed_job_state_is_not_overwritten(tmp_path):
+    bot = _bot(tmp_path, notification_only=False)
+    state_path = Path(
+        slackbot_module.agent_codex_app_jobs_path(bot.config.paths)
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{malformed", encoding="utf-8")
+
+    with pytest.raises(SlackbotError, match="Cannot parse"):
+        slackbot_module._update_codex_app_job(
+            bot.config,
+            "D111:1.000001",
+            {"status": "connected"},
+        )
+
+    assert state_path.read_text(encoding="utf-8") == "{malformed"
+
+
+def test_newer_job_state_version_is_not_overwritten(tmp_path):
+    bot = _bot(tmp_path, notification_only=False)
+    state_path = Path(
+        slackbot_module.agent_codex_app_jobs_path(bot.config.paths)
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    original = '{"version": 2, "jobs": {}}\n'
+    state_path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(SlackbotError, match="Unsupported.*version"):
+        slackbot_module._update_codex_app_job(
+            bot.config,
+            "D111:1.000001",
+            {"status": "connected"},
+        )
+
+    assert state_path.read_text(encoding="utf-8") == original
 
 
 def test_only_safe_app_server_requests_are_relayed(tmp_path, monkeypatch):

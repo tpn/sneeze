@@ -2634,6 +2634,7 @@ def query_codex_app_server_status(
                 "disconnected",
                 "interrupting",
                 "pending-request",
+                "awaiting-request-replay",
                 "preparing",
             }
         )
@@ -6359,13 +6360,34 @@ def agent_codex_app_jobs_path(paths: SlackbotPaths) -> str:
 
 
 def _read_codex_app_jobs(paths: SlackbotPaths) -> dict[str, Any]:
-    data = read_json(agent_codex_app_jobs_path(paths), {})
+    target = Path(agent_codex_app_jobs_path(paths))
+    try:
+        text = target.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"version": 1, "jobs": {}}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SlackbotError(
+            f"Cannot read Codex app-server job state at {target}: {exc}"
+        ) from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SlackbotError(
+            f"Cannot parse Codex app-server job state at {target}: {exc}"
+        ) from exc
     if not isinstance(data, dict):
         raise SlackbotError("Codex app-server job state must be an object")
+    version = data.get("version", 1)
+    if version != 1:
+        raise SlackbotError(
+            f"Unsupported Codex app-server job state version: {version}"
+        )
     jobs = data.get("jobs")
-    if not isinstance(jobs, dict):
+    if jobs is None:
         jobs = {}
-    return {"version": 1, "jobs": jobs}
+    elif not isinstance(jobs, dict):
+        raise SlackbotError("Codex app-server jobs must be an object")
+    return {"version": version, "jobs": jobs}
 
 
 def _update_codex_app_job(
@@ -10770,6 +10792,7 @@ class CodexAppController:
         self.thread_status = "unknown"
         self.active_turn_id: str | None = None
         self.pending_request: dict[str, Any] | None = None
+        self.pending_request_replay: dict[str, Any] | None = None
         self.terminal = False
         self.disconnected = False
         self.last_action_reused = False
@@ -10969,6 +10992,20 @@ class CodexAppController:
             if self.pending_request is not None:
                 return False
             self.pending_request = dict(pending)
+            self.pending_request_replay = None
+            return True
+
+    def set_pending_request_replay(self, pending: dict[str, Any]) -> bool:
+        replay = {
+            "request_id": None,
+            "method": pending.get("method"),
+            "turn_id": pending.get("turn_id"),
+            "expires_at": pending.get("expires_at"),
+        }
+        with self.lock:
+            if self.pending_request is not None:
+                return False
+            self.pending_request_replay = replay
             return True
 
     def clear_pending_request(self, request_id: Any) -> bool:
@@ -10980,6 +11017,13 @@ class CodexAppController:
             self.pending_request = None
             return True
 
+    def clear_pending_request_replay(self) -> bool:
+        with self.lock:
+            if self.pending_request_replay is None:
+                return False
+            self.pending_request_replay = None
+            return True
+
     def pending_snapshot(self) -> dict[str, Any] | None:
         with self.lock:
             return (
@@ -10988,8 +11032,13 @@ class CodexAppController:
                 else None
             )
 
+    def pending_persistence_snapshot(self) -> dict[str, Any] | None:
+        with self.lock:
+            pending = self.pending_request or self.pending_request_replay
+            return dict(pending) if pending is not None else None
+
     def expired(self, now: float) -> bool:
-        pending = self.pending_snapshot()
+        pending = self.pending_persistence_snapshot()
         return bool(
             pending
             and pending.get("expires_at")
@@ -10998,6 +11047,7 @@ class CodexAppController:
 
     def status_snapshot(self) -> dict[str, Any]:
         with self.lock:
+            pending = self.pending_request or self.pending_request_replay
             return {
                 "thread_id": self.thread_id,
                 "source": self.binding.get("source"),
@@ -11005,9 +11055,10 @@ class CodexAppController:
                 "thread_status": self.thread_status,
                 "active_turn_id": self.active_turn_id,
                 "pending_method": (
-                    self.pending_request.get("method")
-                    if self.pending_request
-                    else None
+                    pending.get("method") if pending else None
+                ),
+                "awaiting_request_replay": bool(
+                    self.pending_request_replay and not self.pending_request
                 ),
                 "connected": bool(
                     self.connection and self.connection.connected
@@ -14106,6 +14157,7 @@ class SlackSocketBot:
             "disconnected",
             "interrupting",
             "pending-request",
+            "awaiting-request-replay",
             "preparing",
         }
         candidates = sorted(
@@ -14149,10 +14201,7 @@ class SlackSocketBot:
                 continue
             pending = job.get("pending_request")
             status = "completed" if controller.terminal else "recovered"
-            if (
-                isinstance(pending, dict)
-                and pending.get("request_id") is not None
-            ):
+            if isinstance(pending, dict) and pending.get("method"):
                 try:
                     expires_at = float(pending.get("expires_at") or 0)
                 except (TypeError, ValueError):
@@ -14160,9 +14209,10 @@ class SlackSocketBot:
                 if expires_at >= 0 and (
                     not expires_at or expires_at > time.time()
                 ):
-                    controller.set_pending_request(pending)
                     if controller.pending_snapshot() is not None:
                         status = "pending-request"
+                    elif controller.set_pending_request_replay(pending):
+                        status = "awaiting-request-replay"
                 else:
                     status = "desktop-required"
             self._record_codex_app_controller(
@@ -14334,7 +14384,7 @@ class SlackSocketBot:
         text_hash: str | None = None,
     ) -> None:
         snapshot = controller.status_snapshot()
-        pending = controller.pending_snapshot()
+        pending = controller.pending_persistence_snapshot()
         value = {
             "version": 1,
             "status": status,
@@ -15002,9 +15052,19 @@ class SlackSocketBot:
                     else ""
                 )
                 with controller.lock:
+                    active_turn_id = controller.active_turn_id
+                    if active_turn_id and turn_id != active_turn_id:
+                        self._audit_codex_app(
+                            controller,
+                            "stale_turn_completion_ignored",
+                            turn_id=turn_id or None,
+                            active_turn_id=active_turn_id,
+                        )
+                        return
                     controller.active_turn_id = None
                     controller.thread_status = "idle"
                     controller.pending_request = None
+                    controller.pending_request_replay = None
                     controller.terminal = True
                 self._record_codex_app_controller(
                     controller,
@@ -15017,7 +15077,10 @@ class SlackSocketBot:
                 )
             elif method == "serverRequest/resolved":
                 request_id = params.get("requestId")
-                if controller.clear_pending_request(request_id):
+                if (
+                    controller.clear_pending_request(request_id)
+                    or controller.clear_pending_request_replay()
+                ):
                     self._record_codex_app_controller(
                         controller,
                         status="active",
@@ -15076,7 +15139,8 @@ class SlackSocketBot:
                     expired.append(controller)
                     removable.append((key, controller))
                 elif controller.disconnected or (
-                    controller.terminal and not controller.pending_snapshot()
+                    controller.terminal
+                    and not controller.pending_persistence_snapshot()
                 ):
                     removable.append((key, controller))
             for key, controller in removable:

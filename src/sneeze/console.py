@@ -234,12 +234,23 @@ def user_from_headers(
             email = str(value).strip().split(",", 1)[0].strip().lower()
             break
     authenticated = bool(email)
+    unauthenticated_fallback = False
     if not email and config.allow_unauthenticated:
         email = "anonymous"
+        unauthenticated_fallback = True
     if not email:
         raise ConsoleAuthError("missing authenticated email header", 401)
     domain = config.auth_email_domain.strip().lower()
-    if domain and email != "anonymous" and not email.endswith(f"@{domain}"):
+    if not domain and not unauthenticated_fallback:
+        raise ConsoleAuthError(
+            "authenticated email domain is not configured",
+            403,
+        )
+    if (
+        domain
+        and not unauthenticated_fallback
+        and not email.endswith(f"@{domain}")
+    ):
         raise ConsoleAuthError("authenticated email is not allowed", 403)
     admin_emails = set(config.admin_emails)
     return ConsoleUser(

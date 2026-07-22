@@ -85,7 +85,7 @@ class SlackbotConsoleBase(ProfiledSlackbotCommand):
 
     class AuthEmailDomainArg(StringInvariant):
         _arg = "--auth-email-domain"
-        _help = "Required authenticated email domain; empty disables check."
+        _help = "Required authenticated email domain; empty fails closed."
         _mandatory = False
 
     admin_emails = None
