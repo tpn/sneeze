@@ -20,6 +20,45 @@ class CodexAppServerProtocolError(CodexAppServerError):
     pass
 
 
+class CodexAppServerRequestError(CodexAppServerError):
+    PERMANENT_CODES = frozenset({-32600, -32601, -32602})
+    PERMANENT_MESSAGE_MARKERS = (
+        "invalid params",
+        "invalid request",
+        "method not found",
+        "not found",
+        "does not exist",
+        "unsupported method",
+        "unknown method",
+    )
+
+    def __init__(self, method: str, error: Any | None = None):
+        self.method = method
+        self.error = error
+        self.code = error.get("code") if isinstance(error, dict) else None
+        self.data = error.get("data") if isinstance(error, dict) else None
+        error_text = (
+            CodexAppServerConnection._error_text(error)
+            if error is not None
+            else method
+        )
+        message = f"{method}: {error_text}" if error is not None else method
+        super().__init__(message)
+
+    @property
+    def permanent(self) -> bool:
+        if self.code in self.PERMANENT_CODES:
+            return True
+        message = str(
+            self.error.get("message")
+            if isinstance(self.error, dict)
+            else self.error or self
+        ).lower()
+        return any(
+            marker in message for marker in self.PERMANENT_MESSAGE_MARKERS
+        )
+
+
 def codex_app_server_socket_path(
     configured_path: str | None = None,
     *,
@@ -229,8 +268,9 @@ class CodexAppServerConnection:
                 if message.get("id") != 1:
                     continue
                 if message.get("error") is not None:
-                    raise CodexAppServerProtocolError(
-                        self._error_text(message["error"])
+                    raise CodexAppServerRequestError(
+                        "initialize",
+                        message["error"],
                     )
                 result = message.get("result")
                 if not isinstance(result, dict):
@@ -308,9 +348,7 @@ class CodexAppServerConnection:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
         if response.get("error") is not None:
-            raise CodexAppServerProtocolError(
-                f"{method}: {self._error_text(response['error'])}"
-            )
+            raise CodexAppServerRequestError(method, response["error"])
         result = response.get("result")
         if result is None:
             return {}
@@ -333,6 +371,40 @@ class CodexAppServerConnection:
         if not self.connected:
             raise CodexAppServerError("Codex app-server connection is closed")
         self._send({"method": method, "params": params or {}})
+
+    def drain_handlers(self, *, timeout_seconds: float | None = None) -> None:
+        if threading.current_thread() is self._handler_worker:
+            return
+        if not self.connected:
+            raise CodexAppServerError(
+                "Codex app-server connection closed before callbacks drained"
+            )
+        drained = threading.Event()
+
+        def mark_drained(message: dict[str, Any]) -> None:
+            del message
+            drained.set()
+
+        self._handler_queue.put_nowait((mark_drained, {}))
+        timeout = (
+            self.request_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if drained.wait(timeout=max(0.0, min(0.05, remaining))):
+                return
+            if self._closed.is_set():
+                raise CodexAppServerError(
+                    "Codex app-server connection closed before callbacks "
+                    "drained"
+                )
+            if remaining <= 0:
+                raise CodexAppServerError(
+                    "Codex app-server callbacks did not drain before timeout"
+                )
 
     def close(self) -> None:
         if self._closed.is_set():

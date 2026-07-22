@@ -108,7 +108,7 @@ class SlackbotConsoleBase(ProfiledSlackbotCommand):
 
     class AllowUnauthenticatedArg(BoolInvariant):
         _arg = "--allow-unauthenticated"
-        _help = "Allow local unauthenticated console access."
+        _help = "Allow local unauthenticated read-only console access."
         _mandatory = False
         _default = False
 

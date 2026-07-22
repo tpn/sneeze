@@ -45,7 +45,7 @@ def _normalize_source(value: Any) -> str | None:
         try:
             decoded = json.loads(text)
         except json.JSONDecodeError:
-            pass
+            return None
         else:
             if isinstance(decoded, dict) and "subagent" in decoded:
                 return "subagent"
@@ -267,7 +267,11 @@ def resolve_codex_session_metadata(
     rollout_path = payload_rollout or db_rollout
     metadata = _session_meta(rollout_path) if rollout_path else None
     metadata_id = _text(metadata.get("id")) if metadata else None
-    if metadata_id and metadata_id != session_id:
+    if (
+        metadata is not None
+        and metadata_id != session_id
+        and (metadata_id is not None or db_row is None)
+    ):
         return CodexSessionMetadata(
             session_id=session_id,
             source=None,

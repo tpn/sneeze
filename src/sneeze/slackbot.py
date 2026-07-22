@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import plistlib
 import queue
@@ -35,6 +36,7 @@ from .codex_app_server import (
     CodexAppServerConnection,
     CodexAppServerError,
     CodexAppServerProtocolError,
+    CodexAppServerRequestError,
     codex_app_server_socket_path,
     start_codex_app_server_daemon,
     validate_codex_app_server_socket,
@@ -66,6 +68,22 @@ class CodexHookRetryableError(SlackbotError):
 
 
 class CodexAppPreDispatchError(SlackbotError):
+    pass
+
+
+class CodexAppRecoveryExhaustedError(CodexAppServerProtocolError):
+    pass
+
+
+class CodexAppSessionValidationError(CodexAppServerError):
+    pass
+
+
+class CodexAppStaleControllerError(SlackbotError):
+    pass
+
+
+class CodexAppIneligibleControllerError(SlackbotError):
     pass
 
 
@@ -115,6 +133,26 @@ MAX_CONVERSATION_LOCKS = 1024
 INGRESS_PROCESSING_STALE_SECONDS = 3600.0
 TMUX_CODEX_LIVENESS_POLL_SECONDS = 5.0
 CONTEXTUAL_CODEX_MAX_CONCURRENT_TURNS = 1
+CODEX_APP_RECOVERY_MAX_TURN_PAGES = 100
+CODEX_APP_RECOVERY_RETRY_MIN_SECONDS = 5.0
+CODEX_APP_RECOVERY_RETRY_MAX_SECONDS = 60.0
+CODEX_APP_RECOVERY_RESCAN_SECONDS = 5.0
+# A callback may use Slack's default three 30-second attempts plus two
+# 30-second rate-limit backoffs. Keep callback draining separate from the
+# app-server RPC timeout so a slow, durable Slack delivery can finish.
+CODEX_APP_HANDLER_DRAIN_TIMEOUT_SECONDS = 180.0
+CODEX_APP_RECOVERABLE_STATUSES = frozenset(
+    {
+        "active",
+        "connected",
+        "disconnected",
+        "interrupting",
+        "pending-request",
+        "awaiting-request-replay",
+        "desktop-required",
+        "preparing",
+    }
+)
 CONTEXTUAL_CODEX_VALIDATED_MODELS = frozenset({"gpt-5.4"})
 CONTEXTUAL_SLACK_CONTEXT_MAX_MESSAGES = 50
 CONTEXTUAL_SLACK_CONTEXT_MAX_REQUESTS = 6
@@ -2631,16 +2669,7 @@ def query_codex_app_server_status(
             1
             for job in jobs.values()
             if isinstance(job, dict)
-            and job.get("status")
-            in {
-                "active",
-                "connected",
-                "disconnected",
-                "interrupting",
-                "pending-request",
-                "awaiting-request-replay",
-                "preparing",
-            }
+            and job.get("status") in CODEX_APP_RECOVERABLE_STATUSES
         )
     if not profile.codex_app_server_interaction_enabled:
         result["status"] = "disabled"
@@ -6412,15 +6441,61 @@ def _update_codex_app_job(
                 value.pop("_clear_client_identity", False)
             )
             if isinstance(current, dict):
+                preserved_fields: list[str] = []
                 if not clear_client_identity:
-                    for field_name in (
-                        "client_message_id",
-                        "text_sha256",
-                    ):
-                        if value.get(field_name) is None:
-                            value[field_name] = current.get(field_name)
+                    preserved_fields.extend(
+                        (
+                            "client_message_id",
+                            "text_sha256",
+                        )
+                    )
+                if value.get("status") in {
+                    "preparing",
+                    "desktop-required",
+                }:
+                    preserved_fields.extend(
+                        (
+                            "preparing_action",
+                            "preparing_text",
+                            "preparing_turn_id",
+                        )
+                    )
+                for field_name in preserved_fields:
+                    if value.get(field_name) is None:
+                        value[field_name] = current.get(field_name)
             jobs[key] = value
         write_json_atomic(path, data)
+
+
+def _remove_codex_app_job_if_binding_matches(
+    config: SlackbotConfig,
+    key: str,
+    binding: dict[str, Any],
+) -> bool:
+    path = agent_codex_app_jobs_path(config.paths)
+    with locked_json_path(path):
+        data = _read_codex_app_jobs(config.paths)
+        jobs = data["jobs"]
+        job = jobs.get(key)
+        job_binding = job.get("binding") if isinstance(job, dict) else None
+        if not isinstance(job_binding, dict):
+            return False
+
+        def identity(value: dict[str, Any]) -> tuple[str, str, str]:
+            return (
+                str(
+                    value.get("session_id") or value.get("thread_id") or ""
+                ).strip(),
+                str(value.get("source") or "").strip().lower(),
+                str(value.get("cwd") or "").strip(),
+            )
+
+        expected = identity(binding)
+        if not expected[0] or identity(job_binding) != expected:
+            return False
+        jobs.pop(key, None)
+        write_json_atomic(path, data)
+        return True
 
 
 def _tmux_socket_args(socket_name: str | None) -> list[str]:
@@ -8924,28 +8999,37 @@ def _render_codex_stop_notification(
     return "\n".join(lines)
 
 
-def _codex_app_server_candidate(
+def _codex_app_server_metadata_eligible(
     profile: SlackbotProfile,
     metadata: CodexSessionMetadata,
-    decision: CodexStopNotificationDecision,
-) -> dict[str, Any] | None:
+) -> bool:
     if (
         not profile.codex_app_server_interaction_enabled
-        or not decision.notify
-        or not decision.metadata_verified
+        or not metadata.verified
         or not metadata.session_id
         or metadata.parent_thread_id
         or metadata.thread_source in {"review", "subagent"}
         or metadata.review_turn
         or metadata.automated_review
     ):
-        return None
+        return False
     allowed_sources = {
         str(item).strip().lower()
         for item in profile.codex_app_server_interaction_sources
         if str(item).strip()
     }
-    if metadata.source not in allowed_sources:
+    return metadata.source in allowed_sources
+
+
+def _codex_app_server_candidate(
+    profile: SlackbotProfile,
+    metadata: CodexSessionMetadata,
+    decision: CodexStopNotificationDecision,
+) -> dict[str, Any] | None:
+    if not decision.notify or not _codex_app_server_metadata_eligible(
+        profile,
+        metadata,
+    ):
         return None
     return {
         "kind": "codex_app_server",
@@ -8955,6 +9039,108 @@ def _codex_app_server_candidate(
         "cwd": metadata.cwd,
         "verified_at": utcnow_iso(),
     }
+
+
+def _revoke_codex_app_server_candidates(
+    config: SlackbotConfig,
+    session_id: str,
+    *,
+    reason: str,
+) -> None:
+    session_id = session_id.strip()
+    if not session_id:
+        return
+    revoked_at = utcnow_iso()
+    state_path = agent_codex_hook_state_path(config.paths)
+    with _locked_codex_hook_finalization_state(state_path):
+        state = _read_codex_hook_state(state_path)
+        sessions = state.get("sessions")
+        changed = False
+        if isinstance(sessions, dict):
+            for key, value in sessions.items():
+                if not isinstance(value, dict):
+                    continue
+                candidate = value.get("codex_app_server")
+                candidate_session_id = (
+                    str(
+                        candidate.get("session_id")
+                        or candidate.get("thread_id")
+                        or ""
+                    ).strip()
+                    if isinstance(candidate, dict)
+                    else ""
+                )
+                entry_session_id = str(value.get("session_id") or "").strip()
+                key_session_id = (
+                    str(key).removeprefix("session:")
+                    if str(key).startswith("session:")
+                    else ""
+                )
+                if session_id not in {
+                    candidate_session_id,
+                    entry_session_id,
+                    key_session_id,
+                }:
+                    continue
+                value.pop("codex_app_server", None)
+                value["codex_app_server_revoked_at"] = revoked_at
+                value["codex_app_server_revoked_reason"] = reason
+                changed = True
+        if changed:
+            write_json_atomic(state_path, state)
+    try:
+        _revoke_codex_app_server_jobs(
+            config,
+            session_id,
+            reason=reason,
+            revoked_at=revoked_at,
+        )
+    except (OSError, UnicodeDecodeError, SlackbotError):
+        # Hook-state revocation remains authoritative if controller-state
+        # persistence is temporarily unavailable.
+        pass
+
+
+def _revoke_codex_app_server_jobs(
+    config: SlackbotConfig,
+    session_id: str,
+    *,
+    reason: str,
+    revoked_at: str | None = None,
+) -> None:
+    session_id = session_id.strip()
+    if not session_id:
+        return
+    path = agent_codex_app_jobs_path(config.paths)
+    with locked_json_path(path):
+        data = _read_codex_app_jobs(config.paths)
+        jobs = data["jobs"]
+        changed = False
+        for key, job in list(jobs.items()):
+            if not isinstance(job, dict):
+                continue
+            binding = job.get("binding")
+            binding_session_id = (
+                str(
+                    binding.get("session_id")
+                    or binding.get("thread_id")
+                    or ""
+                ).strip()
+                if isinstance(binding, dict)
+                else ""
+            )
+            job_session_id = str(job.get("thread_id") or "").strip()
+            if session_id not in {binding_session_id, job_session_id}:
+                continue
+            revoked = dict(job)
+            revoked["status"] = "revoked"
+            revoked["revoked_at"] = revoked_at or utcnow_iso()
+            revoked["revoked_reason"] = reason
+            revoked["updated_at"] = utcnow_iso()
+            jobs[str(key)] = revoked
+            changed = True
+        if changed:
+            write_json_atomic(path, data)
 
 
 def _codex_hook_matching_notification(
@@ -9175,6 +9361,20 @@ def notify_codex_agent_stop(
         decision,
         message,
     )
+    app_server_metadata_eligible = _codex_app_server_metadata_eligible(
+        profile,
+        metadata,
+    )
+    if (
+        profile.codex_app_server_interaction_enabled
+        and not app_server_metadata_eligible
+        and metadata.session_id
+    ):
+        _revoke_codex_app_server_candidates(
+            config,
+            metadata.session_id,
+            reason=(metadata.error or decision.reason),
+        )
     if not decision.notify:
         return {
             "status": "skipped",
@@ -9852,6 +10052,14 @@ def notify_codex_agent_stop(
                 _clear_codex_hook_entry_binding(entry)
             if app_server_candidate:
                 entry["codex_app_server"] = app_server_candidate
+                entry.pop("codex_app_server_revoked_at", None)
+                entry.pop("codex_app_server_revoked_reason", None)
+            elif not app_server_metadata_eligible:
+                entry.pop("codex_app_server", None)
+                entry["codex_app_server_revoked_at"] = now
+                entry["codex_app_server_revoked_reason"] = (
+                    metadata.error or decision.reason
+                )
             sessions[key] = entry
             write_json_atomic(state_path, state)
         if receipt_write_error is not None:
@@ -10801,9 +11009,37 @@ class CodexAppController:
         self.active_turn_id: str | None = None
         self.pending_request: dict[str, Any] | None = None
         self.pending_request_replay: dict[str, Any] | None = None
+        self.desktop_required = False
+        self.desktop_request_id: Any = None
+        self.desktop_request_ids: list[Any] = []
+        self.desktop_request_fingerprint: str | None = None
+        self.recovery_blocked = False
+        self.recovery_input_blocked = False
+        self.recovery_handoff_required = False
+        self.recovery_handoff_request_id: Any = None
+        self.recovery_handoff_request_fingerprint: str | None = None
+        self.recovery_retry_at = 0.0
+        self.recovery_retry_delay = 0.0
+        self.dispatch_preparing = False
         self.terminal = False
         self.disconnected = False
         self.last_action_reused = False
+        self.invalidated = False
+
+    def invalidate(self) -> None:
+        with self.lock:
+            self.invalidated = True
+
+    def invalidated_snapshot(self) -> bool:
+        with self.lock:
+            return self.invalidated
+
+    def require_valid(self) -> None:
+        with self.lock:
+            if self.invalidated:
+                raise CodexAppStaleControllerError(
+                    "Codex app-server controller was replaced"
+                )
 
     def connect(self) -> None:
         socket_path = self.bot._codex_app_server_socket()
@@ -10830,6 +11066,7 @@ class CodexAppController:
             )
             resumed_thread = self._result_thread(resume_result)
             self._verify_thread(resumed_thread)
+            self._protocol_barrier_and_drain(connection)
         except Exception:
             connection.close()
             raise
@@ -10879,6 +11116,23 @@ class CodexAppController:
             }
         return thread
 
+    def drain_callbacks(self) -> None:
+        self._protocol_barrier_and_drain(self._connection())
+
+    def _protocol_barrier_and_drain(
+        self,
+        connection: CodexAppServerConnection,
+    ) -> None:
+        barrier_result = connection.request(
+            "thread/read",
+            {"threadId": self.thread_id, "includeTurns": False},
+        )
+        barrier_thread = self._result_thread(barrier_result)
+        self._verify_thread(barrier_thread)
+        connection.drain_handlers(
+            timeout_seconds=CODEX_APP_HANDLER_DRAIN_TIMEOUT_SECONDS,
+        )
+
     def start_turn(self, text: str, client_message_id: str) -> str:
         try:
             self.refresh()
@@ -10912,19 +11166,24 @@ class CodexAppController:
             turn_id = str(recovered_turn.get("id") or "")
             with self.lock:
                 self.last_action_reused = True
+            recovered = True
         else:
             turn = result.get("turn")
             turn_id = (
                 str(turn.get("id") or "") if isinstance(turn, dict) else ""
             )
+            recovered = False
         if not turn_id:
             raise CodexAppServerProtocolError(
                 "turn/start returned no turn identifier"
             )
-        with self.lock:
-            self.active_turn_id = turn_id
-            self.thread_status = "active"
-            self.terminal = False
+        if recovered:
+            self.refresh()
+        else:
+            with self.lock:
+                self.active_turn_id = turn_id
+                self.thread_status = "active"
+                self.terminal = False
         return turn_id
 
     def recover_start_turn(self, text: str, client_message_id: str) -> str:
@@ -10945,14 +11204,23 @@ class CodexAppController:
             self.last_action_reused = True
         return turn_id
 
-    def recover_steer(self, text: str, client_message_id: str) -> str:
+    def recover_steer(
+        self,
+        text: str,
+        client_message_id: str,
+        expected_turn_id: str | None = None,
+    ) -> str:
         connection = self._connection()
         recovered_turn = self._turn_for_client_id(
             connection,
             client_message_id,
         )
         if recovered_turn is None:
-            return self.steer(text, client_message_id)
+            return self.steer(
+                text,
+                client_message_id,
+                expected_turn_id=expected_turn_id,
+            )
         turn_id = str(recovered_turn.get("id") or "")
         if not turn_id:
             raise CodexAppServerProtocolError(
@@ -10963,7 +11231,13 @@ class CodexAppController:
             self.last_action_reused = True
         return turn_id
 
-    def steer(self, text: str, client_message_id: str) -> str:
+    def steer(
+        self,
+        text: str,
+        client_message_id: str,
+        *,
+        expected_turn_id: str | None = None,
+    ) -> str:
         try:
             self.refresh()
         except (CodexAppServerError, OSError) as exc:
@@ -10973,6 +11247,11 @@ class CodexAppController:
         if not turn_id:
             raise CodexAppPreDispatchError(
                 "The Codex thread has no active turn to steer."
+            )
+        if expected_turn_id and turn_id != expected_turn_id:
+            raise CodexAppPreDispatchError(
+                "The active Codex turn changed before steering input could "
+                "be sent."
             )
         try:
             connection = self._connection()
@@ -11043,27 +11322,384 @@ class CodexAppController:
                 self.pending_request = None
         return pending
 
-    def set_pending_request(self, pending: dict[str, Any]) -> bool:
+    def set_pending_request(
+        self,
+        pending: dict[str, Any],
+        *,
+        replace_matching_replay: bool = False,
+    ) -> bool:
         with self.lock:
-            if self.pending_request is not None:
+            if self.pending_request is not None or self.desktop_required:
+                return False
+            replay = self.pending_request_replay
+            replay_fingerprint = (
+                replay.get("request_fingerprint")
+                if replay is not None
+                else None
+            )
+            if replay is not None and not (
+                replace_matching_replay
+                and replay.get("method") == pending.get("method")
+                and replay.get("turn_id") == pending.get("turn_id")
+                and replay_fingerprint is not None
+                and replay_fingerprint == pending.get("request_fingerprint")
+            ):
                 return False
             self.pending_request = dict(pending)
             self.pending_request_replay = None
+            self.desktop_required = False
+            self.desktop_request_id = None
+            self.desktop_request_ids = []
+            self.desktop_request_fingerprint = None
             return True
 
     def recover_pending_request(self, pending: dict[str, Any]) -> str:
         replay = {
-            "request_id": None,
+            "request_id": pending.get("request_id"),
             "method": pending.get("method"),
             "turn_id": pending.get("turn_id"),
             "expires_at": pending.get("expires_at"),
             "request_fingerprint": pending.get("request_fingerprint"),
         }
+        for field_name in (
+            "slack_client_msg_id",
+            "slack_delivery_state",
+            "slack_message_ts",
+        ):
+            if pending.get(field_name) is not None:
+                replay[field_name] = pending.get(field_name)
         with self.lock:
             if self.pending_request is not None:
                 return "pending-request"
+            if replay["request_id"] is None:
+                self.pending_request_replay = replay
+                self.desktop_required = True
+                self.desktop_request_id = None
+                self.desktop_request_ids = []
+                self.desktop_request_fingerprint = replay.get(
+                    "request_fingerprint"
+                )
+                return "desktop-required"
             self.pending_request_replay = replay
+            self.desktop_required = False
+            self.desktop_request_id = None
+            self.desktop_request_ids = []
+            self.desktop_request_fingerprint = None
             return "awaiting-request-replay"
+
+    def mark_desktop_required(
+        self,
+        request_id: Any = None,
+        request_fingerprint: str | None = None,
+    ) -> None:
+        with self.lock:
+            self._restore_desktop_required_locked(
+                [],
+                request_id,
+                request_fingerprint,
+            )
+
+    def restore_desktop_required(
+        self,
+        request_ids: list[Any],
+        preferred_request_id: Any = None,
+        request_fingerprint: str | None = None,
+        *,
+        preserve_legacy_replay: bool = False,
+    ) -> None:
+        with self.lock:
+            self._restore_desktop_required_locked(
+                request_ids,
+                preferred_request_id,
+                request_fingerprint,
+                preserve_legacy_replay=preserve_legacy_replay,
+            )
+
+    def _restore_desktop_required_locked(
+        self,
+        request_ids: list[Any],
+        preferred_request_id: Any,
+        request_fingerprint: str | None,
+        *,
+        preserve_legacy_replay: bool = False,
+    ) -> None:
+        tracked: list[Any] = []
+        for request_id in request_ids:
+            if request_id is not None and request_id not in tracked:
+                tracked.append(request_id)
+        if (
+            preferred_request_id is not None
+            and preferred_request_id not in tracked
+        ):
+            tracked.append(preferred_request_id)
+        self.pending_request = None
+        if not preserve_legacy_replay:
+            self.pending_request_replay = None
+        self.desktop_required = True
+        self.desktop_request_ids = tracked
+        self.desktop_request_fingerprint = request_fingerprint
+        self.desktop_request_id = (
+            preferred_request_id
+            if preferred_request_id in tracked
+            else (tracked[-1] if tracked else None)
+        )
+        self.recovery_blocked = False
+        self.recovery_input_blocked = False
+        self.recovery_handoff_required = False
+        self.recovery_handoff_request_id = None
+        self.recovery_handoff_request_fingerprint = None
+        self.recovery_retry_at = 0.0
+        self.recovery_retry_delay = 0.0
+
+    def track_desktop_request_id(
+        self,
+        request_id: Any,
+        request_fingerprint: str,
+    ) -> bool:
+        with self.lock:
+            if (
+                not self.desktop_required
+                or not self.desktop_request_ids
+                or request_id is None
+            ):
+                return False
+            if (
+                self.desktop_request_fingerprint is not None
+                and self.desktop_request_fingerprint == request_fingerprint
+            ):
+                self.desktop_request_ids = [request_id]
+                self.desktop_request_id = request_id
+                return True
+            self.pending_request_replay = None
+            self.desktop_request_ids = []
+            self.desktop_request_fingerprint = None
+            self.desktop_request_id = None
+            return True
+
+    def desktop_request_ids_snapshot(self) -> list[Any]:
+        with self.lock:
+            return list(self.desktop_request_ids)
+
+    def desktop_request_fingerprint_snapshot(self) -> str | None:
+        with self.lock:
+            return self.desktop_request_fingerprint
+
+    def expire_pending_during_recovery(
+        self,
+        now: float,
+    ) -> dict[str, Any] | None:
+        with self.lock:
+            pending = self.pending_request or self.pending_request_replay
+            if not self.recovery_blocked or not pending:
+                return None
+            if pending.get("expires_at") is None:
+                return None
+            try:
+                expires_at = float(pending.get("expires_at"))
+            except (TypeError, ValueError):
+                expires_at = float("nan")
+            if math.isfinite(expires_at) and now < expires_at:
+                return None
+            expired = dict(pending)
+            self.pending_request = None
+            self.pending_request_replay = None
+            self.mark_recovery_handoff_required(
+                expired.get("request_id"),
+                expired.get("request_fingerprint"),
+            )
+            return expired
+
+    def desktop_required_snapshot(self) -> bool:
+        with self.lock:
+            return self.desktop_required
+
+    def desktop_request_id_snapshot(self) -> Any:
+        with self.lock:
+            return self.desktop_request_id
+
+    def clear_desktop_required_for_request(self, request_id: Any) -> bool:
+        with self.lock:
+            if (
+                not self.desktop_required
+                or request_id not in self.desktop_request_ids
+            ):
+                return False
+            self.desktop_request_ids = [
+                tracked
+                for tracked in self.desktop_request_ids
+                if tracked != request_id
+            ]
+            if self.desktop_request_ids:
+                self.desktop_request_id = self.desktop_request_ids[-1]
+            else:
+                self.desktop_required = False
+                self.desktop_request_id = None
+                self.desktop_request_fingerprint = None
+            return True
+
+    def mark_recovery_blocked(self) -> None:
+        with self.lock:
+            self.recovery_blocked = True
+            self.recovery_input_blocked = True
+
+    def clear_recovery_blocked(self) -> None:
+        with self.lock:
+            self.recovery_blocked = False
+            self.recovery_input_blocked = False
+            self.recovery_retry_at = 0.0
+            self.recovery_retry_delay = 0.0
+
+    def recovery_blocked_snapshot(self) -> bool:
+        with self.lock:
+            return self.recovery_blocked
+
+    def recovery_input_blocked_snapshot(self) -> bool:
+        with self.lock:
+            return self.recovery_input_blocked
+
+    def begin_dispatch_preparation(self) -> None:
+        with self.lock:
+            self.dispatch_preparing = True
+
+    def finish_dispatch_preparation(self) -> None:
+        with self.lock:
+            self.dispatch_preparing = False
+
+    def dispatch_preparing_snapshot(self) -> bool:
+        with self.lock:
+            return self.dispatch_preparing
+
+    def defer_recovery_retry(
+        self,
+        now: float | None = None,
+        *,
+        preserve_input: bool = True,
+    ) -> None:
+        with self.lock:
+            self.recovery_blocked = True
+            self.recovery_input_blocked = preserve_input
+            delay = self.recovery_retry_delay
+            if delay <= 0:
+                delay = CODEX_APP_RECOVERY_RETRY_MIN_SECONDS
+            else:
+                delay = min(
+                    delay * 2,
+                    CODEX_APP_RECOVERY_RETRY_MAX_SECONDS,
+                )
+            self.recovery_retry_delay = delay
+            self.recovery_retry_at = (time.time() if now is None else now) + (
+                delay
+            )
+
+    def claim_recovery_retry(self, now: float) -> bool:
+        with self.lock:
+            if (
+                not self.recovery_blocked
+                or self.recovery_retry_at <= 0
+                or now < self.recovery_retry_at
+            ):
+                return False
+            delay = max(
+                self.recovery_retry_delay,
+                CODEX_APP_RECOVERY_RETRY_MIN_SECONDS,
+            )
+            self.recovery_retry_at = now + delay
+            return True
+
+    def recovery_retry_snapshot(self) -> tuple[float, float]:
+        with self.lock:
+            return self.recovery_retry_at, self.recovery_retry_delay
+
+    def restore_recovery_retry(
+        self,
+        retry_at: float,
+        retry_delay: float,
+        *,
+        preserve_input: bool = True,
+    ) -> None:
+        with self.lock:
+            self.recovery_blocked = True
+            self.recovery_input_blocked = preserve_input
+            self.recovery_retry_at = retry_at
+            self.recovery_retry_delay = retry_delay
+
+    def mark_recovery_handoff_required(
+        self,
+        request_id: Any = None,
+        request_fingerprint: str | None = None,
+    ) -> None:
+        with self.lock:
+            if self.recovery_handoff_required:
+                if (
+                    self.recovery_handoff_request_fingerprint is None
+                    and self.recovery_handoff_request_id == request_id
+                ):
+                    self.recovery_handoff_request_fingerprint = (
+                        request_fingerprint
+                    )
+                    return
+                if (
+                    request_fingerprint is not None
+                    and self.recovery_handoff_request_fingerprint
+                    == request_fingerprint
+                ):
+                    self.recovery_handoff_request_id = request_id
+                    return
+                self.recovery_handoff_request_id = None
+                self.recovery_handoff_request_fingerprint = None
+                return
+            self.recovery_handoff_required = True
+            self.recovery_handoff_request_id = request_id
+            self.recovery_handoff_request_fingerprint = request_fingerprint
+
+    def finalize_recovery(self) -> bool:
+        with self.lock:
+            desktop_required = self.recovery_handoff_required
+            if desktop_required:
+                self.pending_request = None
+                self.pending_request_replay = None
+                self.desktop_required = True
+                self.desktop_request_id = self.recovery_handoff_request_id
+                self.desktop_request_ids = (
+                    [self.recovery_handoff_request_id]
+                    if self.recovery_handoff_request_id is not None
+                    else []
+                )
+                self.desktop_request_fingerprint = (
+                    self.recovery_handoff_request_fingerprint
+                )
+            self.recovery_blocked = False
+            self.recovery_input_blocked = False
+            self.recovery_handoff_required = False
+            self.recovery_handoff_request_id = None
+            self.recovery_handoff_request_fingerprint = None
+            self.recovery_retry_at = 0.0
+            self.recovery_retry_delay = 0.0
+            return desktop_required
+
+    def recovery_handoff_required_snapshot(self) -> bool:
+        with self.lock:
+            return self.recovery_handoff_required
+
+    def recovery_handoff_request_id_snapshot(self) -> Any:
+        with self.lock:
+            return self.recovery_handoff_request_id
+
+    def recovery_handoff_request_fingerprint_snapshot(self) -> str | None:
+        with self.lock:
+            return self.recovery_handoff_request_fingerprint
+
+    def clear_terminal_recovery_state(self) -> None:
+        with self.lock:
+            self.pending_request = None
+            self.pending_request_replay = None
+            self.desktop_required = False
+            self.desktop_request_id = None
+            self.desktop_request_ids = []
+            self.desktop_request_fingerprint = None
+            self.recovery_handoff_required = False
+            self.recovery_handoff_request_id = None
+            self.recovery_handoff_request_fingerprint = None
 
     def clear_pending_request(self, request_id: Any) -> bool:
         with self.lock:
@@ -11081,11 +11717,53 @@ class CodexAppController:
             self.pending_request_replay = None
             return True
 
+    def clear_pending_request_replay_for_request(
+        self,
+        request_id: Any,
+    ) -> bool:
+        with self.lock:
+            if self.pending_request_replay is None or (
+                self.pending_request_replay.get("request_id") != request_id
+            ):
+                return False
+            self.pending_request_replay = None
+            return True
+
+    def update_pending_delivery(
+        self,
+        request_id: Any,
+        delivery_state: str,
+        *,
+        message_ts: str | None = None,
+    ) -> bool:
+        if delivery_state not in {"pending", "posting", "delivered"}:
+            raise ValueError("invalid Codex app Slack delivery state")
+        with self.lock:
+            for pending in (
+                self.pending_request,
+                self.pending_request_replay,
+            ):
+                if pending is None or pending.get("request_id") != request_id:
+                    continue
+                pending["slack_delivery_state"] = delivery_state
+                if message_ts:
+                    pending["slack_message_ts"] = message_ts
+                return True
+            return False
+
     def pending_snapshot(self) -> dict[str, Any] | None:
         with self.lock:
             return (
                 dict(self.pending_request)
                 if self.pending_request is not None
+                else None
+            )
+
+    def pending_replay_snapshot(self) -> dict[str, Any] | None:
+        with self.lock:
+            return (
+                dict(self.pending_request_replay)
+                if self.pending_request_replay is not None
                 else None
             )
 
@@ -11096,11 +11774,13 @@ class CodexAppController:
 
     def expired(self, now: float) -> bool:
         pending = self.pending_persistence_snapshot()
-        return bool(
-            pending
-            and pending.get("expires_at")
-            and now >= float(pending["expires_at"])
-        )
+        if not pending or pending.get("expires_at") is None:
+            return False
+        try:
+            expires_at = float(pending["expires_at"])
+        except (TypeError, ValueError):
+            return True
+        return not math.isfinite(expires_at) or now >= expires_at
 
     def status_snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -11137,7 +11817,7 @@ class CodexAppController:
                     "itemsView": "summary",
                 },
             )
-        except CodexAppServerProtocolError:
+        except (CodexAppServerProtocolError, CodexAppServerRequestError):
             return None
         data = result.get("data")
         if not isinstance(data, list) or not data:
@@ -11150,29 +11830,67 @@ class CodexAppController:
         connection: CodexAppServerConnection,
         client_message_id: str,
     ) -> dict[str, Any] | None:
-        try:
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        pages_read = 0
+        while True:
+            pages_read += 1
+            params: dict[str, Any] = {
+                "threadId": self.thread_id,
+                "limit": 100,
+                "sortDirection": "desc",
+                "itemsView": "full",
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+            # A failed lookup is not proof that the input was never accepted.
+            # Let recovery defer instead of risking a duplicate dispatch.
             result = connection.request(
                 "thread/turns/list",
-                {
-                    "threadId": self.thread_id,
-                    "limit": 3,
-                    "sortDirection": "desc",
-                    "itemsView": "full",
-                },
+                params,
             )
-        except CodexAppServerError:
-            return None
-        for turn in result.get("data") or []:
-            if not isinstance(turn, dict):
-                continue
-            for item in turn.get("items") or []:
-                if (
-                    isinstance(item, dict)
-                    and item.get("type") == "userMessage"
-                    and item.get("clientId") == client_message_id
-                ):
-                    return turn
-        return None
+            turns = result.get("data")
+            if not isinstance(turns, list):
+                raise CodexAppServerProtocolError(
+                    "thread/turns/list returned invalid turn data"
+                )
+            for turn in turns:
+                if not isinstance(turn, dict):
+                    raise CodexAppServerProtocolError(
+                        "thread/turns/list returned a malformed turn"
+                    )
+                items = turn.get("items")
+                if not isinstance(items, list):
+                    raise CodexAppServerProtocolError(
+                        "thread/turns/list returned malformed turn items"
+                    )
+                for item in items:
+                    if not isinstance(item, dict):
+                        raise CodexAppServerProtocolError(
+                            "thread/turns/list returned a malformed item"
+                        )
+                    if (
+                        item.get("type") == "userMessage"
+                        and item.get("clientId") == client_message_id
+                    ):
+                        return turn
+            next_cursor = result.get("nextCursor")
+            if next_cursor is None:
+                return None
+            if not isinstance(next_cursor, str) or not next_cursor:
+                raise CodexAppServerProtocolError(
+                    "thread/turns/list returned an invalid cursor"
+                )
+            if next_cursor in seen_cursors:
+                raise CodexAppServerProtocolError(
+                    "thread/turns/list repeated a pagination cursor"
+                )
+            if pages_read >= CODEX_APP_RECOVERY_MAX_TURN_PAGES:
+                raise CodexAppRecoveryExhaustedError(
+                    "thread/turns/list exceeded the recovery page limit"
+                )
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
 
     def _verify_thread(self, thread: dict[str, Any]) -> None:
         thread_id = str(thread.get("id") or "")
@@ -11181,7 +11899,7 @@ class CodexAppController:
             "",
             self.thread_id,
         }:
-            raise CodexAppServerError(
+            raise CodexAppSessionValidationError(
                 "Codex app-server returned a different thread identity"
             )
         source = str(thread.get("source") or "").lower()
@@ -11194,18 +11912,18 @@ class CodexAppController:
             if str(item).strip()
         }
         if source != expected_source or source not in allowed_sources:
-            raise CodexAppServerError(
+            raise CodexAppSessionValidationError(
                 "Codex app-server thread source is not eligible for Slack "
                 "interaction"
             )
         if thread.get("parentThreadId"):
-            raise CodexAppServerError(
+            raise CodexAppSessionValidationError(
                 "Subagent Codex threads cannot be controlled from Slack"
             )
         expected_cwd = str(self.binding.get("cwd") or "")
         actual_cwd = str(thread.get("cwd") or "")
         if expected_cwd and actual_cwd and expected_cwd != actual_cwd:
-            raise CodexAppServerError(
+            raise CodexAppSessionValidationError(
                 "Codex app-server thread cwd does not match the Stop hook"
             )
 
@@ -11280,6 +11998,7 @@ class SlackSocketBot:
         self.agent_tmux_inflight_lock = threading.Lock()
         self.codex_app_controllers: dict[str, CodexAppController] = {}
         self.codex_app_controllers_lock = threading.RLock()
+        self.codex_app_recovery_rescan_at = 0.0
         if (
             config.allowed_channel_ids
             and not config.allowed_dm_user_ids
@@ -14187,6 +14906,7 @@ class SlackSocketBot:
         socket_path = self._codex_app_server_socket()
         try:
             validate_codex_app_server_socket(socket_path)
+            self._probe_codex_app_server(socket_path)
         except CodexAppServerError:
             if not self.config.profile.codex_app_server_auto_start:
                 raise
@@ -14195,7 +14915,21 @@ class SlackSocketBot:
                 socket_path,
             )
             validate_codex_app_server_socket(socket_path)
+            self._probe_codex_app_server(socket_path)
         return socket_path
+
+    @staticmethod
+    def _probe_codex_app_server(socket_path: str) -> None:
+        connection = CodexAppServerConnection(
+            socket_path,
+            client_name="sneeze_slackbot_probe",
+            client_title="Sneeze Slackbot Probe",
+            client_version="0.1",
+        )
+        try:
+            connection.connect()
+        finally:
+            connection.close()
 
     def _recover_codex_app_jobs(self) -> None:
         if not self.config.profile.codex_app_server_interaction_enabled:
@@ -14208,88 +14942,344 @@ class SlackSocketBot:
                 f"Could not read Codex app-server recovery state: {exc}",
             )
             return
-        recoverable_statuses = {
-            "active",
-            "connected",
-            "disconnected",
-            "interrupting",
-            "pending-request",
-            "awaiting-request-replay",
-            "preparing",
-        }
         candidates = sorted(
             (
                 (str(key), job)
                 for key, job in jobs.items()
                 if isinstance(job, dict)
-                and job.get("status") in recoverable_statuses
+                and job.get("status") in CODEX_APP_RECOVERABLE_STATUSES
             ),
             key=lambda item: str(item[1].get("updated_at") or ""),
             reverse=True,
+        )
+        recovery_priority = {
+            "preparing": 0,
+            "pending-request": 1,
+            "awaiting-request-replay": 1,
+            "interrupting": 1,
+            "active": 2,
+            "connected": 2,
+            "disconnected": 2,
+            "desktop-required": 3,
+        }
+        candidates.sort(
+            key=lambda item: recovery_priority.get(
+                str(item[1].get("status") or ""),
+                4,
+            )
         )
         limit = max(
             1,
             self.config.profile.codex_app_server_max_controllers,
         )
-        recovered_count = 0
-        for key, job in candidates:
-            if recovered_count >= limit:
-                break
-            route_data = job.get("route")
-            binding = job.get("binding")
-            if not isinstance(route_data, dict) or not isinstance(
-                binding,
-                dict,
-            ):
-                continue
-            route = route_from_dict(route_data)
-            if not route.channel_id or not route.thread_ts:
-                continue
-            if key != agent_tmux_thread_key(
-                route.channel_id,
-                route.thread_ts,
-            ):
-                continue
-            try:
-                controller = self._get_codex_app_controller(
+        recovered_keys: set[str] = set()
+        for key, _ in candidates:
+            # Avoid waiting behind a live dispatch for a route that already
+            # has a controller. The check inside the route lock remains the
+            # authoritative capacity decision.
+            with self.codex_app_controllers_lock:
+                if key in self.codex_app_controllers:
+                    continue
+            with self._conversation_lock(f"codex-app:{key}"):
+                with self.codex_app_controllers_lock:
+                    if key in self.codex_app_controllers:
+                        continue
+                    occupied_keys = set(self.codex_app_controllers)
+                    occupied_keys.update(recovered_keys)
+                    if len(occupied_keys) >= limit:
+                        return
+                try:
+                    latest_job = (
+                        (_read_codex_app_jobs(self.config.paths).get("jobs"))
+                        or {}
+                    ).get(key)
+                except (OSError, UnicodeDecodeError, SlackbotError) as exc:
+                    emit(
+                        self.out,
+                        "Could not refresh Codex app-server recovery state: "
+                        f"{exc}",
+                    )
+                    return
+                if (
+                    not isinstance(latest_job, dict)
+                    or latest_job.get("status")
+                    not in CODEX_APP_RECOVERABLE_STATUSES
+                ):
+                    continue
+                route_data = latest_job.get("route")
+                binding = latest_job.get("binding")
+                if not isinstance(route_data, dict) or not isinstance(
+                    binding,
+                    dict,
+                ):
+                    continue
+                route = route_from_dict(route_data)
+                if not route.channel_id or not route.thread_ts:
+                    continue
+                if key != agent_tmux_thread_key(
+                    route.channel_id,
+                    route.thread_ts,
+                ):
+                    continue
+                recovered = self._recover_codex_app_job(
+                    key,
+                    latest_job,
                     route,
                     binding,
-                    record_connected=False,
                 )
-            except (CodexAppServerError, OSError, SlackbotError) as exc:
+                if recovered:
+                    recovered_keys.add(key)
+
+    def _recover_codex_app_job(
+        self,
+        key: str,
+        job: dict[str, Any],
+        route: SlackbotRoute,
+        binding: dict[str, Any],
+    ) -> bool:
+        if not self._codex_app_binding_currently_eligible(route, binding):
+            try:
+                _revoke_codex_app_server_jobs(
+                    self.config,
+                    self._codex_app_binding_session_id(binding),
+                    reason="current-session-ineligible",
+                )
+            except (OSError, UnicodeDecodeError, SlackbotError) as exc:
                 emit(
                     self.out,
-                    "Could not recover Codex app-server controller for "
-                    f"{key}: {exc}",
+                    "Could not persist ineligible Codex app-server "
+                    f"recovery rejection for {key}: {exc}",
                 )
-                continue
-            recovered_count += 1
-            if job.get("status") == "preparing":
-                client_message_id = str(job.get("client_message_id") or "")
-                preparing_action = str(job.get("preparing_action") or "")
-                preparing_text = job.get("preparing_text")
-                text_hash = str(job.get("text_sha256") or "")
-                valid_preparing = (
-                    preparing_action in {"start", "steer"}
-                    and client_message_id
-                    and isinstance(preparing_text, str)
-                    and bool(preparing_text)
-                    and (
-                        not text_hash
-                        or hashlib.sha256(preparing_text.encode()).hexdigest()
-                        == text_hash
+            return False
+        try:
+            controller = self._get_codex_app_controller(
+                route,
+                binding,
+                record_connected=False,
+                pending_recovery=(
+                    job.get("pending_request")
+                    if isinstance(job.get("pending_request"), dict)
+                    else None
+                ),
+            )
+        except CodexAppIneligibleControllerError:
+            try:
+                _revoke_codex_app_server_jobs(
+                    self.config,
+                    self._codex_app_binding_session_id(binding),
+                    reason="current-session-ineligible",
+                )
+            except (OSError, UnicodeDecodeError, SlackbotError) as exc:
+                emit(
+                    self.out,
+                    "Could not persist revoked Codex app-server recovery "
+                    f"for {key}: {exc}",
+                )
+            return False
+        except CodexAppSessionValidationError as exc:
+            rejected_job = dict(job)
+            rejected_job["status"] = "recovery-rejected"
+            rejected_job["updated_at"] = utcnow_iso()
+            try:
+                _update_codex_app_job(
+                    self.config,
+                    key,
+                    rejected_job,
+                )
+            except (OSError, SlackbotError) as state_exc:
+                emit(
+                    self.out,
+                    "Could not persist rejected Codex app-server recovery "
+                    f"for {key}: {state_exc}",
+                )
+            emit(
+                self.out,
+                "Rejected deterministic Codex app-server recovery for "
+                f"{key}: {exc}",
+            )
+            return False
+        except (CodexAppServerError, OSError, SlackbotError) as exc:
+            retained_retry = False
+            permanent_request_error = bool(
+                isinstance(exc, CodexAppServerRequestError) and exc.permanent
+            )
+            if (
+                not permanent_request_error
+                and job.get("status") in CODEX_APP_RECOVERABLE_STATUSES
+            ):
+                retry_controller = CodexAppController(
+                    self,
+                    route,
+                    binding,
+                )
+                preserve_input = job.get("status") == "preparing"
+                if preserve_input:
+                    retry_controller.mark_recovery_blocked()
+                retry_controller.defer_recovery_retry(
+                    preserve_input=preserve_input,
+                )
+                with self.codex_app_controllers_lock:
+                    current = self.codex_app_controllers.get(key)
+                    limit = max(
+                        1,
+                        self.config.profile.codex_app_server_max_controllers,
                     )
+                    if (
+                        current is None
+                        and len(self.codex_app_controllers) < limit
+                    ):
+                        self.codex_app_controllers[key] = retry_controller
+                    retained_retry = (
+                        self.codex_app_controllers.get(key) is not None
+                    )
+            elif permanent_request_error:
+                with self.codex_app_controllers_lock:
+                    retained_retry = (
+                        self.codex_app_controllers.get(key) is not None
+                    )
+            emit(
+                self.out,
+                "Could not recover Codex app-server controller for "
+                f"{key}: {exc}",
+            )
+            return retained_retry
+        if job.get("status") == "preparing":
+            client_message_id = str(job.get("client_message_id") or "")
+            preparing_action = str(job.get("preparing_action") or "")
+            preparing_text = job.get("preparing_text")
+            preparing_turn_id = str(
+                job.get("preparing_turn_id")
+                or (
+                    job.get("active_turn_id")
+                    if preparing_action == "steer"
+                    else ""
                 )
-                if not valid_preparing:
+                or ""
+            )
+            text_hash = str(job.get("text_sha256") or "")
+            valid_preparing = (
+                preparing_action in {"start", "steer"}
+                and client_message_id
+                and isinstance(preparing_text, str)
+                and bool(preparing_text)
+                and (preparing_action != "steer" or preparing_turn_id)
+                and (
+                    not text_hash
+                    or hashlib.sha256(preparing_text.encode()).hexdigest()
+                    == text_hash
+                )
+            )
+            if not valid_preparing:
+                controller.mark_desktop_required()
+                self._record_codex_app_controller(
+                    controller,
+                    status="desktop-required",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "preparing_recovery_rejected",
+                )
+                return True
+            self._record_codex_app_controller(
+                controller,
+                status="preparing",
+                client_message_id=client_message_id,
+                text_hash=text_hash,
+                preparing_action=preparing_action,
+                preparing_text=preparing_text,
+                preparing_turn_id=(preparing_turn_id or None),
+            )
+            try:
+                if preparing_action == "start":
+                    turn_id = controller.recover_start_turn(
+                        preparing_text,
+                        client_message_id,
+                    )
+                else:
+                    turn_id = controller.recover_steer(
+                        preparing_text,
+                        client_message_id,
+                        expected_turn_id=preparing_turn_id,
+                    )
+            except CodexAppPreDispatchError as exc:
+                try:
+                    controller.drain_callbacks()
+                except (CodexAppServerError, OSError) as drain_exc:
+                    controller.defer_recovery_retry()
+                    emit(
+                        self.out,
+                        "Could not drain callbacks after rejected Codex "
+                        f"recovery for {key}: {drain_exc}",
+                    )
+                    self._audit_codex_app(
+                        controller,
+                        "preparing_recovery_deferred",
+                        error_type=type(drain_exc).__name__,
+                        reason="callback-drain-failed",
+                    )
+                    return True
+                desktop_required = controller.finalize_recovery()
+                if desktop_required:
                     self._record_codex_app_controller(
                         controller,
                         status="desktop-required",
+                        client_message_id=client_message_id,
+                        text_hash=text_hash,
+                    )
+                else:
+                    self._clear_codex_app_preparing(controller)
+                    try:
+                        post_slack_message(
+                            self.config,
+                            controller.route,
+                            "Recovered Slack input was not sent because the "
+                            "Codex session state changed. Resend it if it is "
+                            "still needed.",
+                        )
+                    except Exception as post_exc:
+                        emit(
+                            self.out,
+                            "Could not post rejected Codex recovery notice: "
+                            f"{post_exc}",
+                        )
+                self._audit_codex_app(
+                    controller,
+                    "preparing_recovery_rejected",
+                    error_type=type(exc).__name__,
+                    reason="pre-dispatch-state-changed",
+                )
+                return True
+            except CodexAppServerRequestError as exc:
+                _, retry_delay = controller.recovery_retry_snapshot()
+                retry_exhausted = (
+                    retry_delay >= CODEX_APP_RECOVERY_RETRY_MAX_SECONDS
+                )
+                if exc.permanent or retry_exhausted:
+                    controller.mark_desktop_required()
+                    self._record_codex_app_controller(
+                        controller,
+                        status="desktop-required",
+                        client_message_id=client_message_id,
+                        text_hash=text_hash,
+                    )
+                    emit(
+                        self.out,
+                        "Could not safely finish preparing Codex recovery "
+                        f"for {key}: {exc}",
                     )
                     self._audit_codex_app(
                         controller,
                         "preparing_recovery_rejected",
+                        error_type=type(exc).__name__,
+                        error_code=exc.code,
+                        reason=(
+                            "permanent-request-error"
+                            if exc.permanent
+                            else "transient-request-retries-exhausted"
+                        ),
                     )
-                    continue
+                    return True
+                controller.defer_recovery_retry()
                 self._record_codex_app_controller(
                     controller,
                     status="preparing",
@@ -14297,59 +15287,185 @@ class SlackSocketBot:
                     text_hash=text_hash,
                     preparing_action=preparing_action,
                     preparing_text=preparing_text,
+                    preparing_turn_id=(preparing_turn_id or None),
                 )
-                try:
-                    if preparing_action == "start":
-                        turn_id = controller.recover_start_turn(
-                            preparing_text,
-                            client_message_id,
-                        )
-                    else:
-                        turn_id = controller.recover_steer(
-                            preparing_text,
-                            client_message_id,
-                        )
-                except (CodexAppServerError, OSError, SlackbotError) as exc:
-                    emit(
-                        self.out,
-                        "Could not replay preparing Codex input for "
-                        f"{key}: {exc}",
-                    )
-                    self._audit_codex_app(
-                        controller,
-                        "preparing_recovery_deferred",
-                        error_type=type(exc).__name__,
-                    )
-                    continue
+                emit(
+                    self.out,
+                    "Could not replay preparing Codex input for "
+                    f"{key}: {exc}",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "preparing_recovery_deferred",
+                    error_type=type(exc).__name__,
+                    error_code=exc.code,
+                    reason="transient-request-error",
+                )
+                return True
+            except CodexAppServerProtocolError as exc:
+                controller.mark_desktop_required()
                 self._record_codex_app_controller(
                     controller,
-                    status=(
-                        "active" if controller.active_turn_id else "completed"
+                    status="desktop-required",
+                    client_message_id=client_message_id,
+                    text_hash=text_hash,
+                )
+                emit(
+                    self.out,
+                    "Could not safely finish preparing Codex recovery for "
+                    f"{key}: {exc}",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "preparing_recovery_rejected",
+                    error_type=type(exc).__name__,
+                    reason=(
+                        "history-scan-exhausted"
+                        if isinstance(exc, CodexAppRecoveryExhaustedError)
+                        else "deterministic-recovery-failure"
                     ),
+                )
+                return True
+            except (CodexAppServerError, OSError, SlackbotError) as exc:
+                controller.defer_recovery_retry()
+                emit(
+                    self.out,
+                    "Could not replay preparing Codex input for "
+                    f"{key}: {exc}",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "preparing_recovery_deferred",
+                    error_type=type(exc).__name__,
+                )
+                return True
+            try:
+                controller.drain_callbacks()
+            except (CodexAppServerError, OSError) as exc:
+                controller.defer_recovery_retry()
+                emit(
+                    self.out,
+                    "Could not drain Codex callbacks after preparing "
+                    f"recovery for {key}: {exc}",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "preparing_recovery_deferred",
+                    error_type=type(exc).__name__,
+                )
+                return True
+            if controller.finalize_recovery():
+                self._record_codex_app_controller(
+                    controller,
+                    status="desktop-required",
                     client_message_id=client_message_id,
                     text_hash=text_hash,
                 )
                 self._audit_codex_app(
                     controller,
-                    "preparing_recovered",
+                    "preparing_recovered_desktop_required",
                     turn_id=turn_id,
                     preparing_action=preparing_action,
                     client_message_id=client_message_id,
                     text_sha256=text_hash,
                 )
-                continue
+                return True
+            self._record_codex_app_controller(
+                controller,
+                status=(
+                    "active" if controller.active_turn_id else "completed"
+                ),
+                client_message_id=client_message_id,
+                text_hash=text_hash,
+            )
+            self._audit_codex_app(
+                controller,
+                "preparing_recovered",
+                turn_id=turn_id,
+                preparing_action=preparing_action,
+                client_message_id=client_message_id,
+                text_sha256=text_hash,
+            )
+            return True
+        with controller.lock:
+            connection = controller.connection
+            if (
+                controller.disconnected
+                or connection is None
+                or not connection.connected
+            ):
+                should_retry = bool(
+                    not controller.terminal
+                    or controller.pending_request
+                    or controller.pending_request_replay
+                    or controller.desktop_required
+                    or controller.recovery_blocked
+                )
+                if should_retry and not controller.recovery_blocked:
+                    controller.defer_recovery_retry(preserve_input=False)
+                disconnected_status = (
+                    "desktop-required"
+                    if controller.desktop_required
+                    else (
+                        "completed" if controller.terminal else "disconnected"
+                    )
+                )
+                self._record_codex_app_controller(
+                    controller,
+                    status=disconnected_status,
+                )
+                self._audit_codex_app(
+                    controller,
+                    "recovery_deferred",
+                    reason="disconnected-during-finalization",
+                )
+                return True
+            controller.clear_recovery_blocked()
             pending = job.get("pending_request")
-            status = "completed" if controller.terminal else "recovered"
-            if isinstance(pending, dict) and pending.get("method"):
+            status = (
+                "completed"
+                if controller.terminal
+                else ("active" if controller.active_turn_id else "connected")
+            )
+            active_pending = controller.pending_snapshot()
+            replay_pending = controller.pending_replay_snapshot()
+            if controller.desktop_required and replay_pending is not None:
                 try:
-                    expires_at = float(pending.get("expires_at") or 0)
+                    replay_expires_at = float(
+                        replay_pending.get("expires_at")
+                    )
+                except (TypeError, ValueError):
+                    replay_expires_at = -1
+                if (
+                    not math.isfinite(replay_expires_at)
+                    or replay_expires_at <= time.time()
+                ):
+                    controller.clear_pending_request_replay()
+                    replay_pending = None
+            if active_pending is not None:
+                status = "pending-request"
+            elif controller.desktop_required:
+                status = "desktop-required"
+            elif (
+                replay_pending is not None
+                and isinstance(pending, dict)
+                and pending.get("method")
+            ):
+                try:
+                    expires_at = float(pending.get("expires_at"))
                 except (TypeError, ValueError):
                     expires_at = -1
-                if expires_at >= 0 and (
-                    not expires_at or expires_at > time.time()
-                ):
-                    status = controller.recover_pending_request(pending)
+                if math.isfinite(expires_at) and expires_at > time.time():
+                    if controller.pending_request is not None:
+                        status = "pending-request"
+                    elif controller.pending_request_replay is not None:
+                        status = "awaiting-request-replay"
                 else:
+                    controller.clear_pending_request_replay()
+                    controller.mark_desktop_required(
+                        pending.get("request_id"),
+                        pending.get("request_fingerprint"),
+                    )
                     status = "desktop-required"
             self._record_codex_app_controller(
                 controller,
@@ -14360,6 +15476,123 @@ class SlackSocketBot:
                 "recovered",
                 terminal=controller.terminal,
             )
+            return True
+
+    def _retry_codex_app_recovery(
+        self,
+        controller: CodexAppController,
+    ) -> None:
+        key = controller.route_key
+        with self._conversation_lock(f"codex-app:{key}"):
+            if not controller.recovery_blocked_snapshot():
+                return
+            if not self._ensure_codex_app_controller_eligible(
+                controller,
+                reason="deferred-recovery-ineligible",
+            ):
+                return
+            with self.codex_app_controllers_lock:
+                if self.codex_app_controllers.get(key) is not controller:
+                    return
+            try:
+                job = (
+                    _read_codex_app_jobs(self.config.paths).get("jobs") or {}
+                ).get(key)
+            except (OSError, UnicodeDecodeError, SlackbotError) as exc:
+                controller.defer_recovery_retry(
+                    preserve_input=(
+                        controller.recovery_input_blocked_snapshot()
+                    ),
+                )
+                emit(
+                    self.out,
+                    f"Could not read deferred Codex recovery state for "
+                    f"{key}: {exc}",
+                )
+                return
+            route_data = job.get("route") if isinstance(job, dict) else None
+            binding = job.get("binding") if isinstance(job, dict) else None
+            recovered_route = (
+                route_from_dict(route_data)
+                if isinstance(route_data, dict)
+                else None
+            )
+            valid_job = bool(
+                isinstance(job, dict)
+                and job.get("status") in CODEX_APP_RECOVERABLE_STATUSES
+                and isinstance(binding, dict)
+                and recovered_route is not None
+                and recovered_route.channel_id == controller.route.channel_id
+                and recovered_route.thread_ts == controller.route.thread_ts
+                and str(binding.get("thread_id") or "")
+                == controller.thread_id
+                and str(binding.get("source") or "").lower()
+                == str(controller.binding.get("source") or "").lower()
+                and str(binding.get("cwd") or "")
+                == str(controller.binding.get("cwd") or "")
+            )
+            if not valid_job:
+                with self.codex_app_controllers_lock:
+                    if self.codex_app_controllers.get(key) is controller:
+                        controller.invalidate()
+                        self.codex_app_controllers.pop(key, None)
+                controller.close()
+                self._audit_codex_app(
+                    controller,
+                    "preparing_recovery_discarded",
+                    reason="durable-retry-state-mismatch",
+                )
+                return
+            recovered = self._recover_codex_app_job(
+                key,
+                job,
+                controller.route,
+                binding,
+            )
+            if not recovered:
+                try:
+                    latest_job = (
+                        (_read_codex_app_jobs(self.config.paths).get("jobs"))
+                        or {}
+                    ).get(key)
+                except (OSError, UnicodeDecodeError, SlackbotError):
+                    latest_job = None
+                latest_binding = (
+                    latest_job.get("binding")
+                    if isinstance(latest_job, dict)
+                    else None
+                )
+                still_recoverable = bool(
+                    not controller.invalidated_snapshot()
+                    and isinstance(latest_job, dict)
+                    and latest_job.get("status")
+                    in CODEX_APP_RECOVERABLE_STATUSES
+                    and isinstance(latest_binding, dict)
+                    and latest_binding == controller.binding
+                    and self._codex_app_binding_currently_eligible(
+                        controller.route,
+                        controller.binding,
+                    )
+                )
+                if still_recoverable:
+                    controller.defer_recovery_retry(
+                        preserve_input=(
+                            controller.recovery_input_blocked_snapshot()
+                        ),
+                    )
+                retain_controller = still_recoverable
+                with self.codex_app_controllers_lock:
+                    current = self.codex_app_controllers.get(key)
+                    if retain_controller and current is None:
+                        self.codex_app_controllers[key] = controller
+                    elif current is not None and current is not controller:
+                        retain_controller = False
+                    elif current is controller and not retain_controller:
+                        controller.invalidate()
+                        self.codex_app_controllers.pop(key, None)
+                if not retain_controller:
+                    controller.invalidate()
+                    controller.close()
 
     def _codex_app_binding_for_route(
         self,
@@ -14388,15 +15621,38 @@ class SlackSocketBot:
         except (OSError, UnicodeDecodeError):
             state = {}
         sessions = state.get("sessions") if isinstance(state, dict) else None
+        revoked_session_ids: set[str] = set()
         if isinstance(sessions, dict):
-            entries.extend(
-                entry
-                for entry in sessions.values()
-                if isinstance(entry, dict)
-                and entry.get("channel_id") == route.channel_id
-                and entry.get("thread_ts") == route.thread_ts
-                and entry.get("notify_user_id") == notify_user_id
-            )
+            for entry in sessions.values():
+                if (
+                    not isinstance(entry, dict)
+                    or entry.get("channel_id") != route.channel_id
+                    or entry.get("thread_ts") != route.thread_ts
+                    or entry.get("notify_user_id") != notify_user_id
+                ):
+                    continue
+                entries.append(entry)
+                if entry.get("codex_app_server_revoked_at"):
+                    candidate = entry.get("codex_app_server")
+                    key = str(entry.get("key") or "")
+                    key_session_id = (
+                        key.removeprefix("session:")
+                        if key.startswith("session:")
+                        else ""
+                    )
+                    revoked_session_id = str(
+                        entry.get("session_id")
+                        or (
+                            candidate.get("session_id")
+                            or candidate.get("thread_id")
+                            if isinstance(candidate, dict)
+                            else ""
+                        )
+                        or key_session_id
+                        or ""
+                    ).strip()
+                    if revoked_session_id:
+                        revoked_session_ids.add(revoked_session_id)
         try:
             receipt = codex_hook_delivery_receipt_for_route(
                 self.config.paths,
@@ -14417,32 +15673,50 @@ class SlackSocketBot:
             ),
             reverse=True,
         )
-        allowed_sources = {
-            str(item).strip().lower()
-            for item in profile.codex_app_server_interaction_sources
-            if str(item).strip()
-        }
         for entry in entries:
+            if entry.get("codex_app_server_revoked_at"):
+                continue
             candidate = entry.get("codex_app_server")
-            if isinstance(candidate, dict):
-                thread_id = str(candidate.get("thread_id") or "").strip()
-                source = str(candidate.get("source") or "").strip().lower()
-                if (
-                    candidate.get("kind") == "codex_app_server"
-                    and thread_id
-                    and source in allowed_sources
-                ):
-                    return dict(candidate)
-            session_id = str(entry.get("session_id") or "").strip()
+            if candidate is not None and (
+                not isinstance(candidate, dict)
+                or candidate.get("kind") != "codex_app_server"
+            ):
+                continue
+            session_id = (
+                str(
+                    candidate.get("session_id")
+                    or candidate.get("thread_id")
+                    or ""
+                ).strip()
+                if isinstance(candidate, dict)
+                else ""
+            )
+            session_id = (
+                session_id or str(entry.get("session_id") or "").strip()
+            )
             if not session_id:
                 key = str(entry.get("key") or "")
                 if key.startswith("session:"):
                     session_id = key.removeprefix("session:")
             if not session_id:
                 continue
+            if session_id in revoked_session_ids:
+                continue
             metadata_payload: dict[str, Any] = {"session_id": session_id}
+            turn_id = str(
+                entry.get("last_turn_id") or entry.get("turn_id") or ""
+            ).strip()
+            if turn_id:
+                metadata_payload["turn_id"] = turn_id
+            direct_transcript_path = str(
+                entry.get("transcript_path") or ""
+            ).strip()
+            if direct_transcript_path:
+                metadata_payload["transcript_path"] = direct_transcript_path
             notifications = entry.get("notifications")
-            if isinstance(notifications, list):
+            if "transcript_path" not in metadata_payload and isinstance(
+                notifications, list
+            ):
                 for notification in reversed(notifications):
                     if not isinstance(notification, dict):
                         continue
@@ -14454,14 +15728,7 @@ class SlackSocketBot:
                 metadata_payload,
                 environment={**self.config.env, **os.environ},
             )
-            if (
-                metadata.verified
-                and metadata.source in allowed_sources
-                and metadata.thread_source not in {"review", "subagent"}
-                and not metadata.parent_thread_id
-                and not metadata.review_turn
-                and not metadata.automated_review
-            ):
+            if _codex_app_server_metadata_eligible(profile, metadata):
                 return {
                     "kind": "codex_app_server",
                     "thread_id": metadata.session_id,
@@ -14472,28 +15739,370 @@ class SlackSocketBot:
                 }
         return None
 
+    @staticmethod
+    def _codex_app_binding_session_id(binding: dict[str, Any]) -> str:
+        return str(
+            binding.get("session_id") or binding.get("thread_id") or ""
+        ).strip()
+
+    def _codex_app_binding_currently_eligible(
+        self,
+        route: SlackbotRoute,
+        binding: dict[str, Any],
+    ) -> bool:
+        session_id = self._codex_app_binding_session_id(binding)
+        if not session_id or not route.channel_id or not route.thread_ts:
+            return False
+        try:
+            state = read_json(
+                agent_codex_hook_state_path(self.config.paths),
+                {},
+            )
+        except (OSError, UnicodeDecodeError):
+            return False
+        sessions = state.get("sessions") if isinstance(state, dict) else None
+        matching_hook_entry = False
+        if isinstance(sessions, dict):
+            for key, entry in sessions.items():
+                if (
+                    not isinstance(entry, dict)
+                    or entry.get("channel_id") != route.channel_id
+                    or entry.get("thread_ts") != route.thread_ts
+                ):
+                    continue
+                candidate = entry.get("codex_app_server")
+                candidate_session_id = (
+                    self._codex_app_binding_session_id(candidate)
+                    if isinstance(candidate, dict)
+                    else ""
+                )
+                entry_session_id = str(entry.get("session_id") or "").strip()
+                key_session_id = (
+                    str(key).removeprefix("session:")
+                    if str(key).startswith("session:")
+                    else ""
+                )
+                if session_id not in {
+                    candidate_session_id,
+                    entry_session_id,
+                    key_session_id,
+                }:
+                    continue
+                matching_hook_entry = True
+                if entry.get("codex_app_server_revoked_at"):
+                    return False
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("kind") == "codex_app_server"
+                    and candidate_session_id == session_id
+                ):
+                    return True
+        if matching_hook_entry:
+            return False
+        try:
+            jobs = _read_codex_app_jobs(self.config.paths).get("jobs") or {}
+        except (OSError, UnicodeDecodeError, SlackbotError):
+            return False
+        key = agent_tmux_thread_key(route.channel_id, route.thread_ts)
+        job = jobs.get(key)
+        if isinstance(job, dict):
+            job_binding = job.get("binding")
+            if (
+                isinstance(job_binding, dict)
+                and self._codex_app_binding_session_id(job_binding)
+                == session_id
+            ):
+                return job.get("status") != "revoked"
+        # A controller can receive callbacks during initial connection before
+        # its first durable record exists. Its verified binding is the only
+        # eligibility evidence available in that narrow window.
+        return True
+
+    def _retire_ineligible_codex_app_controller(
+        self,
+        controller: CodexAppController,
+        *,
+        reason: str,
+    ) -> None:
+        key = controller.route_key
+        with self.codex_app_controllers_lock:
+            current = self.codex_app_controllers.get(key)
+            controller.invalidate()
+            remove_durable_job = current is None or current is controller
+            if current is controller:
+                self.codex_app_controllers.pop(key, None)
+        if remove_durable_job:
+            try:
+                _remove_codex_app_job_if_binding_matches(
+                    self.config,
+                    key,
+                    controller.binding,
+                )
+            except (OSError, SlackbotError) as exc:
+                emit(
+                    self.out,
+                    "Could not remove revoked Codex app-server job: "
+                    f"{exc}",
+                )
+        try:
+            controller.close()
+        except Exception as exc:
+            emit(
+                self.out,
+                "Could not close revoked Codex app-server controller: "
+                f"{exc}",
+            )
+        self._audit_codex_app(
+            controller,
+            "controller_revoked",
+            reason=reason,
+        )
+
+    def _ensure_codex_app_controller_eligible(
+        self,
+        controller: CodexAppController,
+        *,
+        reason: str,
+    ) -> bool:
+        if self._codex_app_binding_currently_eligible(
+            controller.route,
+            controller.binding,
+        ):
+            return True
+        self._retire_ineligible_codex_app_controller(
+            controller,
+            reason=reason,
+        )
+        return False
+
+    @contextmanager
+    def _codex_app_controllers_temporarily_unlocked(self):
+        self.codex_app_controllers_lock.release()
+        try:
+            yield
+        finally:
+            self.codex_app_controllers_lock.acquire()
+
     def _get_codex_app_controller(
         self,
         route: SlackbotRoute,
         binding: dict[str, Any],
         *,
         record_connected: bool = True,
+        pending_recovery: dict[str, Any] | None = None,
     ) -> CodexAppController:
         route_key = agent_tmux_thread_key(
             str(route.channel_id or ""),
             str(route.thread_ts or ""),
         )
+        recovery_pending = (
+            dict(pending_recovery)
+            if isinstance(pending_recovery, dict)
+            and pending_recovery.get("method")
+            else None
+        )
+        recovery_blocked = False
+        recovery_input_blocked = False
+        recovery_desktop_required = False
+        recovery_desktop_request_id: Any = None
+        recovery_desktop_request_ids: list[Any] = []
+        recovery_desktop_request_fingerprint: str | None = None
+        recovery_handoff_required = False
+        recovery_handoff_request_id: Any = None
+        recovery_handoff_request_fingerprint: str | None = None
+        recovery_retry_at = 0.0
+        recovery_retry_delay = 0.0
         with self.codex_app_controllers_lock:
             existing = self.codex_app_controllers.get(route_key)
+            existing_binding_matches = bool(
+                existing
+                and existing.thread_id == str(binding.get("thread_id") or "")
+                and str(existing.binding.get("source") or "").lower()
+                == str(binding.get("source") or "").lower()
+                and str(existing.binding.get("cwd") or "")
+                == str(binding.get("cwd") or "")
+            )
             if (
                 existing
+                and existing_binding_matches
                 and existing.connection
                 and (existing.connection.connected)
             ):
                 return existing
             if existing:
-                existing.close()
+                if existing_binding_matches:
+                    recovery_blocked = existing.recovery_blocked_snapshot()
+                    recovery_input_blocked = (
+                        existing.recovery_input_blocked_snapshot()
+                    )
+                    recovery_desktop_required = (
+                        existing.desktop_required_snapshot()
+                    )
+                    recovery_desktop_request_id = (
+                        existing.desktop_request_id_snapshot()
+                    )
+                    recovery_desktop_request_ids = (
+                        existing.desktop_request_ids_snapshot()
+                    )
+                    recovery_desktop_request_fingerprint = (
+                        existing.desktop_request_fingerprint_snapshot()
+                    )
+                    recovery_handoff_required = (
+                        existing.recovery_handoff_required_snapshot()
+                    )
+                    recovery_handoff_request_id = (
+                        existing.recovery_handoff_request_id_snapshot()
+                    )
+                    recovery_handoff_request_fingerprint = (
+                        existing.recovery_handoff_request_fingerprint_snapshot()
+                    )
+                    (
+                        recovery_retry_at,
+                        recovery_retry_delay,
+                    ) = existing.recovery_retry_snapshot()
+                    if recovery_pending is None:
+                        recovery_pending = (
+                            existing.pending_persistence_snapshot()
+                        )
+                existing.invalidate()
                 self.codex_app_controllers.pop(route_key, None)
+                with self._codex_app_controllers_temporarily_unlocked():
+                    existing.close()
+            try:
+                with self._codex_app_controllers_temporarily_unlocked():
+                    persisted_jobs = (
+                        _read_codex_app_jobs(self.config.paths).get("jobs")
+                        or {}
+                    )
+            except (OSError, UnicodeDecodeError, SlackbotError) as exc:
+                raise SlackbotError(
+                    "Could not read Codex app-server recovery state"
+                ) from exc
+            persisted_job = persisted_jobs.get(route_key)
+            persisted_binding = (
+                persisted_job.get("binding")
+                if isinstance(persisted_job, dict)
+                else None
+            )
+            persisted_pending = (
+                persisted_job.get("pending_request")
+                if isinstance(persisted_job, dict)
+                else None
+            )
+            persisted_binding_matches = bool(
+                isinstance(persisted_binding, dict)
+                and str(persisted_binding.get("thread_id") or "")
+                == str(binding.get("thread_id") or "")
+                and str(persisted_binding.get("source") or "").lower()
+                == str(binding.get("source") or "").lower()
+                and str(persisted_binding.get("cwd") or "")
+                == str(binding.get("cwd") or "")
+            )
+            if (
+                persisted_binding_matches
+                and persisted_job.get("status") == "preparing"
+            ):
+                recovery_blocked = True
+                recovery_input_blocked = True
+                if recovery_retry_delay <= 0:
+                    try:
+                        persisted_retry_at = float(
+                            persisted_job.get("recovery_retry_at") or 0
+                        )
+                        persisted_retry_delay = float(
+                            persisted_job.get("recovery_retry_delay") or 0
+                        )
+                    except (TypeError, ValueError):
+                        persisted_retry_at = 0.0
+                        persisted_retry_delay = 0.0
+                    if (
+                        math.isfinite(persisted_retry_at)
+                        and math.isfinite(persisted_retry_delay)
+                        and persisted_retry_delay > 0
+                    ):
+                        recovery_retry_at = persisted_retry_at
+                        recovery_retry_delay = min(
+                            persisted_retry_delay,
+                            CODEX_APP_RECOVERY_RETRY_MAX_SECONDS,
+                        )
+                recovery_handoff_required = bool(
+                    persisted_job.get("recovery_handoff_required") is True
+                )
+                recovery_handoff_request_id = persisted_job.get(
+                    "recovery_handoff_request_id"
+                )
+                persisted_handoff_fingerprint = persisted_job.get(
+                    "recovery_handoff_request_fingerprint"
+                )
+                if isinstance(persisted_handoff_fingerprint, str):
+                    recovery_handoff_request_fingerprint = (
+                        persisted_handoff_fingerprint
+                    )
+            if (
+                persisted_binding_matches
+                and persisted_job.get("status") == "desktop-required"
+            ):
+                recovery_desktop_required = True
+                recovery_desktop_request_id = persisted_job.get(
+                    "desktop_request_id"
+                )
+                persisted_desktop_request_ids = persisted_job.get(
+                    "desktop_request_ids"
+                )
+                persisted_desktop_request_fingerprint = persisted_job.get(
+                    "desktop_request_fingerprint"
+                )
+                if isinstance(persisted_desktop_request_fingerprint, str):
+                    recovery_desktop_request_fingerprint = (
+                        persisted_desktop_request_fingerprint
+                    )
+                if isinstance(persisted_desktop_request_ids, list):
+                    recovery_desktop_request_ids = list(
+                        persisted_desktop_request_ids
+                    )
+                if recovery_desktop_request_id is None and isinstance(
+                    persisted_pending, dict
+                ):
+                    recovery_desktop_request_id = persisted_pending.get(
+                        "request_id"
+                    )
+                if (
+                    not recovery_desktop_request_ids
+                    and recovery_desktop_request_id is not None
+                ):
+                    recovery_desktop_request_ids = [
+                        recovery_desktop_request_id
+                    ]
+            if (
+                recovery_pending is None
+                and persisted_binding_matches
+                and isinstance(persisted_pending, dict)
+                and persisted_pending.get("method")
+                and persisted_job.get("status")
+                in {
+                    "active",
+                    "connected",
+                    "disconnected",
+                    "interrupting",
+                    "pending-request",
+                    "awaiting-request-replay",
+                    "desktop-required",
+                }
+            ):
+                recovery_pending = dict(persisted_pending)
+            recovery_expired = False
+            if recovery_pending is not None:
+                try:
+                    recovery_expires_at = float(
+                        recovery_pending.get("expires_at")
+                    )
+                except (TypeError, ValueError):
+                    recovery_expired = True
+                else:
+                    recovery_expired = (
+                        not math.isfinite(recovery_expires_at)
+                        or recovery_expires_at <= time.time()
+                    )
             live = [
                 controller
                 for controller in self.codex_app_controllers.values()
@@ -14506,15 +16115,309 @@ class SlackSocketBot:
                     "The Slackbot already has the maximum number of active "
                     "Codex app-server controllers."
                 )
-            self._ensure_codex_app_server()
+            try:
+                with self._codex_app_controllers_temporarily_unlocked():
+                    self._ensure_codex_app_server()
+            except Exception:
+                if recovery_blocked:
+                    fallback = CodexAppController(self, route, binding)
+                    if recovery_retry_delay > 0:
+                        fallback.restore_recovery_retry(
+                            recovery_retry_at,
+                            recovery_retry_delay,
+                            preserve_input=recovery_input_blocked,
+                        )
+                        fallback.defer_recovery_retry(
+                            preserve_input=recovery_input_blocked,
+                        )
+                    else:
+                        fallback.defer_recovery_retry(
+                            preserve_input=recovery_input_blocked,
+                        )
+                    if self.codex_app_controllers.get(route_key) is None:
+                        self.codex_app_controllers[route_key] = fallback
+                raise
             controller = CodexAppController(self, route, binding)
-            controller.connect()
-            self.codex_app_controllers[route_key] = controller
-            if record_connected:
-                self._record_codex_app_controller(
-                    controller,
-                    status="connected",
+            if recovery_blocked:
+                if recovery_retry_delay > 0:
+                    controller.restore_recovery_retry(
+                        recovery_retry_at,
+                        recovery_retry_delay,
+                        preserve_input=recovery_input_blocked,
+                    )
+                else:
+                    controller.defer_recovery_retry(
+                        preserve_input=recovery_input_blocked,
+                    )
+            if recovery_pending is not None:
+                controller.recover_pending_request(recovery_pending)
+            if recovery_desktop_required:
+                controller.restore_desktop_required(
+                    recovery_desktop_request_ids,
+                    recovery_desktop_request_id,
+                    recovery_desktop_request_fingerprint,
+                    preserve_legacy_replay=bool(
+                        recovery_pending is not None
+                        and recovery_pending.get("request_id") is None
+                    ),
                 )
+            if recovery_handoff_required:
+                controller.mark_recovery_handoff_required(
+                    recovery_handoff_request_id,
+                    recovery_handoff_request_fingerprint,
+                )
+            try:
+                with self._codex_app_controllers_temporarily_unlocked():
+                    controller.connect()
+            except Exception as exc:
+                permanent_request_error = bool(
+                    isinstance(exc, CodexAppServerRequestError)
+                    and exc.permanent
+                )
+                recovery_input_ambiguous = (
+                    controller.recovery_input_blocked_snapshot()
+                )
+                _, current_retry_delay = controller.recovery_retry_snapshot()
+                request_retries_exhausted = bool(
+                    isinstance(exc, CodexAppServerRequestError)
+                    and not exc.permanent
+                    and current_retry_delay
+                    >= CODEX_APP_RECOVERY_RETRY_MAX_SECONDS
+                )
+                pending = controller.pending_persistence_snapshot() or {}
+                recoverable_handoff_state = bool(
+                    recovery_input_ambiguous
+                    or pending
+                    or controller.recovery_handoff_required_snapshot()
+                    or controller.desktop_request_id_snapshot() is not None
+                    or controller.desktop_request_ids_snapshot()
+                )
+                request_recovery_handoff = bool(
+                    (permanent_request_error or request_retries_exhausted)
+                    and recoverable_handoff_state
+                )
+                if request_recovery_handoff:
+                    recovery_job = (
+                        persisted_job
+                        if isinstance(persisted_job, dict)
+                        else {}
+                    )
+                    handoff_request_id = (
+                        controller.recovery_handoff_request_id_snapshot()
+                    )
+                    if handoff_request_id is None:
+                        handoff_request_id = pending.get("request_id")
+                    handoff_fingerprint = (
+                        controller.recovery_handoff_request_fingerprint_snapshot()
+                    )
+                    if handoff_fingerprint is None:
+                        handoff_fingerprint = pending.get(
+                            "request_fingerprint"
+                        )
+                    controller.mark_desktop_required(
+                        handoff_request_id,
+                        handoff_fingerprint,
+                    )
+                    if self.codex_app_controllers.get(route_key) is None:
+                        self.codex_app_controllers[route_key] = controller
+                    persisted_preparing_text = (
+                        recovery_job.get("preparing_text")
+                        if isinstance(
+                            recovery_job.get("preparing_text"),
+                            str,
+                        )
+                        else None
+                    )
+                    with self._codex_app_controllers_temporarily_unlocked():
+                        try:
+                            self._record_codex_app_controller(
+                                controller,
+                                status="desktop-required",
+                                client_message_id=(
+                                    str(
+                                        recovery_job.get("client_message_id")
+                                        or ""
+                                    ).strip()
+                                    or None
+                                ),
+                                text_hash=(
+                                    str(
+                                        recovery_job.get("text_sha256") or ""
+                                    ).strip()
+                                    or None
+                                ),
+                                preparing_action=(
+                                    str(
+                                        recovery_job.get("preparing_action")
+                                        or ""
+                                    ).strip()
+                                    or None
+                                ),
+                                preparing_text=persisted_preparing_text,
+                                preparing_turn_id=(
+                                    str(
+                                        recovery_job.get("preparing_turn_id")
+                                        or ""
+                                    ).strip()
+                                    or None
+                                ),
+                            )
+                        except (OSError, SlackbotError) as state_exc:
+                            emit(
+                                self.out,
+                                "Could not persist Codex app-server "
+                                "Desktop recovery handoff: "
+                                f"{state_exc}",
+                            )
+                elif (
+                    controller.recovery_blocked_snapshot()
+                    and not isinstance(exc, CodexAppSessionValidationError)
+                ):
+                    if recovery_retry_delay > 0:
+                        controller.defer_recovery_retry(
+                            preserve_input=recovery_input_blocked,
+                        )
+                    if self.codex_app_controllers.get(route_key) is None:
+                        self.codex_app_controllers[route_key] = controller
+                    with self._codex_app_controllers_temporarily_unlocked():
+                        try:
+                            self._record_codex_app_controller(
+                                controller,
+                                status=(
+                                    "preparing"
+                                    if recovery_input_ambiguous
+                                    else "disconnected"
+                                ),
+                            )
+                        except (OSError, SlackbotError) as state_exc:
+                            emit(
+                                self.out,
+                                "Could not persist Codex app-server "
+                                "recovery backoff: "
+                                f"{state_exc}",
+                            )
+                else:
+                    controller.invalidate()
+                    if (
+                        self.codex_app_controllers.get(route_key)
+                        is controller
+                    ):
+                        self.codex_app_controllers.pop(route_key, None)
+                    if permanent_request_error:
+                        rejected_job = (
+                            dict(persisted_job)
+                            if isinstance(persisted_job, dict)
+                            else {
+                                "version": 1,
+                                "route": route_to_dict(route),
+                                "binding": dict(binding),
+                            }
+                        )
+                        rejected_job["status"] = "recovery-rejected"
+                        rejected_job["updated_at"] = utcnow_iso()
+                        with (
+                            self._codex_app_controllers_temporarily_unlocked()
+                        ):
+                            try:
+                                _update_codex_app_job(
+                                    self.config,
+                                    route_key,
+                                    rejected_job,
+                                )
+                            except (OSError, SlackbotError) as state_exc:
+                                emit(
+                                    self.out,
+                                    "Could not persist rejected Codex "
+                                    "app-server setup: "
+                                    f"{state_exc}",
+                                )
+                raise
+            if (
+                controller.terminal
+                and not controller.recovery_blocked_snapshot()
+            ):
+                controller.clear_terminal_recovery_state()
+            if (
+                recovery_expired
+                and controller.pending_replay_snapshot() is not None
+            ):
+                controller.clear_pending_request_replay()
+                if controller.recovery_blocked_snapshot():
+                    if not controller.recovery_handoff_required_snapshot():
+                        controller.mark_recovery_handoff_required(
+                            recovery_pending.get("request_id"),
+                            recovery_pending.get("request_fingerprint"),
+                        )
+                else:
+                    controller.mark_desktop_required(
+                        recovery_pending.get("request_id"),
+                        recovery_pending.get("request_fingerprint"),
+                    )
+            with self._codex_app_controllers_temporarily_unlocked():
+                still_eligible = self._codex_app_binding_currently_eligible(
+                    route, binding
+                )
+            if controller.invalidated_snapshot() or not still_eligible:
+                controller.invalidate()
+                with self._codex_app_controllers_temporarily_unlocked():
+                    controller.close()
+                raise CodexAppIneligibleControllerError(
+                    "The Codex app-server session became ineligible during "
+                    "controller setup."
+                )
+            current = self.codex_app_controllers.get(route_key)
+            if current is not None and current is not controller:
+                controller.invalidate()
+                with self._codex_app_controllers_temporarily_unlocked():
+                    controller.close()
+                if (
+                    current.thread_id == controller.thread_id
+                    and current.connection
+                    and current.connection.connected
+                ):
+                    return current
+                raise SlackbotError(
+                    "The Codex app-server controller changed during setup."
+                )
+            live = [
+                existing_controller
+                for existing_key, existing_controller in (
+                    self.codex_app_controllers.items()
+                )
+                if existing_key != route_key
+                and existing_controller.connection
+                and existing_controller.connection.connected
+            ]
+            if len(live) >= max(
+                1, self.config.profile.codex_app_server_max_controllers
+            ):
+                controller.invalidate()
+                with self._codex_app_controllers_temporarily_unlocked():
+                    controller.close()
+                raise SlackbotError(
+                    "The Slackbot already has the maximum number of active "
+                    "Codex app-server controllers."
+                )
+            self.codex_app_controllers[route_key] = controller
+            if (
+                record_connected
+                and not controller.recovery_blocked_snapshot()
+            ):
+                if controller.terminal:
+                    connected_status = "completed"
+                elif controller.pending_snapshot() is not None:
+                    connected_status = "pending-request"
+                elif controller.pending_replay_snapshot() is not None:
+                    connected_status = "awaiting-request-replay"
+                elif controller.desktop_required_snapshot():
+                    connected_status = "desktop-required"
+                else:
+                    connected_status = "connected"
+                with self._codex_app_controllers_temporarily_unlocked():
+                    self._record_codex_app_controller(
+                        controller,
+                        status=connected_status,
+                    )
             return controller
 
     def _record_codex_app_controller(
@@ -14526,10 +16429,39 @@ class SlackSocketBot:
         text_hash: str | None = None,
         preparing_action: str | None = None,
         preparing_text: str | None = None,
+        preparing_turn_id: str | None = None,
+        clear_client_identity: bool = False,
+    ) -> None:
+        with controller.lock:
+            controller.require_valid()
+            self._record_codex_app_controller_locked(
+                controller,
+                status=status,
+                client_message_id=client_message_id,
+                text_hash=text_hash,
+                preparing_action=preparing_action,
+                preparing_text=preparing_text,
+                preparing_turn_id=preparing_turn_id,
+                clear_client_identity=clear_client_identity,
+            )
+
+    def _record_codex_app_controller_locked(
+        self,
+        controller: CodexAppController,
+        *,
+        status: str,
+        client_message_id: str | None = None,
+        text_hash: str | None = None,
+        preparing_action: str | None = None,
+        preparing_text: str | None = None,
+        preparing_turn_id: str | None = None,
         clear_client_identity: bool = False,
     ) -> None:
         snapshot = controller.status_snapshot()
         pending = controller.pending_persistence_snapshot()
+        recovery_retry_at, recovery_retry_delay = (
+            controller.recovery_retry_snapshot()
+        )
         value = {
             "version": 1,
             "status": status,
@@ -14542,6 +16474,25 @@ class SlackSocketBot:
             "text_sha256": text_hash,
             "preparing_action": preparing_action,
             "preparing_text": preparing_text,
+            "preparing_turn_id": preparing_turn_id,
+            "recovery_retry_at": recovery_retry_at,
+            "recovery_retry_delay": recovery_retry_delay,
+            "recovery_handoff_required": (
+                controller.recovery_handoff_required_snapshot()
+            ),
+            "recovery_handoff_request_id": (
+                controller.recovery_handoff_request_id_snapshot()
+            ),
+            "recovery_handoff_request_fingerprint": (
+                controller.recovery_handoff_request_fingerprint_snapshot()
+            ),
+            "desktop_request_id": controller.desktop_request_id_snapshot(),
+            "desktop_request_ids": (
+                controller.desktop_request_ids_snapshot()
+            ),
+            "desktop_request_fingerprint": (
+                controller.desktop_request_fingerprint_snapshot()
+            ),
             "_clear_client_identity": clear_client_identity,
             "pending_request": (
                 {
@@ -14550,6 +16501,11 @@ class SlackSocketBot:
                     "turn_id": pending.get("turn_id"),
                     "expires_at": pending.get("expires_at"),
                     "request_fingerprint": pending.get("request_fingerprint"),
+                    "slack_client_msg_id": pending.get("slack_client_msg_id"),
+                    "slack_delivery_state": pending.get(
+                        "slack_delivery_state"
+                    ),
+                    "slack_message_ts": pending.get("slack_message_ts"),
                 }
                 if pending
                 else None
@@ -14561,6 +16517,97 @@ class SlackSocketBot:
             controller.route_key,
             value,
         )
+
+    def _persist_codex_app_recovery_handoff(
+        self,
+        controller: CodexAppController,
+        request_id: Any,
+        request_fingerprint: str | None = None,
+    ) -> bool:
+        with controller.lock:
+            if (
+                not controller.recovery_input_blocked
+                and not controller.dispatch_preparing
+            ):
+                return False
+            controller.mark_recovery_handoff_required(
+                request_id,
+                request_fingerprint,
+            )
+            self._record_codex_app_controller(
+                controller,
+                status="preparing",
+            )
+            return True
+
+    def _clear_codex_app_recovery_handoff(
+        self,
+        controller: CodexAppController,
+        request_id: Any,
+    ) -> bool:
+        with controller.lock:
+            if (
+                not controller.recovery_handoff_required
+                or controller.recovery_handoff_request_id is None
+                or controller.recovery_handoff_request_id != request_id
+            ):
+                return False
+            controller.recovery_handoff_required = False
+            controller.recovery_handoff_request_id = None
+            controller.recovery_handoff_request_fingerprint = None
+            return True
+
+    def _persist_codex_app_desktop_request_id(
+        self,
+        controller: CodexAppController,
+        request_id: Any,
+        method: str,
+        params: dict[str, Any],
+    ) -> bool:
+        with controller.lock:
+            request_fingerprint = self._codex_app_server_request_fingerprint(
+                method, params
+            )
+            tracked = controller.track_desktop_request_id(
+                request_id,
+                request_fingerprint,
+            )
+            if not tracked:
+                replay = controller.pending_request_replay
+                request_turn_id = str(params.get("turnId") or "") or None
+                replay_matches = bool(
+                    controller.desktop_required
+                    and not controller.desktop_request_ids
+                    and isinstance(replay, dict)
+                    and replay.get("request_id") is None
+                    and replay.get("method") == method
+                    and replay.get("turn_id") == request_turn_id
+                    and replay.get("request_fingerprint") is not None
+                    and replay.get("request_fingerprint")
+                    == request_fingerprint
+                )
+                if not replay_matches or request_id is None:
+                    if (
+                        controller.desktop_required
+                        and not controller.desktop_request_ids
+                        and isinstance(replay, dict)
+                        and replay.get("request_id") is None
+                    ):
+                        controller.pending_request_replay = None
+                        self._record_codex_app_controller(
+                            controller,
+                            status="desktop-required",
+                        )
+                    return False
+                controller.pending_request_replay = None
+                controller.desktop_request_ids = [request_id]
+                controller.desktop_request_id = request_id
+                controller.desktop_request_fingerprint = request_fingerprint
+            self._record_codex_app_controller(
+                controller,
+                status="desktop-required",
+            )
+            return True
 
     def _clear_codex_app_preparing(
         self,
@@ -14581,6 +16628,98 @@ class SlackSocketBot:
             clear_client_identity=True,
         )
 
+    def _begin_codex_app_dispatch_preparation(
+        self,
+        controller: CodexAppController,
+        *,
+        client_message_id: str,
+        text_hash: str,
+        preparing_action: str,
+        preparing_text: str,
+    ) -> str | None:
+        with controller.lock:
+            preparing_turn_id = (
+                controller.active_turn_id
+                if preparing_action == "steer"
+                else None
+            )
+            if preparing_action == "steer" and not preparing_turn_id:
+                raise CodexAppPreDispatchError(
+                    "The Codex thread has no active turn to steer."
+                )
+            controller.begin_dispatch_preparation()
+            try:
+                self._record_codex_app_controller(
+                    controller,
+                    status="preparing",
+                    client_message_id=client_message_id,
+                    text_hash=text_hash,
+                    preparing_action=preparing_action,
+                    preparing_text=preparing_text,
+                    preparing_turn_id=preparing_turn_id,
+                )
+            except Exception:
+                controller.finish_dispatch_preparation()
+                raise
+            return preparing_turn_id
+
+    def _finish_codex_app_pre_dispatch_failure(
+        self,
+        controller: CodexAppController,
+    ) -> None:
+        try:
+            controller.drain_callbacks()
+        except (CodexAppServerError, OSError) as exc:
+            with controller.lock:
+                controller.defer_recovery_retry()
+                controller.dispatch_preparing = False
+            self._audit_codex_app(
+                controller,
+                "dispatch_recovery_deferred",
+                error_type=type(exc).__name__,
+                reason="callback-drain-failed",
+            )
+            return
+        with controller.lock:
+            if controller.recovery_handoff_required:
+                controller.finalize_recovery()
+                self._record_codex_app_controller(
+                    controller,
+                    status="desktop-required",
+                    clear_client_identity=True,
+                )
+            else:
+                self._clear_codex_app_preparing(controller)
+            controller.dispatch_preparing = False
+
+    def _record_codex_app_dispatch_completion(
+        self,
+        controller: CodexAppController,
+        *,
+        default_status: str,
+        client_message_id: str,
+        text_hash: str,
+    ) -> str:
+        with controller.lock:
+            status = default_status
+            if controller.recovery_handoff_required:
+                controller.finalize_recovery()
+                status = "desktop-required"
+            elif default_status in {"active", "completed"}:
+                status = (
+                    "active"
+                    if controller.active_turn_id and not controller.terminal
+                    else "completed"
+                )
+            self._record_codex_app_controller(
+                controller,
+                status=status,
+                client_message_id=client_message_id,
+                text_hash=text_hash,
+            )
+            controller.dispatch_preparing = False
+            return status
+
     def _audit_codex_app(
         self,
         controller: CodexAppController,
@@ -14598,6 +16737,19 @@ class SlackSocketBot:
                 **fields,
             },
         )
+
+    def _post_codex_app_controller_message(
+        self,
+        controller: CodexAppController,
+        text: str,
+    ) -> dict[str, Any] | None:
+        with controller.lock:
+            controller.require_valid()
+            return post_slack_message(
+                self.config,
+                controller.route,
+                text,
+            )
 
     @staticmethod
     def _codex_app_client_message_id(
@@ -14632,6 +16784,26 @@ class SlackSocketBot:
             separators=(",", ":"),
         ).encode()
         return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _codex_app_request_client_msg_id(
+        controller: CodexAppController,
+        request_id: Any,
+        request_fingerprint: str,
+    ) -> str:
+        identity = {
+            "thread_id": controller.thread_id,
+            "request_id": request_id,
+            "request_fingerprint": request_fingerprint,
+            "channel_id": controller.route.channel_id,
+            "thread_ts": controller.route.thread_ts,
+        }
+        return str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                json.dumps(identity, sort_keys=True, separators=(",", ":")),
+            )
+        )
 
     def _maybe_handle_codex_app(
         self,
@@ -14681,9 +16853,45 @@ class SlackSocketBot:
                 "Use `status`, `steer <text>`, `cancel`, or `help` here.",
             )
             return True
+        route_key = agent_tmux_thread_key(
+            str(route.channel_id or ""),
+            str(route.thread_ts or ""),
+        )
+        operation_contexts = ExitStack()
+        controller: CodexAppController | None = None
         try:
+            operation_contexts.enter_context(
+                self._conversation_lock(f"codex-app:{route_key}")
+            )
             controller = self._get_codex_app_controller(route, binding)
+            if controller.recovery_blocked_snapshot():
+                post_slack_message(
+                    self.config,
+                    route,
+                    "Codex has ambiguous Slack input still under recovery. "
+                    "Handle the session in Desktop or wait for recovery to "
+                    "complete. This reply was not sent as model input.",
+                )
+                return True
+            if controller.desktop_required_snapshot():
+                post_slack_message(
+                    self.config,
+                    route,
+                    "Codex has a request that must be resolved in Desktop. "
+                    "This reply was not sent as model input.",
+                )
+                return True
             pending = controller.pending_snapshot()
+            pending_replay = controller.pending_replay_snapshot()
+            if pending_replay:
+                post_slack_message(
+                    self.config,
+                    route,
+                    "Codex is restoring a pending approval or answer. "
+                    "Wait for its Slack prompt or handle it in Desktop. "
+                    "This reply was not sent as model input.",
+                )
+                return True
             if lowered in {
                 "approve",
                 "approve session",
@@ -14742,7 +16950,7 @@ class SlackSocketBot:
                     f"Interrupt requested for Codex turn {turn_id}.",
                 )
                 return True
-            if lowered.startswith("steer"):
+            if lowered == "steer" or lowered.startswith("steer "):
                 steering_text = stripped[5:].strip()
                 if not steering_text:
                     post_slack_message(
@@ -14758,22 +16966,24 @@ class SlackSocketBot:
                     steering_text,
                 )
                 text_hash = hashlib.sha256(steering_text.encode()).hexdigest()
-                self._record_codex_app_controller(
-                    controller,
-                    status="preparing",
-                    client_message_id=client_message_id,
-                    text_hash=text_hash,
-                    preparing_action="steer",
-                    preparing_text=steering_text,
+                preparing_turn_id = (
+                    self._begin_codex_app_dispatch_preparation(
+                        controller,
+                        client_message_id=client_message_id,
+                        text_hash=text_hash,
+                        preparing_action="steer",
+                        preparing_text=steering_text,
+                    )
                 )
                 try:
                     turn_id = controller.steer(
                         steering_text,
                         client_message_id,
+                        expected_turn_id=preparing_turn_id,
                     )
                 except CodexAppPreDispatchError:
                     try:
-                        self._clear_codex_app_preparing(
+                        self._finish_codex_app_pre_dispatch_failure(
                             controller,
                         )
                     except (OSError, SlackbotError) as exc:
@@ -14783,9 +16993,9 @@ class SlackSocketBot:
                             f"{exc}",
                         )
                     raise
-                self._record_codex_app_controller(
+                self._record_codex_app_dispatch_completion(
                     controller,
-                    status="active",
+                    default_status="active",
                     client_message_id=client_message_id,
                     text_hash=text_hash,
                 )
@@ -14815,9 +17025,8 @@ class SlackSocketBot:
                 stripped,
             )
             text_hash = hashlib.sha256(stripped.encode()).hexdigest()
-            self._record_codex_app_controller(
+            self._begin_codex_app_dispatch_preparation(
                 controller,
-                status="preparing",
                 client_message_id=client_message_id,
                 text_hash=text_hash,
                 preparing_action="start",
@@ -14836,7 +17045,7 @@ class SlackSocketBot:
                 )
             except CodexAppPreDispatchError:
                 try:
-                    self._clear_codex_app_preparing(
+                    self._finish_codex_app_pre_dispatch_failure(
                         controller,
                     )
                 except (OSError, SlackbotError) as exc:
@@ -14845,9 +17054,9 @@ class SlackSocketBot:
                         "Could not clear pre-dispatch turn state: " f"{exc}",
                     )
                 raise
-            self._record_codex_app_controller(
+            self._record_codex_app_dispatch_completion(
                 controller,
-                status=(
+                default_status=(
                     "active" if controller.active_turn_id else "completed"
                 ),
                 client_message_id=client_message_id,
@@ -14872,11 +17081,21 @@ class SlackSocketBot:
                 ),
             )
         except (CodexAppServerError, OSError, SlackbotError) as exc:
+            if controller and controller.dispatch_preparing_snapshot():
+                controller.defer_recovery_retry()
+                controller.finish_dispatch_preparation()
+                self._audit_codex_app(
+                    controller,
+                    "dispatch_recovery_deferred",
+                    error_type=type(exc).__name__,
+                )
             post_slack_message(
                 self.config,
                 route,
                 f"Codex app control is unavailable: {exc}",
             )
+        finally:
+            operation_contexts.close()
         return True
 
     @staticmethod
@@ -15004,6 +17223,11 @@ class SlackSocketBot:
         message: dict[str, Any],
     ) -> None:
         try:
+            if not self._ensure_codex_app_controller_eligible(
+                controller,
+                reason="server-request-ineligible",
+            ):
+                return
             method = str(message.get("method") or "")
             params = message.get("params")
             if not isinstance(params, dict):
@@ -15014,6 +17238,49 @@ class SlackSocketBot:
                     "server_request_rejected",
                     request_method=method,
                     reason="thread-id-mismatch",
+                )
+                return
+            request_fingerprint = self._codex_app_server_request_fingerprint(
+                method,
+                params,
+            )
+            if self._persist_codex_app_recovery_handoff(
+                controller,
+                message.get("id"),
+                request_fingerprint,
+            ):
+                self._post_codex_app_controller_message(
+                    controller,
+                    "Codex needs a response while prior Slack input remains "
+                    "ambiguous. Handle it in Desktop; Slack preserved the "
+                    "input recovery record.",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "server_request_handoff",
+                    request_id=message.get("id"),
+                    request_method=str(message.get("method") or ""),
+                    reason="preparing-recovery-blocked",
+                )
+                return
+            if controller.desktop_required_snapshot():
+                self._persist_codex_app_desktop_request_id(
+                    controller,
+                    message.get("id"),
+                    method,
+                    params,
+                )
+                self._post_codex_app_controller_message(
+                    controller,
+                    "Codex has a request that must be resolved in Desktop. "
+                    "Slack did not answer or interrupt it.",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "server_request_handoff",
+                    request_id=message.get("id"),
+                    request_method=method,
+                    reason="desktop-required",
                 )
                 return
             safe_method = method in {
@@ -15031,16 +17298,26 @@ class SlackSocketBot:
                 )
             )
             if not safe_method and not safe_questions:
-                post_slack_message(
-                    self.config,
-                    controller.route,
-                    "Codex needs a permission, secret, MCP form, auth step, "
-                    "or unsupported client response. Handle it in Desktop; "
-                    "Slack did not answer or interrupt the turn.",
+                existing_request = bool(
+                    controller.pending_snapshot()
+                    or controller.pending_replay_snapshot()
                 )
+                if existing_request:
+                    controller.mark_desktop_required()
+                else:
+                    controller.mark_desktop_required(
+                        message.get("id"),
+                        request_fingerprint,
+                    )
                 self._record_codex_app_controller(
                     controller,
                     status="desktop-required",
+                )
+                self._post_codex_app_controller_message(
+                    controller,
+                    "Codex needs a permission, secret, MCP form, auth step, "
+                    "or unsupported client response. Handle it in Desktop; "
+                    "Slack did not answer or interrupt the turn.",
                 )
                 self._audit_codex_app(
                     controller,
@@ -15053,52 +17330,64 @@ class SlackSocketBot:
                 time.time()
                 + self.config.profile.codex_app_server_prompt_timeout_seconds
             )
-            try:
-                saved_jobs = (
-                    _read_codex_app_jobs(self.config.paths).get("jobs") or {}
-                )
-            except (OSError, UnicodeDecodeError, SlackbotError):
-                saved_jobs = {}
-            saved_job = saved_jobs.get(controller.route_key)
-            saved_pending = (
-                saved_job.get("pending_request")
-                if isinstance(saved_job, dict)
-                else None
-            )
+            saved_pending = controller.pending_replay_snapshot()
             request_turn_id = str(params.get("turnId") or "") or None
-            request_fingerprint = self._codex_app_server_request_fingerprint(
-                method,
-                params,
-            )
             recovered_replay = bool(
-                isinstance(saved_job, dict)
-                and saved_job.get("status") == "awaiting-request-replay"
-                and isinstance(saved_pending, dict)
+                isinstance(saved_pending, dict)
                 and saved_pending.get("method") == method
                 and request_turn_id
                 and saved_pending.get("turn_id") == request_turn_id
                 and saved_pending.get("request_fingerprint")
                 == request_fingerprint
-                and saved_pending.get("expires_at") is not None
             )
+            if saved_pending is not None and not recovered_replay:
+                controller.mark_desktop_required()
+                self._record_codex_app_controller(
+                    controller,
+                    status="desktop-required",
+                )
+                self._post_codex_app_controller_message(
+                    controller,
+                    "Codex issued a different request while Slack was "
+                    "restoring an earlier one. Handle the turn in Desktop; "
+                    "Slack did not answer or interrupt either request.",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "server_request_handoff",
+                    request_id=message.get("id"),
+                    request_method=method,
+                    reason="replay-request-mismatch",
+                )
+                return
             if recovered_replay:
                 try:
+                    recovered_expires_at = float(
+                        saved_pending.get("expires_at")
+                    )
+                    if not math.isfinite(recovered_expires_at):
+                        raise ValueError("non-finite recovery deadline")
                     expires_at = min(
                         expires_at,
-                        float(saved_pending["expires_at"]),
+                        recovered_expires_at,
                     )
                 except (TypeError, ValueError):
-                    pass
+                    expires_at = 0.0
             if expires_at <= time.time():
-                post_slack_message(
-                    self.config,
-                    controller.route,
-                    "The recovered Codex request already expired. No "
-                    "response or interrupt was sent; handle it in Desktop.",
+                if recovered_replay:
+                    controller.clear_pending_request_replay()
+                controller.mark_desktop_required(
+                    message.get("id"),
+                    request_fingerprint,
                 )
                 self._record_codex_app_controller(
                     controller,
                     status="desktop-required",
+                )
+                self._post_codex_app_controller_message(
+                    controller,
+                    "The recovered Codex request already expired. No "
+                    "response or interrupt was sent; handle it in Desktop.",
                 )
                 self._audit_codex_app(
                     controller,
@@ -15108,6 +17397,33 @@ class SlackSocketBot:
                     recovered=recovered_replay,
                 )
                 return
+            saved_delivery_state = (
+                str(saved_pending.get("slack_delivery_state") or "")
+                if recovered_replay
+                else ""
+            )
+            saved_client_msg_id = (
+                str(saved_pending.get("slack_client_msg_id") or "")
+                if recovered_replay
+                else ""
+            )
+            if recovered_replay:
+                delivery_state = (
+                    saved_delivery_state
+                    if saved_delivery_state
+                    in {"pending", "posting", "delivered"}
+                    and saved_client_msg_id
+                    else "posting"
+                )
+            else:
+                delivery_state = "pending"
+            slack_client_msg_id = saved_client_msg_id or (
+                self._codex_app_request_client_msg_id(
+                    controller,
+                    message.get("id"),
+                    request_fingerprint,
+                )
+            )
             pending = {
                 "request_id": message.get("id"),
                 "method": method,
@@ -15115,15 +17431,29 @@ class SlackSocketBot:
                 "expires_at": expires_at,
                 "request_fingerprint": request_fingerprint,
                 "questions": questions if safe_questions else None,
+                "slack_client_msg_id": slack_client_msg_id,
+                "slack_delivery_state": delivery_state,
+                "slack_message_ts": (
+                    saved_pending.get("slack_message_ts")
+                    if recovered_replay
+                    else None
+                ),
             }
             rendered_request = self._render_codex_app_server_request(
                 method,
                 params,
             )
-            if not controller.set_pending_request(pending):
-                post_slack_message(
-                    self.config,
-                    controller.route,
+            if not controller.set_pending_request(
+                pending,
+                replace_matching_replay=recovered_replay,
+            ):
+                controller.mark_desktop_required()
+                self._record_codex_app_controller(
+                    controller,
+                    status="desktop-required",
+                )
+                self._post_codex_app_controller_message(
+                    controller,
                     "Codex issued another request while Slack already has "
                     "one "
                     "pending. Handle the newer request in Desktop.",
@@ -15136,14 +17466,85 @@ class SlackSocketBot:
                     reason="another-request-pending",
                 )
                 return
+            self._record_codex_app_controller(
+                controller,
+                status="pending-request",
+            )
+            if recovered_replay and delivery_state == "posting":
+                controller.clear_pending_request(message.get("id"))
+                controller.mark_desktop_required(
+                    message.get("id"),
+                    request_fingerprint,
+                )
+                self._record_codex_app_controller(
+                    controller,
+                    status="desktop-required",
+                )
+                self._post_codex_app_controller_message(
+                    controller,
+                    "Codex reissued a request whose prior Slack delivery "
+                    "was ambiguous. Handle it in Desktop; Slack did not "
+                    "post a duplicate prompt.",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "server_request_handoff",
+                    request_id=message.get("id"),
+                    request_method=method,
+                    reason="slack-delivery-ambiguous",
+                )
+                return
+            if recovered_replay and delivery_state == "delivered":
+                self._audit_codex_app(
+                    controller,
+                    "server_request_relayed",
+                    request_id=message.get("id"),
+                    request_method=method,
+                    turn_id=pending["turn_id"],
+                    slack_delivery_reused=True,
+                )
+                return
+
+            def update_delivery_stage(stage: str) -> None:
+                if controller.update_pending_delivery(
+                    message.get("id"),
+                    stage,
+                ):
+                    self._record_codex_app_controller(
+                        controller,
+                        status="pending-request",
+                    )
+
             try:
-                post_slack_message(
-                    self.config,
-                    controller.route,
-                    rendered_request,
+                with (
+                    slack_single_message_policy(
+                        client_msg_id=slack_client_msg_id,
+                    ),
+                    slack_delivery_stage_policy(update_delivery_stage),
+                ):
+                    response = self._post_codex_app_controller_message(
+                        controller,
+                        rendered_request,
+                    )
+                controller.update_pending_delivery(
+                    message.get("id"),
+                    "delivered",
+                    message_ts=(
+                        str(response.get("ts") or "")
+                        if isinstance(response, dict)
+                        else None
+                    ),
+                )
+                self._record_codex_app_controller(
+                    controller,
+                    status="pending-request",
                 )
             except Exception:
                 controller.clear_pending_request(message.get("id"))
+                controller.mark_desktop_required(
+                    message.get("id"),
+                    request_fingerprint,
+                )
                 try:
                     self._record_codex_app_controller(
                         controller,
@@ -15169,10 +17570,6 @@ class SlackSocketBot:
                         f"Codex app-server handoff audit failed: {exc}",
                     )
                 raise
-            self._record_codex_app_controller(
-                controller,
-                status="pending-request",
-            )
             self._audit_codex_app(
                 controller,
                 "server_request_relayed",
@@ -15252,6 +17649,11 @@ class SlackSocketBot:
         message: dict[str, Any],
     ) -> None:
         try:
+            if not self._ensure_codex_app_controller_eligible(
+                controller,
+                reason="notification-ineligible",
+            ):
+                return
             method = str(message.get("method") or "")
             params = message.get("params")
             if not isinstance(params, dict):
@@ -15272,6 +17674,12 @@ class SlackSocketBot:
                     )
                     controller.thread_status = "active"
                     controller.terminal = False
+                    preserve_preparing = bool(
+                        controller.recovery_blocked
+                        or controller.dispatch_preparing
+                    )
+                if preserve_preparing:
+                    return
                 self._record_codex_app_controller(
                     controller,
                     status="active",
@@ -15284,6 +17692,10 @@ class SlackSocketBot:
                     else ""
                 )
                 with controller.lock:
+                    recovery_blocked = bool(
+                        controller.recovery_blocked
+                        or controller.dispatch_preparing
+                    )
                     active_turn_id = controller.active_turn_id
                     if active_turn_id and turn_id != active_turn_id:
                         self._audit_codex_app(
@@ -15295,9 +17707,21 @@ class SlackSocketBot:
                         return
                     controller.active_turn_id = None
                     controller.thread_status = "idle"
-                    controller.pending_request = None
-                    controller.pending_request_replay = None
                     controller.terminal = True
+                    if not recovery_blocked:
+                        controller.pending_request = None
+                        controller.pending_request_replay = None
+                        controller.desktop_required = False
+                        controller.desktop_request_id = None
+                        controller.desktop_request_ids = []
+                        controller.desktop_request_fingerprint = None
+                if recovery_blocked:
+                    self._audit_codex_app(
+                        controller,
+                        "preparing_recovery_completion_observed",
+                        turn_id=turn_id or None,
+                    )
+                    return
                 self._record_codex_app_controller(
                     controller,
                     status="completed",
@@ -15309,19 +17733,70 @@ class SlackSocketBot:
                 )
             elif method == "serverRequest/resolved":
                 request_id = params.get("requestId")
-                if (
-                    controller.clear_pending_request(request_id)
-                    or controller.clear_pending_request_replay()
-                ):
-                    self._record_codex_app_controller(
-                        controller,
-                        status="active",
+                with controller.lock:
+                    cleared_pending = controller.clear_pending_request(
+                        request_id
                     )
-                    post_slack_message(
-                        self.config,
-                        controller.route,
-                        "The pending Codex request was answered in Desktop; "
-                        "its Slack controls are now closed.",
+                    cleared_replay = (
+                        controller.clear_pending_request_replay_for_request(
+                            request_id
+                        )
+                    )
+                    cleared_desktop = (
+                        controller.clear_desktop_required_for_request(
+                            request_id
+                        )
+                    )
+                    cleared_handoff = self._clear_codex_app_recovery_handoff(
+                        controller,
+                        request_id,
+                    )
+                    resolved = (
+                        cleared_pending
+                        or cleared_replay
+                        or cleared_desktop
+                        or cleared_handoff
+                    )
+                    if resolved:
+                        self._record_codex_app_controller(
+                            controller,
+                            status=(
+                                "preparing"
+                                if controller.recovery_blocked
+                                else (
+                                    "desktop-required"
+                                    if controller.desktop_required
+                                    else (
+                                        "completed"
+                                        if controller.terminal
+                                        else "active"
+                                    )
+                                )
+                            ),
+                        )
+                if resolved:
+                    desktop_required = controller.desktop_required_snapshot()
+                    recovery_blocked = controller.recovery_blocked_snapshot()
+                    if desktop_required:
+                        resolution_text = (
+                            "A pending Codex request was answered in "
+                            "Desktop, but another request remains "
+                            "unresolved; Slack controls remain closed."
+                        )
+                    elif recovery_blocked:
+                        resolution_text = (
+                            "The pending Codex request was answered in "
+                            "Desktop, but Slack input recovery is still "
+                            "pending; controls remain closed."
+                        )
+                    else:
+                        resolution_text = (
+                            "The pending Codex request was answered in "
+                            "Desktop; Slack controls are available again."
+                        )
+                    self._post_codex_app_controller_message(
+                        controller,
+                        resolution_text,
                     )
             elif method == "thread/status/changed":
                 status = params.get("status")
@@ -15344,10 +17819,39 @@ class SlackSocketBot:
         error: BaseException | None,
     ) -> None:
         try:
-            self._record_codex_app_controller(
+            if not self._ensure_codex_app_controller_eligible(
                 controller,
-                status="disconnected",
-            )
+                reason="disconnect-ineligible",
+            ):
+                return
+            with controller.lock:
+                recovery_already_blocked = controller.recovery_blocked
+                dispatch_preparing = controller.dispatch_preparing
+                should_retry = bool(
+                    not controller.terminal
+                    or controller.pending_request
+                    or controller.pending_request_replay
+                    or controller.desktop_required
+                    or recovery_already_blocked
+                    or dispatch_preparing
+                )
+                if not recovery_already_blocked and not dispatch_preparing:
+                    self._record_codex_app_controller(
+                        controller,
+                        status=(
+                            "desktop-required"
+                            if controller.desktop_required
+                            else (
+                                "completed"
+                                if controller.terminal
+                                else "disconnected"
+                            )
+                        ),
+                    )
+                if should_retry and not recovery_already_blocked:
+                    controller.defer_recovery_retry(
+                        preserve_input=dispatch_preparing,
+                    )
             self._audit_codex_app(
                 controller,
                 "disconnect",
@@ -15364,68 +17868,228 @@ class SlackSocketBot:
     def _tick_codex_app_controllers(self) -> None:
         now = time.time()
         expired: list[CodexAppController] = []
+        recovery_expired: list[CodexAppController] = []
+        retryable: list[CodexAppController] = []
         removable: list[tuple[str, CodexAppController]] = []
+        with self.codex_app_controllers_lock:
+            controller_snapshot = list(self.codex_app_controllers.values())
+        for controller in controller_snapshot:
+            try:
+                self._ensure_codex_app_controller_eligible(
+                    controller,
+                    reason="periodic-eligibility-check",
+                )
+            except Exception as exc:
+                emit(
+                    self.out,
+                    "Codex app-server eligibility check failed: " f"{exc}",
+                )
         with self.codex_app_controllers_lock:
             for key, controller in self.codex_app_controllers.items():
                 if controller.expired(now):
-                    expired.append(controller)
-                    removable.append((key, controller))
-                elif controller.disconnected or (
-                    controller.terminal
-                    and not controller.pending_persistence_snapshot()
+                    if controller.recovery_blocked_snapshot():
+                        recovery_expired.append(controller)
+                    else:
+                        expired.append(controller)
+                elif controller.claim_recovery_retry(now):
+                    retryable.append(controller)
+                elif (
+                    not controller.recovery_blocked_snapshot()
+                    and not controller.dispatch_preparing_snapshot()
+                    and (
+                        controller.disconnected
+                        or (
+                            controller.terminal
+                            and not controller.pending_persistence_snapshot()
+                        )
+                    )
                 ):
                     removable.append((key, controller))
-            for key, controller in removable:
-                if self.codex_app_controllers.get(key) is controller:
-                    self.codex_app_controllers.pop(key, None)
-        for controller in expired:
+        for controller in retryable:
             try:
-                post_slack_message(
-                    self.config,
-                    controller.route,
-                    "The Codex Slack prompt expired. No response or "
-                    "interrupt was sent; answer it in Desktop.",
-                )
+                self._retry_codex_app_recovery(controller)
             except Exception as exc:
-                emit(
-                    self.out,
-                    "Codex app-server expiry notification failed: " f"{exc}",
-                )
-            try:
-                self._record_codex_app_controller(
-                    controller,
-                    status="desktop-required",
-                )
-            except Exception as exc:
-                emit(
-                    self.out,
-                    f"Codex app-server expiry state update failed: {exc}",
-                )
-            try:
-                self._audit_codex_app(
-                    controller,
-                    "request_expired",
-                    request_method=(
-                        (controller.pending_snapshot() or {}).get("method")
+                controller.defer_recovery_retry(
+                    preserve_input=(
+                        controller.recovery_input_blocked_snapshot()
                     ),
                 )
-            except Exception as exc:
                 emit(
                     self.out,
-                    f"Codex app-server expiry audit failed: {exc}",
+                    "Deferred Codex app-server recovery failed: " f"{exc}",
                 )
-        for _, controller in removable:
-            try:
-                controller.close()
-            except Exception as exc:
-                emit(
-                    self.out,
-                    f"Codex app-server controller cleanup failed: {exc}",
-                )
+        for controller in recovery_expired:
+            key = controller.route_key
+            with self._conversation_lock(f"codex-app:{key}"):
+                with self.codex_app_controllers_lock:
+                    if self.codex_app_controllers.get(key) is not controller:
+                        continue
+                with controller.lock:
+                    expired_pending = (
+                        controller.expire_pending_during_recovery(now)
+                    )
+                    if expired_pending is None:
+                        continue
+                    try:
+                        self._record_codex_app_controller(
+                            controller,
+                            status="preparing",
+                        )
+                    except Exception as exc:
+                        emit(
+                            self.out,
+                            "Codex app-server recovery expiry state update "
+                            f"failed: {exc}",
+                        )
+                    try:
+                        post_slack_message(
+                            self.config,
+                            controller.route,
+                            "The Codex Slack prompt expired. Handle the "
+                            "request in Desktop; Slack preserved the "
+                            "pending input recovery record.",
+                        )
+                    except Exception as exc:
+                        emit(
+                            self.out,
+                            "Codex app-server recovery expiry notification "
+                            f"failed: {exc}",
+                        )
+                try:
+                    self._audit_codex_app(
+                        controller,
+                        "request_expired",
+                        request_method=expired_pending.get("method"),
+                        recovery_blocked=True,
+                    )
+                except Exception as exc:
+                    emit(
+                        self.out,
+                        "Codex app-server recovery expiry audit failed: "
+                        f"{exc}",
+                    )
+        for controller in expired:
+            key = controller.route_key
+            with self._conversation_lock(f"codex-app:{key}"):
+                with self.codex_app_controllers_lock:
+                    if self.codex_app_controllers.get(key) is not controller:
+                        continue
+                with controller.lock:
+                    if controller.recovery_blocked or not controller.expired(
+                        now
+                    ):
+                        continue
+                    expired_pending = (
+                        controller.pending_persistence_snapshot() or {}
+                    )
+                    controller.mark_desktop_required(
+                        expired_pending.get("request_id"),
+                        expired_pending.get("request_fingerprint"),
+                    )
+                    try:
+                        self._record_codex_app_controller(
+                            controller,
+                            status="desktop-required",
+                        )
+                    except Exception as exc:
+                        emit(
+                            self.out,
+                            "Codex app-server expiry state update failed: "
+                            f"{exc}",
+                        )
+                    try:
+                        post_slack_message(
+                            self.config,
+                            controller.route,
+                            "The Codex Slack prompt expired. No response or "
+                            "interrupt was sent; answer it in Desktop.",
+                        )
+                    except Exception as exc:
+                        emit(
+                            self.out,
+                            "Codex app-server expiry notification failed: "
+                            f"{exc}",
+                        )
+                try:
+                    self._audit_codex_app(
+                        controller,
+                        "request_expired",
+                        request_method=expired_pending.get("method"),
+                    )
+                except Exception as exc:
+                    emit(
+                        self.out,
+                        f"Codex app-server expiry audit failed: {exc}",
+                    )
+        for key, controller in removable:
+            with self._conversation_lock(f"codex-app:{key}"):
+                remove_durable_job = False
+                with self.codex_app_controllers_lock:
+                    if self.codex_app_controllers.get(key) is not controller:
+                        continue
+                    with controller.lock:
+                        if (
+                            controller.recovery_blocked
+                            or controller.dispatch_preparing
+                            or not (
+                                controller.disconnected
+                                or (
+                                    controller.terminal
+                                    and not (
+                                        controller.pending_persistence_snapshot()
+                                    )
+                                )
+                            )
+                        ):
+                            continue
+                        remove_durable_job = bool(
+                            controller.terminal
+                            and not controller.pending_persistence_snapshot()
+                        )
+                        controller.invalidate()
+                        self.codex_app_controllers.pop(key, None)
+                try:
+                    controller.close()
+                except Exception as exc:
+                    emit(
+                        self.out,
+                        "Codex app-server controller cleanup failed: "
+                        f"{exc}",
+                    )
+                if remove_durable_job:
+                    try:
+                        _update_codex_app_job(self.config, key, None)
+                    except (OSError, SlackbotError) as exc:
+                        emit(
+                            self.out,
+                            "Codex app-server completed job cleanup failed: "
+                            f"{exc}",
+                        )
+        self._maybe_recover_deferred_codex_app_jobs(now)
+
+    def _maybe_recover_deferred_codex_app_jobs(self, now: float) -> None:
+        if (
+            not self.config.profile.codex_app_server_interaction_enabled
+            or now < self.codex_app_recovery_rescan_at
+        ):
+            return
+        limit = max(
+            1,
+            self.config.profile.codex_app_server_max_controllers,
+        )
+        with self.codex_app_controllers_lock:
+            if len(self.codex_app_controllers) >= limit:
+                return
+        self.codex_app_recovery_rescan_at = (
+            now + CODEX_APP_RECOVERY_RESCAN_SECONDS
+        )
+        self._recover_codex_app_jobs()
 
     def _close_codex_app_controllers(self) -> None:
         with self.codex_app_controllers_lock:
             controllers = list(self.codex_app_controllers.values())
+            for controller in controllers:
+                controller.invalidate()
             self.codex_app_controllers.clear()
         for controller in controllers:
             controller.close()

@@ -23,6 +23,7 @@ mcp = [
   "mcp>=1.27",
   "starlette>=0.37",
   "uvicorn>=0.30",
+  "websockets>=16,<17",
 ]
 dev = [
   "black>=26.3.1",
@@ -32,6 +33,7 @@ dev = [
   "ruff>=0.15.12",
   "starlette>=0.37",
   "uvicorn>=0.30",
+  "websockets>=16,<17",
 ]
 
 [project.scripts]

@@ -47,20 +47,25 @@ def test_console_user_fails_closed_without_configured_domain():
     assert exc_info.value.status_code == 403
 
 
-def test_console_unauthenticated_fallback_cannot_be_spoofed_by_header():
-    config = ConsoleConfig(allow_unauthenticated=True)
+def test_console_unauthenticated_fallback_preserves_proxy_authentication():
+    config = ConsoleConfig(
+        auth_email_domain="example.com",
+        admin_emails=("admin@example.com",),
+        allow_unauthenticated=True,
+    )
 
     fallback = user_from_headers(config, {})
     assert fallback.email == "anonymous"
     assert fallback.authenticated is False
+    assert fallback.can_write is False
 
-    with pytest.raises(ConsoleAuthError) as exc_info:
-        user_from_headers(
-            config,
-            {"x-auth-request-email": "anonymous"},
-        )
-
-    assert exc_info.value.status_code == 403
+    authenticated = user_from_headers(
+        config,
+        {"x-auth-request-email": "admin@example.com"},
+    )
+    assert authenticated.email == "admin@example.com"
+    assert authenticated.authenticated is True
+    assert authenticated.can_write is True
 
 
 def test_console_user_allows_matching_domain_viewer_and_admin():

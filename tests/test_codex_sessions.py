@@ -146,6 +146,38 @@ def test_exact_session_and_turn_resolve_from_codex_root(tmp_path):
     )
 
 
+def test_rollout_only_metadata_requires_matching_session_id(tmp_path):
+    codex_home = tmp_path / ".codex"
+    rollout_path = _write_session(
+        codex_home,
+        session_id="session-target",
+        source="vscode",
+    )
+    events = [
+        json.loads(line)
+        for line in rollout_path.read_text(encoding="utf-8").splitlines()
+    ]
+    events[0]["payload"].pop("id")
+    rollout_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (codex_home / "state_5.sqlite").unlink()
+
+    metadata = resolve_codex_session_metadata(
+        {
+            "session_id": "session-target",
+            "transcript_path": str(rollout_path),
+        },
+        environment={"CODEX_HOME": str(codex_home)},
+    )
+
+    assert metadata.verified is False
+    assert metadata.source is None
+    assert metadata.cwd is None
+    assert metadata.error == "transcript-session-mismatch"
+
+
 def test_roborev_exec_session_is_detected_from_codex_state(tmp_path):
     codex_home = tmp_path / ".codex"
     _write_session(
@@ -235,6 +267,27 @@ def test_noninteractive_exec_is_excluded_by_source_allowlist(tmp_path):
     assert not metadata.automated_review
     assert not decision.notify
     assert decision.reason == "session-source-not-allowed"
+
+
+def test_malformed_json_session_source_is_unverified(tmp_path):
+    codex_home = tmp_path / ".codex"
+    _write_session(
+        codex_home,
+        session_id="malformed-source",
+        source='{"subagent":',
+    )
+
+    metadata = resolve_codex_session_metadata(
+        {
+            "session_id": "malformed-source",
+            "turn_id": "turn-target",
+        },
+        environment={"CODEX_HOME": str(codex_home)},
+    )
+
+    assert metadata.verified is False
+    assert metadata.source is None
+    assert metadata.error == "unknown-session-source"
 
 
 def test_desktop_session_is_eligible_for_notification(tmp_path):
