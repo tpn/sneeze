@@ -660,6 +660,34 @@ def test_recovery_waits_for_fresh_pending_request_id(tmp_path, monkeypatch):
     assert posts
 
 
+def test_recovery_does_not_overwrite_freshly_reissued_request(tmp_path):
+    bot = _bot(tmp_path, notification_only=False)
+    controller = CodexAppController(
+        bot,
+        SlackbotRoute(channel_id="D111", thread_ts="1.000001"),
+        {
+            "kind": "codex_app_server",
+            "thread_id": "desktop-session",
+            "source": "vscode",
+            "cwd": "/workspace/exact",
+        },
+    )
+    fresh = {
+        "request_id": 99,
+        "method": "item/commandExecution/requestApproval",
+        "turn_id": "turn-one",
+        "expires_at": time.time() + 60,
+    }
+    persisted = {**fresh, "request_id": 42}
+    assert controller.set_pending_request(fresh) is True
+
+    status = controller.recover_pending_request(persisted)
+
+    assert status == "pending-request"
+    assert controller.pending_snapshot() == fresh
+    assert controller.pending_request_replay is None
+
+
 def test_stale_turn_completion_does_not_clear_newer_turn(
     tmp_path,
     monkeypatch,

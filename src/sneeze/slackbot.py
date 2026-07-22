@@ -10995,7 +10995,7 @@ class CodexAppController:
             self.pending_request_replay = None
             return True
 
-    def set_pending_request_replay(self, pending: dict[str, Any]) -> bool:
+    def recover_pending_request(self, pending: dict[str, Any]) -> str:
         replay = {
             "request_id": None,
             "method": pending.get("method"),
@@ -11004,9 +11004,9 @@ class CodexAppController:
         }
         with self.lock:
             if self.pending_request is not None:
-                return False
+                return "pending-request"
             self.pending_request_replay = replay
-            return True
+            return "awaiting-request-replay"
 
     def clear_pending_request(self, request_id: Any) -> bool:
         with self.lock:
@@ -14209,10 +14209,7 @@ class SlackSocketBot:
                 if expires_at >= 0 and (
                     not expires_at or expires_at > time.time()
                 ):
-                    if controller.pending_snapshot() is not None:
-                        status = "pending-request"
-                    elif controller.set_pending_request_replay(pending):
-                        status = "awaiting-request-replay"
+                    status = controller.recover_pending_request(pending)
                 else:
                     status = "desktop-required"
             self._record_codex_app_controller(
