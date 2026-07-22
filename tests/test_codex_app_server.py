@@ -82,6 +82,8 @@ class FakeControllerConnection:
         self.disconnect_handler = kwargs.get("disconnect_handler")
         self.connected = False
         self.active_turn_id = None
+        self.turn_items = []
+        self.turn_history = []
         self.requests = []
         self.responses = []
         self.closed = False
@@ -111,6 +113,8 @@ class FakeControllerConnection:
                 }
             }
         if method == "thread/turns/list":
+            if self.turn_history:
+                return {"data": list(self.turn_history)}
             if not self.active_turn_id:
                 return {"data": []}
             return {
@@ -118,7 +122,7 @@ class FakeControllerConnection:
                     {
                         "id": self.active_turn_id,
                         "status": "inProgress",
-                        "items": [],
+                        "items": list(self.turn_items),
                     }
                 ]
             }
@@ -537,6 +541,134 @@ def test_controller_resumes_exact_thread_and_starts_then_steers(
         method == "turn/steer" and params["expectedTurnId"] == "turn-started"
         for method, params in connection.requests
     )
+
+
+@pytest.mark.parametrize(
+    "recovery_method",
+    (
+        "recover_start_turn",
+        "recover_steer",
+    ),
+)
+def test_recovered_input_reuses_existing_client_id_without_dispatch(
+    tmp_path,
+    monkeypatch,
+    recovery_method,
+):
+    FakeControllerConnection.instances.clear()
+    bot = _bot(tmp_path, notification_only=False)
+    monkeypatch.setattr(
+        slackbot_module,
+        "CodexAppServerConnection",
+        FakeControllerConnection,
+    )
+    controller = CodexAppController(
+        bot,
+        SlackbotRoute(channel_id="D111", thread_ts="1.000001"),
+        {
+            "kind": "codex_app_server",
+            "thread_id": "desktop-session",
+            "source": "vscode",
+            "cwd": "/workspace/exact",
+        },
+    )
+    controller.connect()
+    connection = FakeControllerConnection.instances[-1]
+    if recovery_method == "recover_start_turn":
+        connection.turn_history = [
+            {
+                "id": "turn-existing",
+                "status": "completed",
+                "items": [
+                    {
+                        "type": "userMessage",
+                        "clientId": "client-one",
+                    }
+                ],
+            }
+        ]
+    else:
+        connection.active_turn_id = "turn-existing"
+        connection.turn_items = [
+            {
+                "type": "userMessage",
+                "clientId": "client-one",
+            }
+        ]
+
+    turn_id = getattr(controller, recovery_method)("continue", "client-one")
+
+    assert turn_id == "turn-existing"
+    assert controller.last_action_reused is True
+    dispatches = [
+        method
+        for method, _ in connection.requests
+        if method in {"turn/start", "turn/steer"}
+    ]
+    assert dispatches == []
+
+
+@pytest.mark.parametrize(
+    ("recovery_method", "dispatch_method", "needs_active_turn"),
+    (
+        ("recover_start_turn", "turn/start", False),
+        ("recover_steer", "turn/steer", True),
+    ),
+)
+def test_recovered_input_missing_client_id_dispatches_once(
+    tmp_path,
+    monkeypatch,
+    recovery_method,
+    dispatch_method,
+    needs_active_turn,
+):
+    FakeControllerConnection.instances.clear()
+    bot = _bot(tmp_path, notification_only=False)
+    monkeypatch.setattr(
+        slackbot_module,
+        "CodexAppServerConnection",
+        FakeControllerConnection,
+    )
+    controller = CodexAppController(
+        bot,
+        SlackbotRoute(channel_id="D111", thread_ts="1.000001"),
+        {
+            "kind": "codex_app_server",
+            "thread_id": "desktop-session",
+            "source": "vscode",
+            "cwd": "/workspace/exact",
+        },
+    )
+    controller.connect()
+    connection = FakeControllerConnection.instances[-1]
+    if needs_active_turn:
+        connection.active_turn_id = "turn-existing"
+        history_status = "inProgress"
+        history_turn_id = "turn-existing"
+    else:
+        history_status = "completed"
+        history_turn_id = "turn-completed"
+    connection.turn_history = [
+        {
+            "id": history_turn_id,
+            "status": history_status,
+            "items": [
+                {
+                    "type": "userMessage",
+                    "clientId": "client-other",
+                }
+            ],
+        }
+    ]
+
+    getattr(controller, recovery_method)("continue", "client-missing")
+
+    dispatches = [
+        method
+        for method, _ in connection.requests
+        if method in {"turn/start", "turn/steer"}
+    ]
+    assert dispatches == [dispatch_method]
 
 
 def test_controller_closes_connection_when_initial_refresh_fails(
