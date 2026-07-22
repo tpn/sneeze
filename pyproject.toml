@@ -17,6 +17,7 @@ dependencies = []
 [project.optional-dependencies]
 slackbot = [
   "slack-sdk>=3.30",
+  "websockets>=16,<17",
 ]
 mcp = [
   "mcp>=1.27",

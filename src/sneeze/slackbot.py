@@ -31,7 +31,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .codex_app_server import (
+    CodexAppServerConnection,
+    CodexAppServerError,
+    CodexAppServerProtocolError,
+    codex_app_server_socket_path,
+    start_codex_app_server_daemon,
+    validate_codex_app_server_socket,
+)
+from .codex_sessions import (
+    CodexSessionMetadata,
+    resolve_codex_hook_message,
+    resolve_codex_session_metadata,
+)
 from .console import (
+    DEFAULT_AUTH_EMAIL_DOMAIN,
     DEFAULT_CONSOLE_ROOT_PATH,
     DEFAULT_TMUX_SOCKET,
     normalize_root_path,
@@ -179,7 +193,13 @@ AGENT_TMUX_BINDING_KEYS = (
 AGENT_TMUX_ROUTE_TOMBSTONE_MAX_AGE_SECONDS = 30 * 86400.0
 AGENT_TMUX_ROUTE_TOMBSTONE_MAX_ENTRIES = 4096
 AGENT_CODEX_HOOK_STATE_FILENAME = "agent-codex-hooks.json"
+AGENT_CODEX_APP_JOBS_FILENAME = "agent-codex-app-jobs.json"
 AGENT_CODEX_HOOK_NOTIFY_USER_KEY = "AGENT_NOTIFY_SLACK_USER_ID"
+AGENT_CODEX_HOOK_ORIGIN_ENV = "SNEEZE_CODEX_ORIGIN"
+AGENT_CODEX_HOOK_NOTIFY_ENV = "SNEEZE_CODEX_STOP_NOTIFY"
+AGENT_CODEX_HOOK_SLACK_ORIGIN = "slack"
+AGENT_CODEX_HOOK_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+AGENT_CODEX_HOOK_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 AGENT_CODEX_HOOK_DELIVERY_LOCK_TIMEOUT_SECONDS = 10.0
 AGENT_CODEX_HOOK_DELIVERY_LOCK_BUCKETS = 4096
 AGENT_CODEX_HOOK_SESSIONLESS_DEDUPE_SECONDS = 120.0
@@ -443,6 +463,17 @@ class SlackbotProfile:
     default_codex_tmux_socket: str | None = None
     default_codex_tmux_conf: str | None = None
     default_codex_tmux_lifecycle: str = "ephemeral"
+    codex_stop_notify_sources: tuple[str, ...] | None = None
+    codex_app_server_interaction_enabled: bool = False
+    default_codex_app_server_socket: str | None = None
+    codex_app_server_interaction_sources: tuple[str, ...] = ()
+    codex_app_server_auto_start: bool = False
+    codex_app_server_prompt_timeout_seconds: float = 900.0
+    codex_app_server_max_controllers: int = 2
+    default_console_root_path: str = DEFAULT_CONSOLE_ROOT_PATH
+    default_console_tmux_socket: str = DEFAULT_TMUX_SOCKET
+    default_console_auth_email_domain: str = DEFAULT_AUTH_EMAIL_DOMAIN
+    default_console_label: str = "Console"
     known_collaborator_user_ids: tuple[str, ...] = ()
     codex_progress_update_seconds: float | None = None
     contextual_codex_timeout_seconds: float = 120.0
@@ -543,6 +574,16 @@ class SlackbotIngressPayload:
     slack_user_id: str | None = None
     system_scoped: bool | None = None
     created_at: str = ""
+
+
+@dataclass(frozen=True)
+class CodexStopNotificationDecision:
+    notify: bool
+    reason: str
+    source: str | None = None
+    origin: str | None = None
+    metadata_verified: bool = False
+    metadata_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2559,6 +2600,73 @@ def render_diagnostic_results(
     return "\n".join(lines)
 
 
+def query_codex_app_server_status(
+    config: SlackbotConfig,
+) -> dict[str, Any]:
+    profile = config.profile
+    socket_path = codex_app_server_socket_path(
+        profile.default_codex_app_server_socket,
+        environment={**config.env, **os.environ},
+    )
+    result: dict[str, Any] = {
+        "enabled": profile.codex_app_server_interaction_enabled,
+        "socket_path": socket_path,
+        "auto_start": profile.codex_app_server_auto_start,
+        "interaction_sources": list(
+            profile.codex_app_server_interaction_sources
+        ),
+        "max_controllers": profile.codex_app_server_max_controllers,
+    }
+    try:
+        jobs = _read_codex_app_jobs(config.paths).get("jobs") or {}
+    except (OSError, UnicodeDecodeError, SlackbotError) as exc:
+        result["jobs_error"] = str(exc)
+    else:
+        result["saved_jobs"] = len(jobs)
+        result["active_saved_jobs"] = sum(
+            1
+            for job in jobs.values()
+            if isinstance(job, dict)
+            and job.get("status")
+            in {
+                "active",
+                "connected",
+                "disconnected",
+                "interrupting",
+                "pending-request",
+                "preparing",
+            }
+        )
+    if not profile.codex_app_server_interaction_enabled:
+        result["status"] = "disabled"
+        return result
+    try:
+        validate_codex_app_server_socket(socket_path)
+    except CodexAppServerError as exc:
+        result["status"] = "unavailable"
+        result["error"] = str(exc)
+        return result
+    connection = CodexAppServerConnection(
+        socket_path,
+        client_name="sneeze_slackbot_status",
+        client_title="Sneeze Slackbot Status",
+        client_version="0.1",
+        request_timeout_seconds=2.0,
+    )
+    try:
+        connection.connect()
+    except CodexAppServerError as exc:
+        result["status"] = "unavailable"
+        result["error"] = str(exc)
+    else:
+        result["status"] = "ready"
+        result["codex_home"] = connection.codex_home or ""
+        result["user_agent"] = connection.user_agent or ""
+    finally:
+        connection.close()
+    return result
+
+
 def query_status(
     profile: SlackbotProfile,
     *,
@@ -2609,6 +2717,7 @@ def query_status(
             "trusted_channel_ids"
         ],
         "effective_codex_policy": effective_codex_policy(config),
+        "codex_app_server": query_codex_app_server_status(config),
     }
     if config.bot_token:
         try:
@@ -3707,7 +3816,7 @@ def slackbot_console_url(config: SlackbotConfig) -> str | None:
             config.profile,
             config.env,
             "CONSOLE_ROOT_PATH",
-            DEFAULT_CONSOLE_ROOT_PATH,
+            config.profile.default_console_root_path,
         )
     )
     return base.rstrip("/") + root_path + "/"
@@ -3721,7 +3830,7 @@ def slackbot_working_text(
     url = slackbot_console_url(config) if include_console else None
     if not url:
         return "Working..."
-    return f"Working...\n\nSneeze console: {url}"
+    return f"Working...\n\n{config.profile.default_console_label}: {url}"
 
 
 def slackbot_progress_text(
@@ -3742,7 +3851,7 @@ def slackbot_progress_text(
     )
     url = slackbot_console_url(config) if include_console else None
     if url:
-        text += f"\n\nSneeze console: {url}"
+        text += f"\n\n{config.profile.default_console_label}: {url}"
     return text
 
 
@@ -5171,6 +5280,27 @@ class CodexRunner:
             args.extend(["-o", output_path, "-"])
         return args
 
+    def _child_env(
+        self,
+        extra_env: dict[str, str] | None,
+        *,
+        scrub_secret_env: bool,
+        use_scrub_allowlist: bool,
+    ) -> dict[str, str]:
+        child_env = dict(extra_env or {})
+        child_env.update(
+            {
+                AGENT_CODEX_HOOK_ORIGIN_ENV: AGENT_CODEX_HOOK_SLACK_ORIGIN,
+                AGENT_CODEX_HOOK_NOTIFY_ENV: "0",
+            }
+        )
+        return merge_child_process_env(
+            self.config,
+            child_env,
+            scrub_secret_env=scrub_secret_env,
+            use_scrub_allowlist=use_scrub_allowlist,
+        )
+
     def run(
         self,
         prompt: str,
@@ -5203,8 +5333,7 @@ class CodexRunner:
             proc = subprocess.run(
                 args,
                 input=prompt,
-                env=merge_child_process_env(
-                    self.config,
+                env=self._child_env(
                     extra_env,
                     scrub_secret_env=scrub_secret_env,
                     use_scrub_allowlist=use_scrub_allowlist,
@@ -5657,8 +5786,7 @@ class CodexRunner:
         status_path = run_dir / "status.txt"
         script_path = run_dir / "run.sh"
         write_text(prompt_path, prompt, mode=0o600)
-        child_env = merge_child_process_env(
-            self.config,
+        child_env = self._child_env(
             extra_env,
             scrub_secret_env=scrub_secret_env,
             use_scrub_allowlist=use_scrub_allowlist,
@@ -6224,6 +6352,45 @@ def agent_tmux_target(
 
 def agent_codex_hook_state_path(paths: SlackbotPaths) -> str:
     return str(Path(paths.state_dir) / AGENT_CODEX_HOOK_STATE_FILENAME)
+
+
+def agent_codex_app_jobs_path(paths: SlackbotPaths) -> str:
+    return str(Path(paths.state_dir) / AGENT_CODEX_APP_JOBS_FILENAME)
+
+
+def _read_codex_app_jobs(paths: SlackbotPaths) -> dict[str, Any]:
+    data = read_json(agent_codex_app_jobs_path(paths), {})
+    if not isinstance(data, dict):
+        raise SlackbotError("Codex app-server job state must be an object")
+    jobs = data.get("jobs")
+    if not isinstance(jobs, dict):
+        jobs = {}
+    return {"version": 1, "jobs": jobs}
+
+
+def _update_codex_app_job(
+    config: SlackbotConfig,
+    key: str,
+    value: dict[str, Any] | None,
+) -> None:
+    path = agent_codex_app_jobs_path(config.paths)
+    with locked_json_path(path):
+        data = _read_codex_app_jobs(config.paths)
+        jobs = data["jobs"]
+        if value is None:
+            jobs.pop(key, None)
+        else:
+            current = jobs.get(key)
+            if isinstance(current, dict):
+                value = dict(value)
+                for field_name in (
+                    "client_message_id",
+                    "text_sha256",
+                ):
+                    if value.get(field_name) is None:
+                        value[field_name] = current.get(field_name)
+            jobs[key] = value
+        write_json_atomic(path, data)
 
 
 def _tmux_socket_args(socket_name: str | None) -> list[str]:
@@ -7612,10 +7779,185 @@ def _codex_hook_text_value(
     return text or None
 
 
-def _codex_hook_message_text(payload: dict[str, Any]) -> str:
+def _codex_hook_message_text(
+    payload: dict[str, Any],
+    metadata: CodexSessionMetadata | None = None,
+) -> str:
+    if metadata is None:
+        metadata = resolve_codex_session_metadata(payload)
     return (
-        _codex_hook_text_value(payload, "last_assistant_message")
-        or "(no assistant message in hook input)"
+        resolve_codex_hook_message(payload, metadata)
+        or "(Codex completed without a recoverable final message.)"
+    )
+
+
+def _codex_hook_message_is_ui_directive(message: str) -> bool:
+    lines = [line.strip() for line in message.splitlines() if line.strip()]
+    return bool(lines) and all(
+        re.fullmatch(r"::[A-Za-z0-9_-]+\{.*\}", line) for line in lines
+    )
+
+
+def _codex_hook_notify_override(
+    environment: dict[str, str],
+) -> tuple[bool | None, bool]:
+    raw_value = environment.get(AGENT_CODEX_HOOK_NOTIFY_ENV)
+    if raw_value is None or not raw_value.strip():
+        return None, True
+    value = raw_value.strip().lower()
+    if value in AGENT_CODEX_HOOK_TRUE_VALUES:
+        return True, True
+    if value in AGENT_CODEX_HOOK_FALSE_VALUES:
+        return False, True
+    return None, False
+
+
+def decide_codex_stop_notification(
+    profile: SlackbotProfile,
+    payload: dict[str, Any],
+    *,
+    environment: dict[str, str] | None = None,
+    metadata: CodexSessionMetadata | None = None,
+) -> CodexStopNotificationDecision:
+    environment = os.environ if environment is None else environment
+    origin = str(environment.get(AGENT_CODEX_HOOK_ORIGIN_ENV) or "").strip()
+    hook_event_name = _codex_hook_text_value(payload, "hook_event_name")
+    if hook_event_name and hook_event_name != "Stop":
+        return CodexStopNotificationDecision(
+            False,
+            "unexpected-hook-event",
+            origin=origin or None,
+        )
+    override, override_valid = _codex_hook_notify_override(environment)
+    if not override_valid:
+        return CodexStopNotificationDecision(
+            False,
+            "invalid-environment-override",
+            origin=origin or None,
+        )
+    if origin.lower() == AGENT_CODEX_HOOK_SLACK_ORIGIN:
+        return CodexStopNotificationDecision(
+            False,
+            "origin-already-delivers",
+            origin=origin,
+        )
+    if override is False:
+        return CodexStopNotificationDecision(
+            False,
+            "disabled-by-environment",
+            origin=origin or None,
+        )
+    metadata = metadata or resolve_codex_session_metadata(
+        payload,
+        environment=environment,
+    )
+    message = _codex_hook_message_text(payload, metadata)
+    if _codex_hook_message_is_ui_directive(message):
+        return CodexStopNotificationDecision(
+            False,
+            "ui-directive-only",
+            source=metadata.source,
+            origin=origin or None,
+            metadata_verified=metadata.verified,
+            metadata_error=metadata.error,
+        )
+    if metadata.verified and (
+        metadata.source == "subagent"
+        or metadata.thread_source == "subagent"
+        or metadata.parent_thread_id
+    ):
+        return CodexStopNotificationDecision(
+            False,
+            "subagent-session",
+            source=metadata.source,
+            origin=origin or None,
+            metadata_verified=True,
+        )
+    if metadata.verified and (
+        metadata.automated_review
+        or metadata.review_turn
+        or metadata.thread_source == "review"
+    ):
+        return CodexStopNotificationDecision(
+            False,
+            "automated-review-session",
+            source=metadata.source,
+            origin=origin or None,
+            metadata_verified=True,
+        )
+    if override is True:
+        return CodexStopNotificationDecision(
+            True,
+            "enabled-by-environment",
+            source=metadata.source,
+            origin=origin or None,
+            metadata_verified=metadata.verified,
+            metadata_error=metadata.error,
+        )
+    allowed_sources = profile.codex_stop_notify_sources
+    if allowed_sources is None:
+        return CodexStopNotificationDecision(
+            True,
+            "profile-unrestricted",
+            source=metadata.source,
+            origin=origin or None,
+            metadata_verified=metadata.verified,
+            metadata_error=metadata.error,
+        )
+    if not metadata.verified:
+        return CodexStopNotificationDecision(
+            True,
+            "metadata-unavailable-fail-open",
+            source=metadata.source,
+            origin=origin or None,
+            metadata_verified=False,
+            metadata_error=metadata.error,
+        )
+    normalized_sources = {
+        str(item).strip().lower()
+        for item in allowed_sources
+        if str(item).strip()
+    }
+    if metadata.source not in normalized_sources:
+        return CodexStopNotificationDecision(
+            False,
+            "session-source-not-allowed",
+            source=metadata.source,
+            origin=origin or None,
+            metadata_verified=True,
+        )
+    return CodexStopNotificationDecision(
+        True,
+        "interactive-session",
+        source=metadata.source,
+        origin=origin or None,
+        metadata_verified=True,
+    )
+
+
+def _audit_codex_stop_notification_decision(
+    config: SlackbotConfig,
+    payload: dict[str, Any],
+    decision: CodexStopNotificationDecision,
+    message: str,
+) -> None:
+    _append_slackbot_audit_event_best_effort(
+        config,
+        {
+            "kind": "codex_stop_notification",
+            "status": "eligible" if decision.notify else "skipped",
+            "reason": decision.reason,
+            "source": decision.source,
+            "origin": decision.origin,
+            "metadata_verified": decision.metadata_verified,
+            "metadata_error": decision.metadata_error,
+            "session_id": _codex_hook_text_value(payload, "session_id"),
+            "turn_id": _codex_hook_text_value(payload, "turn_id"),
+            "hook_event_name": _codex_hook_text_value(
+                payload, "hook_event_name"
+            ),
+            "message_sha256": _codex_hook_message_hash(message),
+        },
     )
 
 
@@ -8504,8 +8846,10 @@ def _render_codex_stop_notification(
     message: str,
     *,
     first_message: bool,
+    app_server_candidate: dict[str, Any] | None = None,
+    metadata_error: str | None = None,
 ) -> str:
-    lines = ["Codex stopped and is waiting for input."]
+    lines = ["Codex turn finished."]
     session_id = _codex_hook_text_value(payload, "session_id")
     turn_id = _codex_hook_text_value(payload, "turn_id")
     cwd = _codex_hook_text_value(payload, "cwd")
@@ -8533,13 +8877,54 @@ def _render_codex_stop_notification(
             "when it is idle. status, tail, p, n, and cancel "
             "keep their tmux controls."
         )
+    elif first_message and app_server_candidate:
+        lines.append(
+            "Reply in this thread to continue the exact Codex session. "
+            "Use status, steer <text>, cancel, or help for app controls."
+        )
     elif first_message:
         lines.append(
-            "No tmux pane was resolved. This notification is read-only."
+            "No interactive transport was verified. This notification is "
+            "read-only."
         )
+    if metadata_error:
+        lines.append(f"Codex metadata lookup degraded: {metadata_error}.")
     lines.append("")
     lines.append(message)
     return "\n".join(lines)
+
+
+def _codex_app_server_candidate(
+    profile: SlackbotProfile,
+    metadata: CodexSessionMetadata,
+    decision: CodexStopNotificationDecision,
+) -> dict[str, Any] | None:
+    if (
+        not profile.codex_app_server_interaction_enabled
+        or not decision.notify
+        or not decision.metadata_verified
+        or not metadata.session_id
+        or metadata.parent_thread_id
+        or metadata.thread_source in {"review", "subagent"}
+        or metadata.review_turn
+        or metadata.automated_review
+    ):
+        return None
+    allowed_sources = {
+        str(item).strip().lower()
+        for item in profile.codex_app_server_interaction_sources
+        if str(item).strip()
+    }
+    if metadata.source not in allowed_sources:
+        return None
+    return {
+        "kind": "codex_app_server",
+        "thread_id": metadata.session_id,
+        "session_id": metadata.session_id,
+        "source": metadata.source,
+        "cwd": metadata.cwd,
+        "verified_at": utcnow_iso(),
+    }
 
 
 def _codex_hook_matching_notification(
@@ -8742,6 +9127,36 @@ def notify_codex_agent_stop(
         unit_name=unit_name,
         allow_missing_tokens=True,
     )
+    hook_environment = {**config.env, **os.environ}
+    metadata = resolve_codex_session_metadata(
+        payload,
+        environment=hook_environment,
+    )
+    message = _codex_hook_message_text(payload, metadata)
+    decision = decide_codex_stop_notification(
+        profile,
+        payload,
+        environment=hook_environment,
+        metadata=metadata,
+    )
+    _audit_codex_stop_notification_decision(
+        config,
+        payload,
+        decision,
+        message,
+    )
+    if not decision.notify:
+        return {
+            "status": "skipped",
+            "reason": decision.reason,
+            "source": decision.source,
+            "origin": decision.origin,
+        }
+    app_server_candidate = _codex_app_server_candidate(
+        profile,
+        metadata,
+        decision,
+    )
     notify_user_id = env_lookup(
         profile,
         config.env,
@@ -8821,7 +9236,6 @@ def notify_codex_agent_stop(
     else:
         desired_key = _codex_hook_state_key(payload, binding)
     turn_id = _codex_hook_text_value(payload, "turn_id")
-    message = _codex_hook_message_text(payload)
     message_hash = _codex_hook_message_hash(message)
     state_path = agent_codex_hook_state_path(config.paths)
     fallback_key = (
@@ -9202,6 +9616,8 @@ def notify_codex_agent_stop(
                             binding,
                             message,
                             first_message=first_message,
+                            app_server_candidate=app_server_candidate,
+                            metadata_error=decision.metadata_error,
                         ),
                     )
             except Exception as exc:
@@ -9236,6 +9652,7 @@ def notify_codex_agent_stop(
                 "turn_id": turn_id,
                 "message_sha256": message_hash,
                 "tmux_binding": binding,
+                "codex_app_server": app_server_candidate,
                 "transcript_path": transcript_path,
                 "binding_observed_revision": binding_observed_revision,
                 "binding_observed_at": binding_observed_at,
@@ -9403,6 +9820,8 @@ def notify_codex_agent_stop(
                 _replace_codex_hook_entry_binding(entry, binding)
             elif binding_restore_rejected:
                 _clear_codex_hook_entry_binding(entry)
+            if app_server_candidate:
+                entry["codex_app_server"] = app_server_candidate
             sessions[key] = entry
             write_json_atomic(state_path, state)
         if receipt_write_error is not None:
@@ -9425,6 +9844,7 @@ def notify_codex_agent_stop(
         "channel_id": channel_id,
         "thread_ts": thread_ts,
         "tmux_binding": binding,
+        "codex_app_server": app_server_candidate,
     }
 
 
@@ -10202,8 +10622,7 @@ def render_tmux_codex_script(
             ),
             "status=$?",
             f"printf '%s\\n' \"$status\" > {shlex.quote(str(status_path))}",
-            "printf '\\nSneeze Codex job finished with status %s.\\n' "
-            '"$status"',
+            "printf '\\nCodex job finished with status %s.\\n' " '"$status"',
         ]
     )
     if lifecycle == "persistent":
@@ -10331,6 +10750,385 @@ def strip_bot_mentions(text: str, bot_user_id: str | None = None) -> str:
     return result.rstrip()
 
 
+class CodexAppController:
+    def __init__(
+        self,
+        bot: Any,
+        route: SlackbotRoute,
+        binding: dict[str, Any],
+    ):
+        self.bot = bot
+        self.route = route
+        self.binding = dict(binding)
+        self.thread_id = str(binding.get("thread_id") or "")
+        self.route_key = agent_tmux_thread_key(
+            str(route.channel_id or ""),
+            str(route.thread_ts or ""),
+        )
+        self.connection: CodexAppServerConnection | None = None
+        self.lock = threading.RLock()
+        self.thread_status = "unknown"
+        self.active_turn_id: str | None = None
+        self.pending_request: dict[str, Any] | None = None
+        self.terminal = False
+        self.disconnected = False
+        self.last_action_reused = False
+
+    def connect(self) -> None:
+        socket_path = self.bot._codex_app_server_socket()
+        connection = CodexAppServerConnection(
+            socket_path,
+            client_name="sneeze_slackbot",
+            client_title="Sneeze Slackbot",
+            client_version="0.1",
+            notification_handler=self._handle_notification,
+            server_request_handler=self._handle_server_request,
+            disconnect_handler=self._handle_disconnect,
+        )
+        connection.connect()
+        try:
+            read_result = connection.request(
+                "thread/read",
+                {"threadId": self.thread_id, "includeTurns": False},
+            )
+            thread = self._result_thread(read_result)
+            self._verify_thread(thread)
+            resume_result = connection.request(
+                "thread/resume",
+                {"threadId": self.thread_id, "excludeTurns": True},
+            )
+            resumed_thread = self._result_thread(resume_result)
+            self._verify_thread(resumed_thread)
+        except Exception:
+            connection.close()
+            raise
+        with self.lock:
+            self.connection = connection
+            self.disconnected = False
+        try:
+            self.refresh()
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        with self.lock:
+            connection = self.connection
+            self.connection = None
+        if connection is not None:
+            connection.close()
+
+    def refresh(self) -> dict[str, Any]:
+        connection = self._connection()
+        result = connection.request(
+            "thread/read",
+            {"threadId": self.thread_id, "includeTurns": False},
+        )
+        thread = self._result_thread(result)
+        self._verify_thread(thread)
+        status = thread.get("status")
+        status_type = (
+            str(status.get("type") or "unknown")
+            if isinstance(status, dict)
+            else str(status or "unknown")
+        )
+        latest_turn = self._latest_turn(connection)
+        active_turn_id = None
+        if latest_turn and str(latest_turn.get("status") or "").lower() in {
+            "inprogress",
+            "in_progress",
+        }:
+            active_turn_id = str(latest_turn.get("id") or "") or None
+        with self.lock:
+            self.thread_status = status_type
+            self.active_turn_id = active_turn_id
+            self.terminal = active_turn_id is None and status_type in {
+                "idle",
+                "notLoaded",
+            }
+        return thread
+
+    def start_turn(self, text: str, client_message_id: str) -> str:
+        self.refresh()
+        with self.lock:
+            if self.active_turn_id:
+                raise SlackbotError(
+                    "The Codex thread is active. Use `steer <text>` to add "
+                    "input to its current turn."
+                )
+            self.last_action_reused = False
+        connection = self._connection()
+        params = {
+            "threadId": self.thread_id,
+            "input": [{"type": "text", "text": text}],
+            "clientUserMessageId": client_message_id,
+        }
+        try:
+            result = connection.request("turn/start", params)
+        except CodexAppServerError:
+            recovered_turn = self._turn_for_client_id(
+                connection,
+                client_message_id,
+            )
+            if recovered_turn is None:
+                raise
+            turn_id = str(recovered_turn.get("id") or "")
+            with self.lock:
+                self.last_action_reused = True
+        else:
+            turn = result.get("turn")
+            turn_id = (
+                str(turn.get("id") or "") if isinstance(turn, dict) else ""
+            )
+        if not turn_id:
+            raise CodexAppServerProtocolError(
+                "turn/start returned no turn identifier"
+            )
+        with self.lock:
+            self.active_turn_id = turn_id
+            self.thread_status = "active"
+            self.terminal = False
+        return turn_id
+
+    def steer(self, text: str, client_message_id: str) -> str:
+        self.refresh()
+        with self.lock:
+            turn_id = self.active_turn_id
+        if not turn_id:
+            raise SlackbotError(
+                "The Codex thread has no active turn to steer."
+            )
+        connection = self._connection()
+        with self.lock:
+            self.last_action_reused = False
+        try:
+            result = connection.request(
+                "turn/steer",
+                {
+                    "threadId": self.thread_id,
+                    "expectedTurnId": turn_id,
+                    "input": [{"type": "text", "text": text}],
+                    "clientUserMessageId": client_message_id,
+                },
+            )
+        except CodexAppServerError:
+            recovered_turn = self._turn_for_client_id(
+                connection,
+                client_message_id,
+            )
+            recovered_turn_id = (
+                str(recovered_turn.get("id") or "")
+                if recovered_turn is not None
+                else ""
+            )
+            if recovered_turn_id != turn_id:
+                raise
+            with self.lock:
+                self.last_action_reused = True
+            return turn_id
+        returned_turn_id = str(result.get("turnId") or turn_id)
+        if returned_turn_id != turn_id:
+            raise CodexAppServerProtocolError(
+                "turn/steer returned a different active turn"
+            )
+        return turn_id
+
+    def interrupt(self) -> str:
+        self.refresh()
+        with self.lock:
+            turn_id = self.active_turn_id
+        if not turn_id:
+            raise SlackbotError("The Codex thread has no active turn.")
+        self._connection().request(
+            "turn/interrupt",
+            {"threadId": self.thread_id, "turnId": turn_id},
+        )
+        return turn_id
+
+    def respond(self, result: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            pending = dict(self.pending_request or {})
+        if not pending:
+            raise SlackbotError("There is no pending Codex request.")
+        expires_at = float(pending.get("expires_at") or 0)
+        if expires_at and time.time() >= expires_at:
+            raise SlackbotError(
+                "That Slack prompt expired; answer it in Desktop."
+            )
+        self._connection().respond(pending.get("request_id"), result)
+        with self.lock:
+            if self.pending_request is not None and (
+                self.pending_request.get("request_id")
+                == pending.get("request_id")
+            ):
+                self.pending_request = None
+        return pending
+
+    def set_pending_request(self, pending: dict[str, Any]) -> bool:
+        with self.lock:
+            if self.pending_request is not None:
+                return False
+            self.pending_request = dict(pending)
+            return True
+
+    def clear_pending_request(self, request_id: Any) -> bool:
+        with self.lock:
+            if self.pending_request is None or (
+                self.pending_request.get("request_id") != request_id
+            ):
+                return False
+            self.pending_request = None
+            return True
+
+    def pending_snapshot(self) -> dict[str, Any] | None:
+        with self.lock:
+            return (
+                dict(self.pending_request)
+                if self.pending_request is not None
+                else None
+            )
+
+    def expired(self, now: float) -> bool:
+        pending = self.pending_snapshot()
+        return bool(
+            pending
+            and pending.get("expires_at")
+            and now >= float(pending["expires_at"])
+        )
+
+    def status_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "thread_id": self.thread_id,
+                "source": self.binding.get("source"),
+                "cwd": self.binding.get("cwd"),
+                "thread_status": self.thread_status,
+                "active_turn_id": self.active_turn_id,
+                "pending_method": (
+                    self.pending_request.get("method")
+                    if self.pending_request
+                    else None
+                ),
+                "connected": bool(
+                    self.connection and self.connection.connected
+                ),
+                "disconnected": self.disconnected,
+            }
+
+    def _latest_turn(
+        self,
+        connection: CodexAppServerConnection,
+    ) -> dict[str, Any] | None:
+        try:
+            result = connection.request(
+                "thread/turns/list",
+                {
+                    "threadId": self.thread_id,
+                    "limit": 1,
+                    "sortDirection": "desc",
+                    "itemsView": "summary",
+                },
+            )
+        except CodexAppServerProtocolError:
+            return None
+        data = result.get("data")
+        if not isinstance(data, list) or not data:
+            return None
+        turn = data[0]
+        return turn if isinstance(turn, dict) else None
+
+    def _turn_for_client_id(
+        self,
+        connection: CodexAppServerConnection,
+        client_message_id: str,
+    ) -> dict[str, Any] | None:
+        try:
+            result = connection.request(
+                "thread/turns/list",
+                {
+                    "threadId": self.thread_id,
+                    "limit": 3,
+                    "sortDirection": "desc",
+                    "itemsView": "full",
+                },
+            )
+        except CodexAppServerError:
+            return None
+        for turn in result.get("data") or []:
+            if not isinstance(turn, dict):
+                continue
+            for item in turn.get("items") or []:
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "userMessage"
+                    and item.get("clientId") == client_message_id
+                ):
+                    return turn
+        return None
+
+    def _verify_thread(self, thread: dict[str, Any]) -> None:
+        thread_id = str(thread.get("id") or "")
+        session_id = str(thread.get("sessionId") or "")
+        if thread_id != self.thread_id or session_id not in {
+            "",
+            self.thread_id,
+        }:
+            raise CodexAppServerError(
+                "Codex app-server returned a different thread identity"
+            )
+        source = str(thread.get("source") or "").lower()
+        expected_source = str(self.binding.get("source") or "").lower()
+        allowed_sources = {
+            str(item).strip().lower()
+            for item in (
+                self.bot.config.profile.codex_app_server_interaction_sources
+            )
+            if str(item).strip()
+        }
+        if source != expected_source or source not in allowed_sources:
+            raise CodexAppServerError(
+                "Codex app-server thread source is not eligible for Slack "
+                "interaction"
+            )
+        if thread.get("parentThreadId"):
+            raise CodexAppServerError(
+                "Subagent Codex threads cannot be controlled from Slack"
+            )
+        expected_cwd = str(self.binding.get("cwd") or "")
+        actual_cwd = str(thread.get("cwd") or "")
+        if expected_cwd and actual_cwd and expected_cwd != actual_cwd:
+            raise CodexAppServerError(
+                "Codex app-server thread cwd does not match the Stop hook"
+            )
+
+    @staticmethod
+    def _result_thread(result: dict[str, Any]) -> dict[str, Any]:
+        thread = result.get("thread")
+        if not isinstance(thread, dict):
+            raise CodexAppServerProtocolError(
+                "Codex app-server returned no thread object"
+            )
+        return thread
+
+    def _connection(self) -> CodexAppServerConnection:
+        with self.lock:
+            connection = self.connection
+        if connection is None or not connection.connected:
+            raise CodexAppServerError("Codex app-server connection is closed")
+        return connection
+
+    def _handle_notification(self, message: dict[str, Any]) -> None:
+        self.bot._handle_codex_app_notification(self, message)
+
+    def _handle_server_request(self, message: dict[str, Any]) -> None:
+        self.bot._handle_codex_app_server_request(self, message)
+
+    def _handle_disconnect(self, error: BaseException | None) -> None:
+        with self.lock:
+            self.disconnected = True
+        self.bot._handle_codex_app_disconnect(self, error)
+
+
 class SlackSocketBot:
     def __init__(
         self,
@@ -10372,6 +11170,8 @@ class SlackSocketBot:
         self.user_name_cache: dict[str, str] = {}
         self.agent_tmux_inflight: set[str] = set()
         self.agent_tmux_inflight_lock = threading.Lock()
+        self.codex_app_controllers: dict[str, CodexAppController] = {}
+        self.codex_app_controllers_lock = threading.RLock()
         if (
             config.allowed_channel_ids
             and not config.allowed_dm_user_ids
@@ -10441,6 +11241,7 @@ class SlackSocketBot:
             f"{self.team_name or 'unknown team'} "
             f"({self.team_domain or 'unknown domain'})",
         )
+        self._recover_codex_app_jobs()
         if not (
             self.config.allowed_dm_user_ids
             or self.config.allowed_user_ids
@@ -10463,6 +11264,7 @@ class SlackSocketBot:
             ):
                 self.drain_ingress()
                 self._tick_agent_tmux_jobs()
+                self._tick_codex_app_controllers()
                 stop_event.wait(1.0)
         finally:
             for sig, previous in previous_handlers.items():
@@ -10474,6 +11276,7 @@ class SlackSocketBot:
                 client.close()
             except Exception:
                 pass
+            self._close_codex_app_controllers()
             self.executor.shutdown(wait=True, cancel_futures=False)
             self.contextual_dispatch_semaphore.acquire()
             try:
@@ -10804,12 +11607,13 @@ class SlackSocketBot:
     ) -> None:
         payload_type = request_type or payload.get("type")
         if payload_type == "events_api":
-            event = payload.get("event") or {}
+            event = dict(payload.get("event") or {})
             event_id = payload.get("event_id") or self._event_dedupe_key(
                 event
             )
             if self._seen_recently(event_id):
                 return
+            event["_sneeze_event_id"] = event_id
             self._handle_event(event)
         elif payload_type == "slash_commands":
             dedupe_key = payload.get("trigger_id") or self._slash_dedupe_key(
@@ -10944,13 +11748,23 @@ class SlackSocketBot:
         )
         is_normally_authorized = request_authority is not None
         is_operator = request_authority == "operator"
-        is_bound_notify_thread = (
+        is_tmux_notify_thread = (
             channel_type == "im"
             and self._is_agent_notify_tmux_thread(route, slack_user_id)
         )
-        is_agent_notify_thread = is_bound_notify_thread or (
-            channel_type == "im"
-            and self._is_agent_notify_thread(route, slack_user_id)
+        codex_app_binding = (
+            self._codex_app_binding_for_route(route, slack_user_id)
+            if channel_type == "im" and not is_tmux_notify_thread
+            else None
+        )
+        is_codex_app_notify_thread = codex_app_binding is not None
+        is_agent_notify_thread = (
+            is_tmux_notify_thread
+            or is_codex_app_notify_thread
+            or (
+                channel_type == "im"
+                and self._is_agent_notify_thread(route, slack_user_id)
+            )
         )
         notification_binding_only = (
             is_agent_notify_thread and not is_normally_authorized
@@ -10971,7 +11785,11 @@ class SlackSocketBot:
         ):
             self._post_unauthorized(route)
             return
-        if notification_binding_only and not is_bound_notify_thread:
+        if (
+            notification_binding_only
+            and not is_tmux_notify_thread
+            and not is_codex_app_notify_thread
+        ):
             post_slack_message(
                 self.config,
                 route,
@@ -10980,6 +11798,15 @@ class SlackSocketBot:
             )
             return
         if notification_binding_only:
+            if is_codex_app_notify_thread:
+                self._maybe_handle_codex_app(
+                    text,
+                    route,
+                    slack_user_id,
+                    event_id=event.get("_sneeze_event_id"),
+                    binding=codex_app_binding,
+                )
+                return
             if self._maybe_handle_agent_tmux(
                 text,
                 route,
@@ -10993,6 +11820,15 @@ class SlackSocketBot:
             ):
                 return
             self._post_unauthorized(route)
+            return
+        if is_codex_app_notify_thread:
+            self._maybe_handle_codex_app(
+                text,
+                route,
+                slack_user_id,
+                event_id=event.get("_sneeze_event_id"),
+                binding=codex_app_binding,
+            )
             return
         if channel_type == "im" and self._maybe_handle_user_config(
             text,
@@ -13232,6 +14068,1071 @@ class SlackSocketBot:
             return self._agent_tmux_binding_for_route(route) is not None
         except (OSError, UnicodeDecodeError, SlackbotError):
             return False
+
+    def _codex_app_server_socket(self) -> str:
+        return codex_app_server_socket_path(
+            self.config.profile.default_codex_app_server_socket,
+            environment={**self.config.env, **os.environ},
+        )
+
+    def _ensure_codex_app_server(self) -> str:
+        socket_path = self._codex_app_server_socket()
+        try:
+            validate_codex_app_server_socket(socket_path)
+        except CodexAppServerError:
+            if not self.config.profile.codex_app_server_auto_start:
+                raise
+            start_codex_app_server_daemon(
+                self.config.codex_bin,
+                socket_path,
+            )
+            validate_codex_app_server_socket(socket_path)
+        return socket_path
+
+    def _recover_codex_app_jobs(self) -> None:
+        if not self.config.profile.codex_app_server_interaction_enabled:
+            return
+        try:
+            jobs = _read_codex_app_jobs(self.config.paths).get("jobs") or {}
+        except (OSError, UnicodeDecodeError, SlackbotError) as exc:
+            emit(
+                self.out,
+                f"Could not read Codex app-server recovery state: {exc}",
+            )
+            return
+        recoverable_statuses = {
+            "active",
+            "connected",
+            "disconnected",
+            "interrupting",
+            "pending-request",
+            "preparing",
+        }
+        candidates = sorted(
+            (
+                (str(key), job)
+                for key, job in jobs.items()
+                if isinstance(job, dict)
+                and job.get("status") in recoverable_statuses
+            ),
+            key=lambda item: str(item[1].get("updated_at") or ""),
+            reverse=True,
+        )
+        limit = max(
+            1,
+            self.config.profile.codex_app_server_max_controllers,
+        )
+        for key, job in candidates[:limit]:
+            route_data = job.get("route")
+            binding = job.get("binding")
+            if not isinstance(route_data, dict) or not isinstance(
+                binding,
+                dict,
+            ):
+                continue
+            route = route_from_dict(route_data)
+            if not route.channel_id or not route.thread_ts:
+                continue
+            if key != agent_tmux_thread_key(
+                route.channel_id,
+                route.thread_ts,
+            ):
+                continue
+            try:
+                controller = self._get_codex_app_controller(route, binding)
+            except (CodexAppServerError, OSError, SlackbotError) as exc:
+                emit(
+                    self.out,
+                    "Could not recover Codex app-server controller for "
+                    f"{key}: {exc}",
+                )
+                continue
+            pending = job.get("pending_request")
+            status = "completed" if controller.terminal else "recovered"
+            if (
+                isinstance(pending, dict)
+                and pending.get("request_id") is not None
+            ):
+                try:
+                    expires_at = float(pending.get("expires_at") or 0)
+                except (TypeError, ValueError):
+                    expires_at = -1
+                if expires_at >= 0 and (
+                    not expires_at or expires_at > time.time()
+                ):
+                    controller.set_pending_request(pending)
+                    if controller.pending_snapshot() is not None:
+                        status = "pending-request"
+                else:
+                    status = "desktop-required"
+            self._record_codex_app_controller(
+                controller,
+                status=status,
+            )
+            self._audit_codex_app(
+                controller,
+                "recovered",
+                terminal=controller.terminal,
+            )
+
+    def _codex_app_binding_for_route(
+        self,
+        route: SlackbotRoute,
+        slack_user_id: str | None,
+    ) -> dict[str, Any] | None:
+        profile = self.config.profile
+        if (
+            not profile.codex_app_server_interaction_enabled
+            or not route.channel_id
+            or not route.thread_ts
+        ):
+            return None
+        notify_user_id = env_lookup(
+            profile,
+            self.config.env,
+            AGENT_CODEX_HOOK_NOTIFY_USER_KEY,
+        )
+        if not notify_user_id or slack_user_id != notify_user_id:
+            return None
+        entries: list[dict[str, Any]] = []
+        try:
+            state = read_json(
+                agent_codex_hook_state_path(self.config.paths), {}
+            )
+        except (OSError, UnicodeDecodeError):
+            state = {}
+        sessions = state.get("sessions") if isinstance(state, dict) else None
+        if isinstance(sessions, dict):
+            entries.extend(
+                entry
+                for entry in sessions.values()
+                if isinstance(entry, dict)
+                and entry.get("channel_id") == route.channel_id
+                and entry.get("thread_ts") == route.thread_ts
+                and entry.get("notify_user_id") == notify_user_id
+            )
+        try:
+            receipt = codex_hook_delivery_receipt_for_route(
+                self.config.paths,
+                channel_id=route.channel_id,
+                thread_ts=route.thread_ts,
+                notify_user_id=notify_user_id,
+            )
+        except (OSError, SlackbotError):
+            receipt = None
+        if isinstance(receipt, dict):
+            entries.append(receipt)
+        entries.sort(
+            key=lambda entry: str(
+                entry.get("updated_at")
+                or entry.get("notified_at")
+                or entry.get("created_at")
+                or ""
+            ),
+            reverse=True,
+        )
+        allowed_sources = {
+            str(item).strip().lower()
+            for item in profile.codex_app_server_interaction_sources
+            if str(item).strip()
+        }
+        for entry in entries:
+            candidate = entry.get("codex_app_server")
+            if isinstance(candidate, dict):
+                thread_id = str(candidate.get("thread_id") or "").strip()
+                source = str(candidate.get("source") or "").strip().lower()
+                if (
+                    candidate.get("kind") == "codex_app_server"
+                    and thread_id
+                    and source in allowed_sources
+                ):
+                    return dict(candidate)
+            session_id = str(entry.get("session_id") or "").strip()
+            if not session_id:
+                key = str(entry.get("key") or "")
+                if key.startswith("session:"):
+                    session_id = key.removeprefix("session:")
+            if not session_id:
+                continue
+            metadata_payload: dict[str, Any] = {"session_id": session_id}
+            notifications = entry.get("notifications")
+            if isinstance(notifications, list):
+                for notification in reversed(notifications):
+                    if not isinstance(notification, dict):
+                        continue
+                    transcript_path = notification.get("transcript_path")
+                    if transcript_path:
+                        metadata_payload["transcript_path"] = transcript_path
+                        break
+            metadata = resolve_codex_session_metadata(
+                metadata_payload,
+                environment={**self.config.env, **os.environ},
+            )
+            if (
+                metadata.verified
+                and metadata.source in allowed_sources
+                and metadata.thread_source not in {"review", "subagent"}
+                and not metadata.parent_thread_id
+                and not metadata.review_turn
+                and not metadata.automated_review
+            ):
+                return {
+                    "kind": "codex_app_server",
+                    "thread_id": metadata.session_id,
+                    "session_id": metadata.session_id,
+                    "source": metadata.source,
+                    "cwd": metadata.cwd,
+                    "verified_at": utcnow_iso(),
+                }
+        return None
+
+    def _get_codex_app_controller(
+        self,
+        route: SlackbotRoute,
+        binding: dict[str, Any],
+    ) -> CodexAppController:
+        route_key = agent_tmux_thread_key(
+            str(route.channel_id or ""),
+            str(route.thread_ts or ""),
+        )
+        with self.codex_app_controllers_lock:
+            existing = self.codex_app_controllers.get(route_key)
+            if (
+                existing
+                and existing.connection
+                and (existing.connection.connected)
+            ):
+                return existing
+            if existing:
+                existing.close()
+                self.codex_app_controllers.pop(route_key, None)
+            live = [
+                controller
+                for controller in self.codex_app_controllers.values()
+                if controller.connection and controller.connection.connected
+            ]
+            if len(live) >= max(
+                1, self.config.profile.codex_app_server_max_controllers
+            ):
+                raise SlackbotError(
+                    "The Slackbot already has the maximum number of active "
+                    "Codex app-server controllers."
+                )
+            self._ensure_codex_app_server()
+            controller = CodexAppController(self, route, binding)
+            controller.connect()
+            self.codex_app_controllers[route_key] = controller
+            self._record_codex_app_controller(controller, status="connected")
+            return controller
+
+    def _record_codex_app_controller(
+        self,
+        controller: CodexAppController,
+        *,
+        status: str,
+        client_message_id: str | None = None,
+        text_hash: str | None = None,
+    ) -> None:
+        snapshot = controller.status_snapshot()
+        pending = controller.pending_snapshot()
+        value = {
+            "version": 1,
+            "status": status,
+            "route": route_to_dict(controller.route),
+            "binding": controller.binding,
+            "thread_id": controller.thread_id,
+            "active_turn_id": snapshot["active_turn_id"],
+            "thread_status": snapshot["thread_status"],
+            "client_message_id": client_message_id,
+            "text_sha256": text_hash,
+            "pending_request": (
+                {
+                    "request_id": pending.get("request_id"),
+                    "method": pending.get("method"),
+                    "turn_id": pending.get("turn_id"),
+                    "expires_at": pending.get("expires_at"),
+                }
+                if pending
+                else None
+            ),
+            "updated_at": utcnow_iso(),
+        }
+        _update_codex_app_job(
+            self.config,
+            controller.route_key,
+            value,
+        )
+
+    def _audit_codex_app(
+        self,
+        controller: CodexAppController,
+        action: str,
+        **fields: Any,
+    ) -> None:
+        _append_slackbot_audit_event_best_effort(
+            self.config,
+            {
+                "kind": "codex_app_server_control",
+                "action": action,
+                "thread_id": controller.thread_id,
+                "channel_id": controller.route.channel_id,
+                "thread_ts": controller.route.thread_ts,
+                **fields,
+            },
+        )
+
+    @staticmethod
+    def _codex_app_client_message_id(
+        event_id: str | None,
+        route: SlackbotRoute,
+        action: str,
+        text: str,
+    ) -> str:
+        identity = {
+            "event_id": event_id,
+            "channel_id": route.channel_id,
+            "thread_ts": route.thread_ts,
+            "action": action,
+            "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        }
+        return str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                json.dumps(identity, sort_keys=True, separators=(",", ":")),
+            )
+        )
+
+    def _maybe_handle_codex_app(
+        self,
+        text: str,
+        route: SlackbotRoute,
+        slack_user_id: str | None,
+        *,
+        event_id: str | None = None,
+        binding: dict[str, Any] | None = None,
+    ) -> bool:
+        binding = binding or self._codex_app_binding_for_route(
+            route,
+            slack_user_id,
+        )
+        if binding is None:
+            return False
+        stripped = text.strip()
+        lowered = stripped.lower()
+        if lowered in {"?", "help", "app help"}:
+            post_slack_message(
+                self.config,
+                route,
+                "Codex app controls: plain text starts an idle turn; "
+                "`steer <text>` adds input to the active turn; `status` "
+                "inspects it; `cancel` interrupts it. Approval replies are "
+                "`approve`, `approve session`, `deny`, or `cancel request`. "
+                "Use `answer <question-id>: <value>` for each displayed "
+                "non-secret question.",
+            )
+            return True
+        tmux_only = {
+            "tail",
+            "capture",
+            "pipe",
+            "proceed",
+            "p",
+            "nurse",
+            "n",
+            "jobs",
+            "use",
+        }
+        if stripped.split(maxsplit=1)[0].lower() in tmux_only:
+            post_slack_message(
+                self.config,
+                route,
+                "That control is only available for tmux-backed threads. "
+                "Use `status`, `steer <text>`, `cancel`, or `help` here.",
+            )
+            return True
+        try:
+            controller = self._get_codex_app_controller(route, binding)
+            pending = controller.pending_snapshot()
+            if lowered in {
+                "approve",
+                "approve session",
+                "deny",
+                "cancel request",
+            }:
+                self._respond_codex_app_approval(
+                    controller,
+                    lowered,
+                    pending,
+                )
+                return True
+            if lowered.startswith("answer "):
+                self._respond_codex_app_questions(
+                    controller,
+                    stripped,
+                    pending,
+                )
+                return True
+            if pending:
+                post_slack_message(
+                    self.config,
+                    route,
+                    "Codex is waiting for the approval or answer shown "
+                    "above. "
+                    "This reply was not sent as model input.",
+                )
+                return True
+            if lowered in {"status", "st", "update", "u"}:
+                controller.refresh()
+                snapshot = controller.status_snapshot()
+                post_slack_message(
+                    self.config,
+                    route,
+                    self._render_codex_app_status(snapshot),
+                )
+                self._record_codex_app_controller(
+                    controller,
+                    status="connected",
+                )
+                return True
+            if lowered == "cancel":
+                turn_id = controller.interrupt()
+                self._record_codex_app_controller(
+                    controller,
+                    status="interrupting",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "interrupt",
+                    turn_id=turn_id,
+                )
+                post_slack_message(
+                    self.config,
+                    route,
+                    f"Interrupt requested for Codex turn {turn_id}.",
+                )
+                return True
+            if lowered.startswith("steer"):
+                steering_text = stripped[5:].strip()
+                if not steering_text:
+                    post_slack_message(
+                        self.config,
+                        route,
+                        "Usage: `steer <text>`",
+                    )
+                    return True
+                client_message_id = self._codex_app_client_message_id(
+                    event_id,
+                    route,
+                    "steer",
+                    steering_text,
+                )
+                turn_id = controller.steer(
+                    steering_text,
+                    client_message_id,
+                )
+                text_hash = hashlib.sha256(steering_text.encode()).hexdigest()
+                self._record_codex_app_controller(
+                    controller,
+                    status="active",
+                    client_message_id=client_message_id,
+                    text_hash=text_hash,
+                )
+                self._audit_codex_app(
+                    controller,
+                    "steer",
+                    turn_id=turn_id,
+                    client_message_id=client_message_id,
+                    text_sha256=text_hash,
+                )
+                post_slack_message(
+                    self.config,
+                    route,
+                    (
+                        "Codex already accepted that steering input for "
+                        f"turn {turn_id}."
+                        if controller.last_action_reused
+                        else "Steering input accepted by Codex turn "
+                        f"{turn_id}."
+                    ),
+                )
+                return True
+            client_message_id = self._codex_app_client_message_id(
+                event_id,
+                route,
+                "start",
+                stripped,
+            )
+            text_hash = hashlib.sha256(stripped.encode()).hexdigest()
+            self._record_codex_app_controller(
+                controller,
+                status="preparing",
+                client_message_id=client_message_id,
+                text_hash=text_hash,
+            )
+            self._audit_codex_app(
+                controller,
+                "turn_start_preparing",
+                client_message_id=client_message_id,
+                text_sha256=text_hash,
+            )
+            turn_id = controller.start_turn(stripped, client_message_id)
+            self._record_codex_app_controller(
+                controller,
+                status=(
+                    "active" if controller.active_turn_id else "completed"
+                ),
+                client_message_id=client_message_id,
+                text_hash=text_hash,
+            )
+            self._audit_codex_app(
+                controller,
+                "turn_started",
+                turn_id=turn_id,
+                client_message_id=client_message_id,
+                text_sha256=text_hash,
+            )
+            post_slack_message(
+                self.config,
+                route,
+                (
+                    "Codex already accepted that Slack event as turn "
+                    f"{turn_id}."
+                    if controller.last_action_reused
+                    else f"Started Codex turn {turn_id} in the existing "
+                    "session."
+                ),
+            )
+        except (CodexAppServerError, OSError, SlackbotError) as exc:
+            post_slack_message(
+                self.config,
+                route,
+                f"Codex app control is unavailable: {exc}",
+            )
+        return True
+
+    @staticmethod
+    def _render_codex_app_status(snapshot: dict[str, Any]) -> str:
+        lines = [
+            "Codex app-server thread status:",
+            f"thread: {snapshot.get('thread_id')}",
+            f"source: {snapshot.get('source')}",
+            f"cwd: {snapshot.get('cwd')}",
+            f"status: {snapshot.get('thread_status')}",
+            f"active turn: {snapshot.get('active_turn_id') or '(none)'}",
+            f"pending request: {snapshot.get('pending_method') or '(none)'}",
+            f"connected: {snapshot.get('connected')}",
+        ]
+        return "\n".join(lines)
+
+    def _respond_codex_app_approval(
+        self,
+        controller: CodexAppController,
+        command: str,
+        pending: dict[str, Any] | None,
+    ) -> None:
+        if not pending or pending.get("method") not in {
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        }:
+            post_slack_message(
+                self.config,
+                controller.route,
+                "There is no command or file approval waiting in Slack.",
+            )
+            return
+        decisions = {
+            "approve": "accept",
+            "approve session": "acceptForSession",
+            "deny": "decline",
+            "cancel request": "cancel",
+        }
+        decision = decisions[command]
+        completed = controller.respond({"decision": decision})
+        self._record_codex_app_controller(controller, status="active")
+        self._audit_codex_app(
+            controller,
+            "approval_response",
+            request_id=completed.get("request_id"),
+            request_method=completed.get("method"),
+            decision=decision,
+        )
+        post_slack_message(
+            self.config,
+            controller.route,
+            f"Sent Codex approval decision: {decision}.",
+        )
+
+    def _respond_codex_app_questions(
+        self,
+        controller: CodexAppController,
+        text: str,
+        pending: dict[str, Any] | None,
+    ) -> None:
+        if not pending or pending.get("method") != (
+            "item/tool/requestUserInput"
+        ):
+            post_slack_message(
+                self.config,
+                controller.route,
+                "There is no non-secret Codex question waiting in Slack.",
+            )
+            return
+        questions = pending.get("questions")
+        if not isinstance(questions, list):
+            raise SlackbotError("The pending Codex question is malformed.")
+        answers: dict[str, dict[str, list[str]]] = {}
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if line.lower().startswith("answer "):
+                line = line[len("answer ") :]
+            question_id, separator, value = line.partition(":")
+            if not separator:
+                raise SlackbotError(
+                    "Use `answer <question-id>: <value>` for each question."
+                )
+            question_id = question_id.strip()
+            value = value.strip()
+            if not question_id or not value:
+                raise SlackbotError("Question answers must not be blank.")
+            if question_id in answers:
+                raise SlackbotError(
+                    f"Question {question_id!r} was answered more than once."
+                )
+            answers[question_id] = {"answers": [value]}
+        expected = {
+            str(question.get("id") or "")
+            for question in questions
+            if isinstance(question, dict)
+        }
+        if set(answers) != expected:
+            missing = sorted(expected - set(answers))
+            extra = sorted(set(answers) - expected)
+            detail = []
+            if missing:
+                detail.append("missing " + ", ".join(missing))
+            if extra:
+                detail.append("unknown " + ", ".join(extra))
+            raise SlackbotError(
+                "Invalid question answers: " + "; ".join(detail)
+            )
+        completed = controller.respond({"answers": answers})
+        self._record_codex_app_controller(controller, status="active")
+        self._audit_codex_app(
+            controller,
+            "question_response",
+            request_id=completed.get("request_id"),
+            question_ids=sorted(answers),
+        )
+        post_slack_message(
+            self.config,
+            controller.route,
+            "Sent the non-secret answer set to Codex.",
+        )
+
+    def _handle_codex_app_server_request(
+        self,
+        controller: CodexAppController,
+        message: dict[str, Any],
+    ) -> None:
+        try:
+            method = str(message.get("method") or "")
+            params = message.get("params")
+            if not isinstance(params, dict):
+                return
+            if str(params.get("threadId") or "") != controller.thread_id:
+                self._audit_codex_app(
+                    controller,
+                    "server_request_rejected",
+                    request_method=method,
+                    reason="thread-id-mismatch",
+                )
+                return
+            safe_method = method in {
+                "item/commandExecution/requestApproval",
+                "item/fileChange/requestApproval",
+            }
+            questions = params.get("questions")
+            safe_questions = method == "item/tool/requestUserInput" and (
+                isinstance(questions, list)
+                and bool(questions)
+                and all(
+                    isinstance(question, dict)
+                    and not bool(question.get("isSecret"))
+                    for question in questions
+                )
+            )
+            if not safe_method and not safe_questions:
+                post_slack_message(
+                    self.config,
+                    controller.route,
+                    "Codex needs a permission, secret, MCP form, auth step, "
+                    "or unsupported client response. Handle it in Desktop; "
+                    "Slack did not answer or interrupt the turn.",
+                )
+                self._record_codex_app_controller(
+                    controller,
+                    status="desktop-required",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "server_request_handoff",
+                    request_id=message.get("id"),
+                    request_method=method,
+                )
+                return
+            expires_at = (
+                time.time()
+                + self.config.profile.codex_app_server_prompt_timeout_seconds
+            )
+            try:
+                saved_jobs = (
+                    _read_codex_app_jobs(self.config.paths).get("jobs") or {}
+                )
+            except (OSError, UnicodeDecodeError, SlackbotError):
+                saved_jobs = {}
+            saved_job = saved_jobs.get(controller.route_key)
+            saved_pending = (
+                saved_job.get("pending_request")
+                if isinstance(saved_job, dict)
+                else None
+            )
+            if (
+                isinstance(saved_pending, dict)
+                and saved_pending.get("method") == method
+                and saved_pending.get("expires_at") is not None
+            ):
+                try:
+                    expires_at = min(
+                        expires_at,
+                        float(saved_pending["expires_at"]),
+                    )
+                except (TypeError, ValueError):
+                    pass
+            if expires_at <= time.time():
+                post_slack_message(
+                    self.config,
+                    controller.route,
+                    "The recovered Codex request already expired. No "
+                    "response or interrupt was sent; handle it in Desktop.",
+                )
+                self._record_codex_app_controller(
+                    controller,
+                    status="desktop-required",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "request_expired",
+                    request_id=message.get("id"),
+                    request_method=method,
+                    recovered=True,
+                )
+                return
+            pending = {
+                "request_id": message.get("id"),
+                "method": method,
+                "turn_id": str(params.get("turnId") or "") or None,
+                "expires_at": expires_at,
+                "questions": questions if safe_questions else None,
+            }
+            rendered_request = self._render_codex_app_server_request(
+                method,
+                params,
+            )
+            if not controller.set_pending_request(pending):
+                post_slack_message(
+                    self.config,
+                    controller.route,
+                    "Codex issued another request while Slack already has "
+                    "one "
+                    "pending. Handle the newer request in Desktop.",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "server_request_handoff",
+                    request_id=message.get("id"),
+                    request_method=method,
+                    reason="another-request-pending",
+                )
+                return
+            try:
+                post_slack_message(
+                    self.config,
+                    controller.route,
+                    rendered_request,
+                )
+            except Exception:
+                controller.clear_pending_request(message.get("id"))
+                try:
+                    self._record_codex_app_controller(
+                        controller,
+                        status="desktop-required",
+                    )
+                except Exception as exc:
+                    emit(
+                        self.out,
+                        "Codex app-server handoff state update failed: "
+                        f"{exc}",
+                    )
+                try:
+                    self._audit_codex_app(
+                        controller,
+                        "server_request_handoff",
+                        request_id=message.get("id"),
+                        request_method=method,
+                        reason="slack-delivery-failed",
+                    )
+                except Exception as exc:
+                    emit(
+                        self.out,
+                        f"Codex app-server handoff audit failed: {exc}",
+                    )
+                raise
+            self._record_codex_app_controller(
+                controller,
+                status="pending-request",
+            )
+            self._audit_codex_app(
+                controller,
+                "server_request_relayed",
+                request_id=message.get("id"),
+                request_method=method,
+                turn_id=pending["turn_id"],
+            )
+        except Exception as exc:
+            emit(
+                self.out,
+                f"Codex app-server request relay failed: {exc}",
+            )
+
+    @staticmethod
+    def _render_codex_app_server_request(
+        method: str,
+        params: dict[str, Any],
+    ) -> str:
+        if method == "item/commandExecution/requestApproval":
+            command = redact_secret_text(
+                str(params.get("command") or "(command unavailable)")
+            )[:2000]
+            cwd = str(params.get("cwd") or "(unknown)")
+            reason = redact_secret_text(str(params.get("reason") or ""))
+            lines = [
+                "Codex requests command approval.",
+                f"cwd: {cwd}",
+            ]
+            if reason:
+                lines.append(f"reason: {reason}")
+            lines.extend(
+                [
+                    "command:",
+                    command,
+                    "Reply `approve`, `approve session`, `deny`, or "
+                    "`cancel request`.",
+                ]
+            )
+            return "\n".join(lines)
+        if method == "item/fileChange/requestApproval":
+            reason = redact_secret_text(str(params.get("reason") or ""))
+            grant_root = str(params.get("grantRoot") or "")
+            lines = ["Codex requests file-change approval."]
+            if grant_root:
+                lines.append(f"requested root: {grant_root}")
+            if reason:
+                lines.append(f"reason: {reason}")
+            lines.append(
+                "Reply `approve`, `approve session`, `deny`, or "
+                "`cancel request`."
+            )
+            return "\n".join(lines)
+        lines = [
+            "Codex requests non-secret input. Reply with one line per "
+            "question: `answer <question-id>: <value>`."
+        ]
+        for question in params.get("questions") or []:
+            if not isinstance(question, dict):
+                continue
+            question_id = str(question.get("id") or "")
+            header = str(question.get("header") or question_id)
+            prompt = str(question.get("question") or "")
+            lines.append(f"{header} [{question_id}]: {prompt}")
+            options = question.get("options")
+            if isinstance(options, list):
+                for option in options:
+                    if not isinstance(option, dict):
+                        continue
+                    label = str(option.get("label") or "")
+                    description = str(option.get("description") or "")
+                    lines.append(f"- {label}: {description}")
+        return "\n".join(lines)
+
+    def _handle_codex_app_notification(
+        self,
+        controller: CodexAppController,
+        message: dict[str, Any],
+    ) -> None:
+        try:
+            method = str(message.get("method") or "")
+            params = message.get("params")
+            if not isinstance(params, dict):
+                return
+            thread_id = str(params.get("threadId") or "")
+            if thread_id and thread_id != controller.thread_id:
+                return
+            if method == "turn/started":
+                turn = params.get("turn")
+                turn_id = (
+                    str(turn.get("id") or "")
+                    if isinstance(turn, dict)
+                    else ""
+                )
+                with controller.lock:
+                    controller.active_turn_id = turn_id or (
+                        controller.active_turn_id
+                    )
+                    controller.thread_status = "active"
+                    controller.terminal = False
+                self._record_codex_app_controller(
+                    controller,
+                    status="active",
+                )
+            elif method == "turn/completed":
+                turn = params.get("turn")
+                turn_id = (
+                    str(turn.get("id") or "")
+                    if isinstance(turn, dict)
+                    else ""
+                )
+                with controller.lock:
+                    controller.active_turn_id = None
+                    controller.thread_status = "idle"
+                    controller.pending_request = None
+                    controller.terminal = True
+                self._record_codex_app_controller(
+                    controller,
+                    status="completed",
+                )
+                self._audit_codex_app(
+                    controller,
+                    "turn_completed",
+                    turn_id=turn_id or None,
+                )
+            elif method == "serverRequest/resolved":
+                request_id = params.get("requestId")
+                if controller.clear_pending_request(request_id):
+                    self._record_codex_app_controller(
+                        controller,
+                        status="active",
+                    )
+                    post_slack_message(
+                        self.config,
+                        controller.route,
+                        "The pending Codex request was answered in Desktop; "
+                        "its Slack controls are now closed.",
+                    )
+            elif method == "thread/status/changed":
+                status = params.get("status")
+                status_type = (
+                    str(status.get("type") or "unknown")
+                    if isinstance(status, dict)
+                    else str(status or "unknown")
+                )
+                with controller.lock:
+                    controller.thread_status = status_type
+        except Exception as exc:
+            emit(
+                self.out,
+                f"Codex app-server notification handling failed: {exc}",
+            )
+
+    def _handle_codex_app_disconnect(
+        self,
+        controller: CodexAppController,
+        error: BaseException | None,
+    ) -> None:
+        try:
+            self._record_codex_app_controller(
+                controller,
+                status="disconnected",
+            )
+            self._audit_codex_app(
+                controller,
+                "disconnect",
+                error_type=(type(error).__name__ if error else None),
+            )
+        except Exception:
+            pass
+        emit(
+            self.out,
+            "Codex app-server controller disconnected"
+            + (f": {error}" if error else ""),
+        )
+
+    def _tick_codex_app_controllers(self) -> None:
+        now = time.time()
+        expired: list[CodexAppController] = []
+        removable: list[tuple[str, CodexAppController]] = []
+        with self.codex_app_controllers_lock:
+            for key, controller in self.codex_app_controllers.items():
+                if controller.expired(now):
+                    expired.append(controller)
+                    removable.append((key, controller))
+                elif controller.disconnected or (
+                    controller.terminal and not controller.pending_snapshot()
+                ):
+                    removable.append((key, controller))
+            for key, controller in removable:
+                if self.codex_app_controllers.get(key) is controller:
+                    self.codex_app_controllers.pop(key, None)
+        for controller in expired:
+            try:
+                post_slack_message(
+                    self.config,
+                    controller.route,
+                    "The Codex Slack prompt expired. No response or "
+                    "interrupt was sent; answer it in Desktop.",
+                )
+            except Exception as exc:
+                emit(
+                    self.out,
+                    "Codex app-server expiry notification failed: " f"{exc}",
+                )
+            try:
+                self._record_codex_app_controller(
+                    controller,
+                    status="desktop-required",
+                )
+            except Exception as exc:
+                emit(
+                    self.out,
+                    f"Codex app-server expiry state update failed: {exc}",
+                )
+            try:
+                self._audit_codex_app(
+                    controller,
+                    "request_expired",
+                    request_method=(
+                        (controller.pending_snapshot() or {}).get("method")
+                    ),
+                )
+            except Exception as exc:
+                emit(
+                    self.out,
+                    f"Codex app-server expiry audit failed: {exc}",
+                )
+        for _, controller in removable:
+            try:
+                controller.close()
+            except Exception as exc:
+                emit(
+                    self.out,
+                    f"Codex app-server controller cleanup failed: {exc}",
+                )
+
+    def _close_codex_app_controllers(self) -> None:
+        with self.codex_app_controllers_lock:
+            controllers = list(self.codex_app_controllers.values())
+            self.codex_app_controllers.clear()
+        for controller in controllers:
+            controller.close()
 
     def _maybe_mirror_agent_tmux_reply(
         self,

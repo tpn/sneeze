@@ -20,10 +20,10 @@ from .command import CommandError
 TMUX_FIELD_SEP = "\x1f"
 DEFAULT_CONSOLE_HOST = "127.0.0.1"
 DEFAULT_CONSOLE_PORT = 8960
-DEFAULT_CONSOLE_ROOT_PATH = "/sneeze/console"
+DEFAULT_CONSOLE_ROOT_PATH = "/console"
 DEFAULT_TMUX_SOCKET = "sneeze"
 DEFAULT_AUTH_EMAIL_HEADER = "x-auth-request-email"
-DEFAULT_AUTH_EMAIL_DOMAIN = "example.com"
+DEFAULT_AUTH_EMAIL_DOMAIN = ""
 AUTH_EMAIL_HEADER_ALIASES = (
     "x-auth-request-email",
     "x-forwarded-email",

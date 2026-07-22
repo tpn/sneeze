@@ -15,13 +15,13 @@ from sneeze.console import (
 
 
 def test_normalize_root_path():
-    assert normalize_root_path("sneeze/console/") == "/sneeze/console"
+    assert normalize_root_path("sample/console/") == "/sample/console"
     assert normalize_root_path("/") == "/"
-    assert normalize_root_path("") == "/sneeze/console"
+    assert normalize_root_path("") == "/console"
 
 
 def test_parse_email_list_normalizes_and_deduplicates():
-    assert parse_email_list("Admin@example.com, admin@example.com,") == (
+    assert parse_email_list("Admin@Example.com, admin@example.com,") == (
         "admin@example.com",
     )
 
@@ -35,8 +35,11 @@ def test_console_user_requires_authenticated_email_header():
     assert exc_info.value.status_code == 401
 
 
-def test_console_user_allows_example_viewer_and_admin():
-    config = ConsoleConfig(admin_emails=("admin@example.com",))
+def test_console_user_allows_matching_domain_viewer_and_admin():
+    config = ConsoleConfig(
+        auth_email_domain="example.com",
+        admin_emails=("admin@example.com",),
+    )
 
     viewer = user_from_headers(
         config,
@@ -54,10 +57,10 @@ def test_console_user_allows_example_viewer_and_admin():
 
 
 def test_console_user_rejects_non_matching_domain():
-    config = ConsoleConfig()
+    config = ConsoleConfig(auth_email_domain="example.com")
 
     with pytest.raises(ConsoleAuthError) as exc_info:
-        user_from_headers(config, {"x-auth-request-email": "a@example.com"})
+        user_from_headers(config, {"x-auth-request-email": "a@other.test"})
 
     assert exc_info.value.status_code == 403
 

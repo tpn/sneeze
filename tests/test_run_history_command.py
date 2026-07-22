@@ -291,7 +291,7 @@ def _instance(
         argv=argv or ["sne", command],
         command=command,
         hostname=host or runlog.HOSTNAME,
-        username="trent",
+        username="sample",
         started_at=started,
         ended_at=started,
         duration_s=0.1,

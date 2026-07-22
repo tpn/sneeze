@@ -26,7 +26,7 @@ def _make_instance(command):
         argv=["sne", command],
         command=command,
         hostname="air",
-        username="trent",
+        username="sample",
         started_at=now,
         ended_at=now,
         duration_s=0.1,

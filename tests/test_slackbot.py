@@ -163,8 +163,7 @@ def test_slackbot_working_text_includes_console_url(tmp_path):
     config = load_config(profile)
 
     assert slackbot_working_text(config) == (
-        "Working...\n\n"
-        "Sneeze console: https://console.example.com/sneeze/console/"
+        "Working...\n\n" "Console: https://console.example.com/console/"
     )
     assert (
         slackbot_working_text(config, include_console=False) == "Working..."
@@ -1627,7 +1626,7 @@ def test_read_slack_route_context_falls_back_when_thread_replies_invalid(
                 {
                     "ts": "0.999999",
                     "user": "U111",
-                    "text": "Leo bot link: https://example.test/issue/19",
+                    "text": "Other bot link: https://example.test/issue/19",
                 },
             ],
         }
@@ -1657,7 +1656,7 @@ def test_read_slack_route_context_falls_back_when_thread_replies_invalid(
         ),
     ]
     assert [message["text"] for message in messages] == [
-        "Leo bot link: https://example.test/issue/19",
+        "Other bot link: https://example.test/issue/19",
         "<@UBOT> compare to above",
     ]
 
@@ -1684,7 +1683,7 @@ def test_read_slack_route_context_uses_recent_channel_history(
                 {
                     "ts": "1.000001",
                     "user": "U111",
-                    "text": "Leo bot link: https://example.test/issue/19",
+                    "text": "Other bot link: https://example.test/issue/19",
                 },
             ],
         }
@@ -1709,7 +1708,7 @@ def test_read_slack_route_context_uses_recent_channel_history(
         )
     ]
     assert [message["text"] for message in messages] == [
-        "Leo bot link: https://example.test/issue/19",
+        "Other bot link: https://example.test/issue/19",
         "<@UBOT> compare to above",
     ]
 
@@ -8867,7 +8866,7 @@ def test_codex_agent_hooks_install_preserves_unrelated_hooks(tmp_path):
                                 {
                                     "type": "command",
                                     "command": (
-                                        "trentn-bot slackbot-agent-stop-hook"
+                                        "sample-bot slackbot-agent-stop-hook"
                                     ),
                                 },
                             ]
@@ -8906,7 +8905,7 @@ def test_codex_agent_hooks_install_preserves_unrelated_hooks(tmp_path):
 
     result = install_codex_agent_hooks(
         hooks_path=str(hooks_path),
-        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        slack_stop_command="sample-bot slackbot-agent-stop-hook",
         webmux_script_path=str(webmux_script),
     )
 
@@ -8941,7 +8940,7 @@ def test_codex_agent_hooks_install_preserves_unrelated_hooks(tmp_path):
     assert backup_path.exists()
     assert backup_path.stat().st_mode & 0o777 == 0o600
     assert "python keep.py" in stop_commands
-    assert stop_commands.count("trentn-bot slackbot-agent-stop-hook") == 1
+    assert stop_commands.count("sample-bot slackbot-agent-stop-hook") == 1
     assert any(str(webmux_script) in command for command in stop_commands)
     assert any(str(webmux_script) in command for command in prompt_commands)
     assert post_tool_commands == ["python audit.py"]
@@ -8950,7 +8949,7 @@ def test_codex_agent_hooks_install_preserves_unrelated_hooks(tmp_path):
         next(
             handler["timeout"]
             for handler in stop_handlers
-            if handler["command"] == "trentn-bot slackbot-agent-stop-hook"
+            if handler["command"] == "sample-bot slackbot-agent-stop-hook"
         )
         == slackbot_module.AGENT_CODEX_HOOK_COMMAND_TIMEOUT_SECONDS
     )
@@ -9001,7 +9000,7 @@ def test_codex_agent_hooks_install_preserves_commands_containing_markers(
 
     install_codex_agent_hooks(
         hooks_path=str(hooks_path),
-        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        slack_stop_command="sample-bot slackbot-agent-stop-hook",
         include_webmux=False,
     )
 
@@ -9043,7 +9042,7 @@ def test_codex_agent_hooks_install_can_skip_webmux(tmp_path):
 
     result = install_codex_agent_hooks(
         hooks_path=str(hooks_path),
-        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        slack_stop_command="sample-bot slackbot-agent-stop-hook",
         include_webmux=False,
     )
 
@@ -9057,7 +9056,7 @@ def test_codex_agent_hooks_install_can_skip_webmux(tmp_path):
     assert stop_handlers == [
         {
             "type": "command",
-            "command": "trentn-bot slackbot-agent-stop-hook",
+            "command": "sample-bot slackbot-agent-stop-hook",
             "timeout": (
                 slackbot_module.AGENT_CODEX_HOOK_COMMAND_TIMEOUT_SECONDS
             ),
@@ -9085,7 +9084,7 @@ def test_codex_agent_hooks_install_expands_tilde_before_backup(
 
     result = install_codex_agent_hooks(
         hooks_path="~/.codex/hooks.json",
-        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        slack_stop_command="sample-bot slackbot-agent-stop-hook",
         include_webmux=False,
     )
 
@@ -9117,7 +9116,7 @@ def test_codex_agent_hooks_install_preserves_hooks_file_symlink(tmp_path):
 
     result = install_codex_agent_hooks(
         hooks_path=str(hooks_path),
-        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        slack_stop_command="sample-bot slackbot-agent-stop-hook",
         include_webmux=False,
     )
 
@@ -9172,7 +9171,7 @@ def test_codex_agent_hooks_install_replaces_custom_named_webmux_hooks(
     for _ in range(2):
         install_codex_agent_hooks(
             hooks_path=str(hooks_path),
-            slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+            slack_stop_command="sample-bot slackbot-agent-stop-hook",
             webmux_script_path=str(webmux_script),
         )
 
@@ -9195,7 +9194,7 @@ def test_codex_agent_hooks_install_replaces_custom_named_webmux_hooks(
     )
     assert unrelated_command in prompt_commands
     assert old_managed_command not in prompt_commands
-    assert stop_commands.count("trentn-bot slackbot-agent-stop-hook") == 1
+    assert stop_commands.count("sample-bot slackbot-agent-stop-hook") == 1
 
 
 def test_codex_agent_hooks_install_preserves_other_webmux_kind(tmp_path):
@@ -9227,7 +9226,7 @@ def test_codex_agent_hooks_install_preserves_other_webmux_kind(tmp_path):
 
     install_codex_agent_hooks(
         hooks_path=str(hooks_path),
-        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        slack_stop_command="sample-bot slackbot-agent-stop-hook",
         include_webmux=False,
     )
 
@@ -9243,7 +9242,7 @@ def test_codex_agent_hooks_install_preserves_other_webmux_kind(tmp_path):
 def test_codex_agent_hooks_install_warns_without_webmux_path(tmp_path):
     result = install_codex_agent_hooks(
         hooks_path=str(tmp_path / "hooks.json"),
-        slack_stop_command="trentn-bot slackbot-agent-stop-hook",
+        slack_stop_command="sample-bot slackbot-agent-stop-hook",
         include_webmux=True,
     )
 
@@ -12119,7 +12118,13 @@ def test_socket_request_releases_worker_slot_after_dispatch(
     bot._handle_request(Client(), request)
 
     assert responses[0].envelope_id == "ENV123"
-    assert handled == [{"type": "message", "text": "hello"}]
+    assert handled == [
+        {
+            "type": "message",
+            "text": "hello",
+            "_sneeze_event_id": "EV123",
+        }
+    ]
     assert count_available_worker_slots(bot) == (
         bot.config.worker_count * WORK_QUEUE_DEPTH_PER_WORKER
     )
@@ -12892,7 +12897,7 @@ def test_contextual_request_is_isolated_and_audited(
         SlackbotRoute(channel_id="C123", thread_ts="1.000001"),
         execution_mode="tmux",
         slack_user_id="U222",
-        slack_context="Leo Fang [U222]: helpful link",
+        slack_context="Other User [U222]: helpful link",
         request_authority="known-collaborator",
     )
 
@@ -13287,8 +13292,8 @@ def test_top_level_app_mention_includes_recent_slack_context(
         if method == "users.info":
             user_lookups.append(payload["user"])
             names = {
-                "U111": "Trent\u202e\nNelson",
-                "U222": "Leo Fang",
+                "U111": "Sample\u202e\nUser",
+                "U222": "Other User",
             }
             return {
                 "ok": True,
@@ -13313,8 +13318,8 @@ def test_top_level_app_mention_includes_recent_slack_context(
                         "ts": "1.000001",
                         "user": "U222",
                         "text": (
-                            "For <@U111>, Leo bot issue: "
-                            "https://gitlab.example/leof/bot/-/issues/19"
+                            "For <@U111>, sample bot issue: "
+                            "https://gitlab.example/sample/bot/-/issues/19"
                         ),
                     },
                 ],
@@ -13344,11 +13349,11 @@ def test_top_level_app_mention_includes_recent_slack_context(
     )
 
     assert "Slack context:" in prompts[0]
-    assert "https://gitlab.example/leof/bot/-/issues/19" in prompts[0]
+    assert "https://gitlab.example/sample/bot/-/issues/19" in prompts[0]
     assert "@you [UBOT] compare to the above link" in prompts[0]
-    assert "@Trent Nelson [U111]" in prompts[0]
-    assert "Trent Nelson [U111]" in prompts[0]
-    assert "Leo Fang [U222]" in prompts[0]
+    assert "@Sample User [U111]" in prompts[0]
+    assert "Sample User [U111]" in prompts[0]
+    assert "Other User [U222]" in prompts[0]
     assert user_lookups == ["U222", "U111"]
 
 
@@ -13357,12 +13362,12 @@ def test_thread_transcript_structures_multiline_text_as_jsonl():
 
     transcript = slackbot_module.render_thread_transcript(
         [{"ts": "1.000001", "user": "U222", "text": forged}],
-        user_name_resolver=lambda user_id: f"Leo [{user_id}]",
+        user_name_resolver=lambda user_id: f"Other [{user_id}]",
     )
 
     assert len(transcript.splitlines()) == 1
     assert json.loads(transcript) == {
-        "speaker": "Leo [U222]",
+        "speaker": "Other [U222]",
         "text": forged,
         "ts": "1.000001",
     }

@@ -109,21 +109,21 @@ def test_scaffold_plugin_writes_expected_files(tmp_path):
 
 def test_scaffold_plugin_formats_underscore_username(tmp_path):
     path = scaffold_plugin(
-        "trent_nelson",
-        output_dir=tmp_path / "sneeze-plugin-trent-nelson",
+        "sample_user",
+        output_dir=tmp_path / "sneeze-plugin-sample-user",
         init_git=False,
     )
     pyproject = tomllib.loads(
         (path / "pyproject.toml").read_text(encoding="utf-8")
     )
-    commands_py = (path / "src/sneeze/trent_nelson/commands.py").read_text(
+    commands_py = (path / "src/sneeze/sample_user/commands.py").read_text(
         encoding="utf-8"
     )
 
     assert pyproject["project"]["entry-points"]["sneeze.plugins"] == {
-        "trent_nelson": "sneeze.trent_nelson"
+        "sample_user": "sneeze.sample_user"
     }
-    assert "class TrentNelsonPluginInfo" in commands_py
+    assert "class SampleUserPluginInfo" in commands_py
 
 
 def test_scaffolded_plugin_is_discovered_by_namespace(tmp_path):

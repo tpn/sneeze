@@ -5,12 +5,9 @@ import os
 
 from .command import CommandError
 from .console import (
-    DEFAULT_AUTH_EMAIL_DOMAIN,
     DEFAULT_AUTH_EMAIL_HEADER,
     DEFAULT_CONSOLE_HOST,
     DEFAULT_CONSOLE_PORT,
-    DEFAULT_CONSOLE_ROOT_PATH,
-    DEFAULT_TMUX_SOCKET,
     ConsoleConfig,
     describe_console_config,
     list_tmux_sessions,
@@ -126,6 +123,7 @@ class SlackbotConsoleBase(ProfiledSlackbotCommand):
         return env_lookup(self._profile(), self._env(), suffix, default)
 
     def _config(self) -> ConsoleConfig:
+        profile = self._profile()
         host = (
             self._host
             or self.host
@@ -141,13 +139,19 @@ class SlackbotConsoleBase(ProfiledSlackbotCommand):
         root_path = normalize_root_path(
             self._root_path
             or self.root_path
-            or self._env_value("CONSOLE_ROOT_PATH", DEFAULT_CONSOLE_ROOT_PATH)
+            or self._env_value(
+                "CONSOLE_ROOT_PATH",
+                profile.default_console_root_path,
+            )
         )
         tmux_socket = (
             self._tmux_socket
             or self.tmux_socket
-            or self._env_value("CONSOLE_TMUX_SOCKET", DEFAULT_TMUX_SOCKET)
-            or DEFAULT_TMUX_SOCKET
+            or self._env_value(
+                "CONSOLE_TMUX_SOCKET",
+                profile.default_console_tmux_socket,
+            )
+            or profile.default_console_tmux_socket
         )
         auth_email_header = (
             self._auth_email_header
@@ -166,7 +170,7 @@ class SlackbotConsoleBase(ProfiledSlackbotCommand):
         if auth_email_domain is None:
             auth_email_domain = self._env_value(
                 "CONSOLE_AUTH_EMAIL_DOMAIN",
-                DEFAULT_AUTH_EMAIL_DOMAIN,
+                profile.default_console_auth_email_domain,
             )
         admin_emails = (
             self._admin_emails
