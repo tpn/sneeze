@@ -1,3 +1,4 @@
+import hashlib
 import json
 import queue
 import shutil
@@ -22,6 +23,7 @@ from sneeze.codex_app_server import (
 )
 from sneeze.slackbot import (
     CodexAppController,
+    CodexAppPreDispatchError,
     SlackbotError,
     SlackbotProfile,
     SlackbotRoute,
@@ -613,7 +615,7 @@ def test_recovery_waits_for_fresh_pending_request_id(tmp_path, monkeypatch):
     monkeypatch.setattr(
         bot,
         "_get_codex_app_controller",
-        lambda recovered_route, recovered_binding: controller,
+        lambda recovered_route, recovered_binding, **kwargs: controller,
     )
     statuses = []
     monkeypatch.setattr(
@@ -638,6 +640,7 @@ def test_recovery_waits_for_fresh_pending_request_id(tmp_path, monkeypatch):
         "method": pending["method"],
         "turn_id": pending["turn_id"],
         "expires_at": pending["expires_at"],
+        "request_fingerprint": None,
     }
     assert statuses == ["awaiting-request-replay"]
 
@@ -658,6 +661,244 @@ def test_recovery_waits_for_fresh_pending_request_id(tmp_path, monkeypatch):
     assert controller.pending_snapshot()["request_id"] == 99
     assert statuses[-1] == "pending-request"
     assert posts
+
+
+def test_recovery_limit_counts_only_successful_controllers(
+    tmp_path,
+    monkeypatch,
+):
+    bot = _bot(tmp_path, notification_only=False)
+    bot.config = replace(
+        bot.config,
+        profile=replace(
+            bot.config.profile,
+            codex_app_server_max_controllers=1,
+        ),
+    )
+    route = SlackbotRoute(channel_id="D111", thread_ts="1.000001")
+    binding = {
+        "kind": "codex_app_server",
+        "thread_id": "desktop-session",
+        "source": "vscode",
+        "cwd": "/workspace/exact",
+    }
+    controller = CodexAppController(bot, route, binding)
+    monkeypatch.setattr(
+        slackbot_module,
+        "_read_codex_app_jobs",
+        lambda paths: {
+            "jobs": {
+                "malformed": {
+                    "status": "active",
+                    "updated_at": "2026-07-21T00:00:02Z",
+                    "route": {},
+                    "binding": binding,
+                },
+                controller.route_key: {
+                    "status": "active",
+                    "updated_at": "2026-07-21T00:00:01Z",
+                    "route": {
+                        "channel_id": route.channel_id,
+                        "thread_ts": route.thread_ts,
+                    },
+                    "binding": binding,
+                },
+            }
+        },
+    )
+    recovered = []
+    monkeypatch.setattr(
+        bot,
+        "_get_codex_app_controller",
+        lambda recovered_route, recovered_binding, **kwargs: (
+            recovered.append(recovered_route) or controller
+        ),
+    )
+    monkeypatch.setattr(
+        bot,
+        "_record_codex_app_controller",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(bot, "_audit_codex_app", lambda *args, **kwargs: None)
+
+    bot._recover_codex_app_jobs()
+
+    assert recovered == [route]
+
+
+@pytest.mark.parametrize(
+    ("preparing_action", "recovery_method"),
+    (
+        ("start", "recover_start_turn"),
+        ("steer", "recover_steer"),
+    ),
+)
+def test_preparing_input_is_replayed_with_same_client_id(
+    tmp_path,
+    monkeypatch,
+    preparing_action,
+    recovery_method,
+):
+    bot = _bot(tmp_path, notification_only=False)
+    route = SlackbotRoute(channel_id="D111", thread_ts="1.000001")
+    binding = {
+        "kind": "codex_app_server",
+        "thread_id": "desktop-session",
+        "source": "vscode",
+        "cwd": "/workspace/exact",
+    }
+    controller = CodexAppController(bot, route, binding)
+    text = "continue the exact task"
+    client_message_id = "client-one"
+    text_hash = hashlib.sha256(text.encode()).hexdigest()
+    monkeypatch.setattr(
+        slackbot_module,
+        "_read_codex_app_jobs",
+        lambda paths: {
+            "jobs": {
+                controller.route_key: {
+                    "status": "preparing",
+                    "updated_at": "2026-07-21T00:00:00Z",
+                    "route": {
+                        "channel_id": route.channel_id,
+                        "thread_ts": route.thread_ts,
+                    },
+                    "binding": binding,
+                    "client_message_id": client_message_id,
+                    "text_sha256": text_hash,
+                    "preparing_action": preparing_action,
+                    "preparing_text": text,
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        bot,
+        "_get_codex_app_controller",
+        lambda *args, **kwargs: controller,
+    )
+    replayed = []
+
+    def fake_recover(recovered_text, recovered_client_id):
+        replayed.append((recovered_text, recovered_client_id))
+        with controller.lock:
+            controller.active_turn_id = "turn-recovered"
+            controller.terminal = False
+        return "turn-recovered"
+
+    monkeypatch.setattr(controller, recovery_method, fake_recover)
+    records = []
+    monkeypatch.setattr(
+        bot,
+        "_record_codex_app_controller",
+        lambda recovered_controller, **fields: records.append(fields),
+    )
+    monkeypatch.setattr(bot, "_audit_codex_app", lambda *args, **kwargs: None)
+
+    bot._recover_codex_app_jobs()
+
+    assert replayed == [(text, client_message_id)]
+    assert records[0]["status"] == "preparing"
+    assert records[0]["preparing_text"] == text
+    assert records[-1]["status"] == "active"
+    assert records[-1].get("preparing_text") is None
+
+
+@pytest.mark.parametrize(
+    ("message_text", "dispatch_method", "preparing_text"),
+    (
+        ("continue the task", "start_turn", "continue the task"),
+        ("steer add this", "steer", "add this"),
+    ),
+)
+def test_pre_dispatch_failure_clears_replayable_input(
+    tmp_path,
+    monkeypatch,
+    message_text,
+    dispatch_method,
+    preparing_text,
+):
+    bot = _bot(tmp_path, notification_only=False)
+    route = SlackbotRoute(channel_id="D111", thread_ts="1.000001")
+    binding = {
+        "kind": "codex_app_server",
+        "thread_id": "desktop-session",
+        "source": "vscode",
+        "cwd": "/workspace/exact",
+    }
+    controller = CodexAppController(bot, route, binding)
+    monkeypatch.setattr(
+        bot,
+        "_get_codex_app_controller",
+        lambda *args, **kwargs: controller,
+    )
+    monkeypatch.setattr(
+        controller,
+        dispatch_method,
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            CodexAppPreDispatchError("not sent")
+        ),
+    )
+    records = []
+    original_record = bot._record_codex_app_controller
+
+    def capture_record(recovered, **fields):
+        records.append(fields)
+        original_record(recovered, **fields)
+
+    monkeypatch.setattr(
+        bot,
+        "_record_codex_app_controller",
+        capture_record,
+    )
+    monkeypatch.setattr(bot, "_audit_codex_app", lambda *args, **kwargs: None)
+    posts = []
+    monkeypatch.setattr(
+        slackbot_module,
+        "post_slack_message",
+        lambda config, recovered_route, text: posts.append(text),
+    )
+
+    assert bot._maybe_handle_codex_app(
+        message_text,
+        route,
+        "U111",
+        event_id="event-one",
+        binding=binding,
+    )
+
+    assert records[0]["status"] == "preparing"
+    assert records[0]["preparing_text"] == preparing_text
+    assert records[-1]["status"] == "connected"
+    assert records[-1].get("preparing_text") is None
+    assert records[-1]["clear_client_identity"] is True
+    saved_job = slackbot_module._read_codex_app_jobs(bot.config.paths)[
+        "jobs"
+    ][controller.route_key]
+    assert saved_job["client_message_id"] is None
+    assert saved_job["text_sha256"] is None
+    assert saved_job["preparing_text"] is None
+    assert "not sent" in posts[-1]
+
+
+def test_start_turn_marks_refresh_failure_as_pre_dispatch(tmp_path):
+    bot = _bot(tmp_path, notification_only=False)
+    controller = CodexAppController(
+        bot,
+        SlackbotRoute(channel_id="D111", thread_ts="1.000001"),
+        {
+            "kind": "codex_app_server",
+            "thread_id": "desktop-session",
+            "source": "vscode",
+            "cwd": "/workspace/exact",
+        },
+    )
+    controller.refresh = lambda: (_ for _ in ()).throw(
+        CodexAppServerError("refresh failed")
+    )
+
+    with pytest.raises(CodexAppPreDispatchError, match="refresh failed"):
+        controller.start_turn("continue", "client-one")
 
 
 def test_recovery_does_not_overwrite_freshly_reissued_request(tmp_path):
@@ -858,6 +1099,78 @@ def test_only_safe_app_server_requests_are_relayed(tmp_path, monkeypatch):
     assert controller.pending_snapshot() is None
     assert len(connection.responses) == 1
     assert "Handle it in Desktop" in posts[-1]
+
+
+def test_stale_request_context_does_not_reuse_recovery_deadline(
+    tmp_path,
+    monkeypatch,
+):
+    FakeControllerConnection.instances.clear()
+    bot = _bot(tmp_path, notification_only=False)
+    monkeypatch.setattr(
+        slackbot_module,
+        "CodexAppServerConnection",
+        FakeControllerConnection,
+    )
+    posts = []
+    monkeypatch.setattr(
+        slackbot_module,
+        "post_slack_message",
+        lambda config, route, text: posts.append(text),
+    )
+    controller = CodexAppController(
+        bot,
+        SlackbotRoute(channel_id="D111", thread_ts="1.000001"),
+        {
+            "kind": "codex_app_server",
+            "thread_id": "desktop-session",
+            "source": "vscode",
+            "cwd": "/workspace/exact",
+        },
+    )
+    controller.connect()
+    stale_params = {
+        "threadId": "desktop-session",
+        "turnId": "turn-one",
+        "command": "git status",
+        "cwd": "/workspace/exact",
+    }
+    current_params = {**stale_params, "command": "git diff"}
+    stale_fingerprint = bot._codex_app_server_request_fingerprint(
+        "item/commandExecution/requestApproval",
+        stale_params,
+    )
+    monkeypatch.setattr(
+        slackbot_module,
+        "_read_codex_app_jobs",
+        lambda paths: {
+            "jobs": {
+                controller.route_key: {
+                    "status": "awaiting-request-replay",
+                    "pending_request": {
+                        "method": "item/commandExecution/requestApproval",
+                        "turn_id": "turn-one",
+                        "expires_at": time.time() - 1,
+                        "request_fingerprint": stale_fingerprint,
+                    },
+                }
+            }
+        },
+    )
+
+    bot._handle_codex_app_server_request(
+        controller,
+        {
+            "id": 44,
+            "method": "item/commandExecution/requestApproval",
+            "params": current_params,
+        },
+    )
+
+    pending = controller.pending_snapshot()
+    assert pending["request_id"] == 44
+    assert pending["expires_at"] > time.time()
+    assert "Codex requests command approval" in posts[-1]
 
 
 def test_failed_slack_request_delivery_clears_pending_state(

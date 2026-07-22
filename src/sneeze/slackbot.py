@@ -65,6 +65,10 @@ class CodexHookRetryableError(SlackbotError):
     pass
 
 
+class CodexAppPreDispatchError(SlackbotError):
+    pass
+
+
 class TmuxPaneMismatchError(SlackbotError):
     pass
 
@@ -6403,14 +6407,18 @@ def _update_codex_app_job(
             jobs.pop(key, None)
         else:
             current = jobs.get(key)
+            value = dict(value)
+            clear_client_identity = bool(
+                value.pop("_clear_client_identity", False)
+            )
             if isinstance(current, dict):
-                value = dict(value)
-                for field_name in (
-                    "client_message_id",
-                    "text_sha256",
-                ):
-                    if value.get(field_name) is None:
-                        value[field_name] = current.get(field_name)
+                if not clear_client_identity:
+                    for field_name in (
+                        "client_message_id",
+                        "text_sha256",
+                    ):
+                        if value.get(field_name) is None:
+                            value[field_name] = current.get(field_name)
             jobs[key] = value
         write_json_atomic(path, data)
 
@@ -10872,15 +10880,21 @@ class CodexAppController:
         return thread
 
     def start_turn(self, text: str, client_message_id: str) -> str:
-        self.refresh()
+        try:
+            self.refresh()
+        except (CodexAppServerError, OSError) as exc:
+            raise CodexAppPreDispatchError(str(exc)) from exc
         with self.lock:
             if self.active_turn_id:
-                raise SlackbotError(
+                raise CodexAppPreDispatchError(
                     "The Codex thread is active. Use `steer <text>` to add "
                     "input to its current turn."
                 )
             self.last_action_reused = False
-        connection = self._connection()
+        try:
+            connection = self._connection()
+        except CodexAppServerError as exc:
+            raise CodexAppPreDispatchError(str(exc)) from exc
         params = {
             "threadId": self.thread_id,
             "input": [{"type": "text", "text": text}],
@@ -10913,15 +10927,57 @@ class CodexAppController:
             self.terminal = False
         return turn_id
 
-    def steer(self, text: str, client_message_id: str) -> str:
+    def recover_start_turn(self, text: str, client_message_id: str) -> str:
+        connection = self._connection()
+        recovered_turn = self._turn_for_client_id(
+            connection,
+            client_message_id,
+        )
+        if recovered_turn is None:
+            return self.start_turn(text, client_message_id)
+        turn_id = str(recovered_turn.get("id") or "")
+        if not turn_id:
+            raise CodexAppServerProtocolError(
+                "Recovered Codex turn has no identifier"
+            )
         self.refresh()
+        with self.lock:
+            self.last_action_reused = True
+        return turn_id
+
+    def recover_steer(self, text: str, client_message_id: str) -> str:
+        connection = self._connection()
+        recovered_turn = self._turn_for_client_id(
+            connection,
+            client_message_id,
+        )
+        if recovered_turn is None:
+            return self.steer(text, client_message_id)
+        turn_id = str(recovered_turn.get("id") or "")
+        if not turn_id:
+            raise CodexAppServerProtocolError(
+                "Recovered Codex turn has no identifier"
+            )
+        self.refresh()
+        with self.lock:
+            self.last_action_reused = True
+        return turn_id
+
+    def steer(self, text: str, client_message_id: str) -> str:
+        try:
+            self.refresh()
+        except (CodexAppServerError, OSError) as exc:
+            raise CodexAppPreDispatchError(str(exc)) from exc
         with self.lock:
             turn_id = self.active_turn_id
         if not turn_id:
-            raise SlackbotError(
+            raise CodexAppPreDispatchError(
                 "The Codex thread has no active turn to steer."
             )
-        connection = self._connection()
+        try:
+            connection = self._connection()
+        except CodexAppServerError as exc:
+            raise CodexAppPreDispatchError(str(exc)) from exc
         with self.lock:
             self.last_action_reused = False
         try:
@@ -11001,6 +11057,7 @@ class CodexAppController:
             "method": pending.get("method"),
             "turn_id": pending.get("turn_id"),
             "expires_at": pending.get("expires_at"),
+            "request_fingerprint": pending.get("request_fingerprint"),
         }
         with self.lock:
             if self.pending_request is not None:
@@ -14174,7 +14231,10 @@ class SlackSocketBot:
             1,
             self.config.profile.codex_app_server_max_controllers,
         )
-        for key, job in candidates[:limit]:
+        recovered_count = 0
+        for key, job in candidates:
+            if recovered_count >= limit:
+                break
             route_data = job.get("route")
             binding = job.get("binding")
             if not isinstance(route_data, dict) or not isinstance(
@@ -14191,12 +14251,91 @@ class SlackSocketBot:
             ):
                 continue
             try:
-                controller = self._get_codex_app_controller(route, binding)
+                controller = self._get_codex_app_controller(
+                    route,
+                    binding,
+                    record_connected=False,
+                )
             except (CodexAppServerError, OSError, SlackbotError) as exc:
                 emit(
                     self.out,
                     "Could not recover Codex app-server controller for "
                     f"{key}: {exc}",
+                )
+                continue
+            recovered_count += 1
+            if job.get("status") == "preparing":
+                client_message_id = str(job.get("client_message_id") or "")
+                preparing_action = str(job.get("preparing_action") or "")
+                preparing_text = job.get("preparing_text")
+                text_hash = str(job.get("text_sha256") or "")
+                valid_preparing = (
+                    preparing_action in {"start", "steer"}
+                    and client_message_id
+                    and isinstance(preparing_text, str)
+                    and bool(preparing_text)
+                    and (
+                        not text_hash
+                        or hashlib.sha256(preparing_text.encode()).hexdigest()
+                        == text_hash
+                    )
+                )
+                if not valid_preparing:
+                    self._record_codex_app_controller(
+                        controller,
+                        status="desktop-required",
+                    )
+                    self._audit_codex_app(
+                        controller,
+                        "preparing_recovery_rejected",
+                    )
+                    continue
+                self._record_codex_app_controller(
+                    controller,
+                    status="preparing",
+                    client_message_id=client_message_id,
+                    text_hash=text_hash,
+                    preparing_action=preparing_action,
+                    preparing_text=preparing_text,
+                )
+                try:
+                    if preparing_action == "start":
+                        turn_id = controller.recover_start_turn(
+                            preparing_text,
+                            client_message_id,
+                        )
+                    else:
+                        turn_id = controller.recover_steer(
+                            preparing_text,
+                            client_message_id,
+                        )
+                except (CodexAppServerError, OSError, SlackbotError) as exc:
+                    emit(
+                        self.out,
+                        "Could not replay preparing Codex input for "
+                        f"{key}: {exc}",
+                    )
+                    self._audit_codex_app(
+                        controller,
+                        "preparing_recovery_deferred",
+                        error_type=type(exc).__name__,
+                    )
+                    continue
+                self._record_codex_app_controller(
+                    controller,
+                    status=(
+                        "active" if controller.active_turn_id else "completed"
+                    ),
+                    client_message_id=client_message_id,
+                    text_hash=text_hash,
+                )
+                self._audit_codex_app(
+                    controller,
+                    "preparing_recovered",
+                    turn_id=turn_id,
+                    preparing_action=preparing_action,
+                    client_message_id=client_message_id,
+                    text_sha256=text_hash,
                 )
                 continue
             pending = job.get("pending_request")
@@ -14337,6 +14476,8 @@ class SlackSocketBot:
         self,
         route: SlackbotRoute,
         binding: dict[str, Any],
+        *,
+        record_connected: bool = True,
     ) -> CodexAppController:
         route_key = agent_tmux_thread_key(
             str(route.channel_id or ""),
@@ -14369,7 +14510,11 @@ class SlackSocketBot:
             controller = CodexAppController(self, route, binding)
             controller.connect()
             self.codex_app_controllers[route_key] = controller
-            self._record_codex_app_controller(controller, status="connected")
+            if record_connected:
+                self._record_codex_app_controller(
+                    controller,
+                    status="connected",
+                )
             return controller
 
     def _record_codex_app_controller(
@@ -14379,6 +14524,9 @@ class SlackSocketBot:
         status: str,
         client_message_id: str | None = None,
         text_hash: str | None = None,
+        preparing_action: str | None = None,
+        preparing_text: str | None = None,
+        clear_client_identity: bool = False,
     ) -> None:
         snapshot = controller.status_snapshot()
         pending = controller.pending_persistence_snapshot()
@@ -14392,12 +14540,16 @@ class SlackSocketBot:
             "thread_status": snapshot["thread_status"],
             "client_message_id": client_message_id,
             "text_sha256": text_hash,
+            "preparing_action": preparing_action,
+            "preparing_text": preparing_text,
+            "_clear_client_identity": clear_client_identity,
             "pending_request": (
                 {
                     "request_id": pending.get("request_id"),
                     "method": pending.get("method"),
                     "turn_id": pending.get("turn_id"),
                     "expires_at": pending.get("expires_at"),
+                    "request_fingerprint": pending.get("request_fingerprint"),
                 }
                 if pending
                 else None
@@ -14408,6 +14560,25 @@ class SlackSocketBot:
             self.config,
             controller.route_key,
             value,
+        )
+
+    def _clear_codex_app_preparing(
+        self,
+        controller: CodexAppController,
+    ) -> None:
+        snapshot = controller.status_snapshot()
+        if snapshot["disconnected"]:
+            status = "disconnected"
+        elif controller.terminal:
+            status = "completed"
+        elif snapshot["active_turn_id"]:
+            status = "active"
+        else:
+            status = "connected"
+        self._record_codex_app_controller(
+            controller,
+            status=status,
+            clear_client_identity=True,
         )
 
     def _audit_codex_app(
@@ -14448,6 +14619,19 @@ class SlackSocketBot:
                 json.dumps(identity, sort_keys=True, separators=(",", ":")),
             )
         )
+
+    @staticmethod
+    def _codex_app_server_request_fingerprint(
+        method: str,
+        params: dict[str, Any],
+    ) -> str:
+        encoded = json.dumps(
+            {"method": method, "params": params},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return hashlib.sha256(encoded).hexdigest()
 
     def _maybe_handle_codex_app(
         self,
@@ -14573,11 +14757,32 @@ class SlackSocketBot:
                     "steer",
                     steering_text,
                 )
-                turn_id = controller.steer(
-                    steering_text,
-                    client_message_id,
-                )
                 text_hash = hashlib.sha256(steering_text.encode()).hexdigest()
+                self._record_codex_app_controller(
+                    controller,
+                    status="preparing",
+                    client_message_id=client_message_id,
+                    text_hash=text_hash,
+                    preparing_action="steer",
+                    preparing_text=steering_text,
+                )
+                try:
+                    turn_id = controller.steer(
+                        steering_text,
+                        client_message_id,
+                    )
+                except CodexAppPreDispatchError:
+                    try:
+                        self._clear_codex_app_preparing(
+                            controller,
+                        )
+                    except (OSError, SlackbotError) as exc:
+                        emit(
+                            self.out,
+                            "Could not clear pre-dispatch steering state: "
+                            f"{exc}",
+                        )
+                    raise
                 self._record_codex_app_controller(
                     controller,
                     status="active",
@@ -14615,6 +14820,8 @@ class SlackSocketBot:
                 status="preparing",
                 client_message_id=client_message_id,
                 text_hash=text_hash,
+                preparing_action="start",
+                preparing_text=stripped,
             )
             self._audit_codex_app(
                 controller,
@@ -14622,7 +14829,22 @@ class SlackSocketBot:
                 client_message_id=client_message_id,
                 text_sha256=text_hash,
             )
-            turn_id = controller.start_turn(stripped, client_message_id)
+            try:
+                turn_id = controller.start_turn(
+                    stripped,
+                    client_message_id,
+                )
+            except CodexAppPreDispatchError:
+                try:
+                    self._clear_codex_app_preparing(
+                        controller,
+                    )
+                except (OSError, SlackbotError) as exc:
+                    emit(
+                        self.out,
+                        "Could not clear pre-dispatch turn state: " f"{exc}",
+                    )
+                raise
             self._record_codex_app_controller(
                 controller,
                 status=(
@@ -14843,11 +15065,23 @@ class SlackSocketBot:
                 if isinstance(saved_job, dict)
                 else None
             )
-            if (
-                isinstance(saved_pending, dict)
+            request_turn_id = str(params.get("turnId") or "") or None
+            request_fingerprint = self._codex_app_server_request_fingerprint(
+                method,
+                params,
+            )
+            recovered_replay = bool(
+                isinstance(saved_job, dict)
+                and saved_job.get("status") == "awaiting-request-replay"
+                and isinstance(saved_pending, dict)
                 and saved_pending.get("method") == method
+                and request_turn_id
+                and saved_pending.get("turn_id") == request_turn_id
+                and saved_pending.get("request_fingerprint")
+                == request_fingerprint
                 and saved_pending.get("expires_at") is not None
-            ):
+            )
+            if recovered_replay:
                 try:
                     expires_at = min(
                         expires_at,
@@ -14871,14 +15105,15 @@ class SlackSocketBot:
                     "request_expired",
                     request_id=message.get("id"),
                     request_method=method,
-                    recovered=True,
+                    recovered=recovered_replay,
                 )
                 return
             pending = {
                 "request_id": message.get("id"),
                 "method": method,
-                "turn_id": str(params.get("turnId") or "") or None,
+                "turn_id": request_turn_id,
                 "expires_at": expires_at,
+                "request_fingerprint": request_fingerprint,
                 "questions": questions if safe_questions else None,
             }
             rendered_request = self._render_codex_app_server_request(
