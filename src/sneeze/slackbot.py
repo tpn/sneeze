@@ -261,6 +261,7 @@ DEFINITIVE_SLACK_API_ERRORS = frozenset(
         "invalid_arg_name",
         "invalid_array_arg",
         "invalid_auth",
+        "invalid_blocks",
         "invalid_charset",
         "invalid_form_data",
         "invalid_post_type",

@@ -5160,9 +5160,11 @@ def test_codex_stop_hook_retries_ambiguous_conversations_join(
     assert not list(Path(state_path).parent.rglob("*.receipt.json"))
 
 
+@pytest.mark.parametrize("error_code", ("invalid_auth", "invalid_blocks"))
 def test_codex_stop_hook_retries_after_definitive_slack_rejection(
     tmp_path,
     monkeypatch,
+    error_code,
 ):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
@@ -5175,16 +5177,19 @@ def test_codex_stop_hook_retries_after_definitive_slack_rejection(
     )
     calls = []
 
-    def fake_post(config, route, text, blocks):
-        calls.append(route)
+    def fake_slack_api_post(token, method, payload):
+        if method == "conversations.open":
+            return {"ok": True, "channel": {"id": "D111"}}
+        assert method == "chat.postMessage"
+        assert payload["blocks"]
+        calls.append(method)
         if len(calls) == 1:
-            raise SlackApiError(
-                "chat.postMessage",
-                {"ok": False, "error": "invalid_auth"},
-            )
-        return {"channel": "D111", "ts": "1.000001"}
+            raise SlackApiError(method, {"ok": False, "error": error_code})
+        return {"ok": True, "channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
+    monkeypatch.setattr(
+        slackbot_module, "slack_api_post", fake_slack_api_post
+    )
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -5193,7 +5198,7 @@ def test_codex_stop_hook_retries_after_definitive_slack_rejection(
         }
     )
 
-    with pytest.raises(SlackApiError, match="invalid_auth"):
+    with pytest.raises(SlackApiError, match=error_code):
         notify_codex_agent_stop(profile, payload)
     state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
     assert not list(Path(state_path).parent.rglob("*.receipt.json"))
