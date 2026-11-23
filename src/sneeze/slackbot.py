@@ -43,6 +43,7 @@ from .codex_app_server import (
 )
 from .codex_sessions import (
     CodexSessionMetadata,
+    codex_thread_name,
     resolve_codex_hook_message,
     resolve_codex_session_metadata,
 )
@@ -3161,12 +3162,11 @@ def post_slack_message(
     if single_message_max_chars is None:
         chunks = chunk_text(rendered_text)
     else:
-        suffix = "\n\n[Notification truncated to fit one Slack message.]"
-        if len(rendered_text) > single_message_max_chars:
-            suffix = suffix[:single_message_max_chars]
-            prefix_length = max(0, single_message_max_chars - len(suffix))
-            rendered_text = rendered_text[:prefix_length].rstrip() + suffix
-        chunks = [rendered_text]
+        chunks = [
+            _truncate_slack_notification(
+                rendered_text, single_message_max_chars
+            )
+        ]
     first_response = None
     post_route = route
     force_response_url = False
@@ -3198,9 +3198,18 @@ def post_slack_message(
     return first_response
 
 
-def render_route_text(route: SlackbotRoute, text: str) -> str:
+def _truncate_slack_notification(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    suffix = "\n\n[Notification truncated to fit one Slack message.]"[:limit]
+    return text[: limit - len(suffix)].rstrip() + suffix
+
+
+def render_route_text(
+    route: SlackbotRoute, text: str, *, mrkdwn: bool = True
+) -> str:
     prefix = " ".join(f"<@{user}>" for user in route.mention_user_ids)
-    slack_text = markdown_to_slack_mrkdwn(text)
+    slack_text = markdown_to_slack_mrkdwn(text) if mrkdwn else text
     return f"{prefix} {slack_text}".strip() if prefix else slack_text
 
 
@@ -3353,7 +3362,9 @@ def post_slack_blocks(
     text: str,
     blocks: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    rendered_text = render_route_text(route, text)
+    rendered_text = render_route_text(
+        route, text, mrkdwn=SLACK_SINGLE_MESSAGE_MRKDWN.get() is not False
+    )
     rendered_blocks = render_slack_blocks(blocks)
     if not config.bot_token and route.response_url:
         return slack_response_url_post(
@@ -7903,6 +7914,77 @@ def _codex_hook_message_is_ui_directive(message: str) -> bool:
     )
 
 
+# Match code first so examples of links inside code survive verbatim. Codex
+# emits angle-wrapped destinations for local paths containing whitespace.
+_CODEX_SLACK_MARKDOWN = re.compile(
+    r"(?P<escape>\\[\\`*_#\[\]()<>!~])"
+    r"|^ {0,3}(?P<fence>`{3,}|~{3,})[^\n]*\n(?P<block>(?s:.*?))"
+    r"(?:^ {0,3}(?P=fence)[`~]*[ \t]*$|\Z)"
+    r"|(?<!`)(?P<ticks>`++)(?P<code>[^\n]*?)(?<!`)(?P=ticks)(?!`)"
+    r"|!?\[(?P<label>(?:\\.|[^\\\[\]\n])+)\]\("
+    r"(?:<(?P<angle>[^<>\n]+)>|(?P<dest>(?:[^\s()<>]|\([^\s()]*\))+))\)"
+    r"|(?P<heading>^ {0,3}#{1,6}[ \t]+)"
+    r"|(?P<paragraph>\n[ \t]*\n)"
+    r"|(?P<closer>(?<=[^\s*_~])(?:\*{1,3}|_{1,3}|~~)(?!\w))"
+    r"|(?P<opener>(?<!\w)(?:\*{1,3}|_{1,3}|~~)(?=[^\s*_~]))",
+    re.MULTILINE,
+)
+
+
+def _codex_slack_markdown(text: str) -> str:
+    """Keep Codex Markdown, rendering local file links as copyable paths."""
+    if "](" not in text:
+        return text
+
+    def local_link(match: re.Match[str]) -> str:
+        path = match["angle"] or match["dest"]
+        if not path or not path.startswith("/") or path.startswith("//"):
+            return match[0]
+        delimiter = "`"
+        if "`" in path:
+            ticks = max(len(run) for run in re.findall(r"`+", path))
+            delimiter = "`" * (ticks + 1)
+            path = f" {path} "
+        code = f"{delimiter}{path}{delimiter}"
+        label = match["label"]
+        return code if label == path.strip() else f"{label} ({code})"
+
+    return _CODEX_SLACK_MARKDOWN.sub(local_link, text)
+
+
+def _codex_slack_plain_text(text: str) -> str:
+    """Read the same content as the Slack blocks in notification previews."""
+    parts: list[str] = []
+    open_markers: dict[str, list[int]] = {}
+    end = 0
+    for match in _CODEX_SLACK_MARKDOWN.finditer(text):
+        parts.append(text[end : match.start()])
+        end = match.end()
+        token = match[0]
+        if match["label"] is not None:
+            token = _codex_slack_plain_text(match["label"])
+        elif match["block"] is not None:
+            open_markers.clear()
+            token = match["block"].removesuffix("\n")
+        elif match["code"] is not None:
+            token = match["code"]
+        elif match["escape"] is not None:
+            token = token[1:]
+        elif match["heading"] is not None:
+            open_markers.clear()
+            token = ""
+        elif match["paragraph"] is not None:
+            open_markers.clear()
+        elif match["opener"] is not None:
+            open_markers.setdefault(token, []).append(len(parts))
+        elif open_markers.get(token):
+            parts[open_markers[token].pop()] = ""
+            token = ""
+        parts.append(token)
+    parts.append(text[end:])
+    return "".join(parts)
+
+
 def _codex_hook_notify_override(
     environment: dict[str, str],
 ) -> tuple[bool | None, bool]:
@@ -8946,57 +9028,35 @@ def _locked_codex_hook_pre_delivery_state(state_path: str):
 
 
 def _render_codex_stop_notification(
-    payload: dict[str, Any],
-    binding: dict[str, str] | None,
     message: str,
     *,
-    first_message: bool,
-    app_server_candidate: dict[str, Any] | None = None,
-    metadata_error: str | None = None,
-) -> str:
-    lines = ["Codex turn finished."]
-    session_id = _codex_hook_text_value(payload, "session_id")
-    turn_id = _codex_hook_text_value(payload, "turn_id")
-    cwd = _codex_hook_text_value(payload, "cwd")
-    details = []
-    if session_id:
-        details.append(f"session {session_id}")
-    if turn_id:
-        details.append(f"turn {turn_id}")
-    if cwd:
-        details.append(f"cwd {cwd}")
-    if binding:
-        tmux_socket = tmux_socket_display_name(binding.get("tmux_socket"))
-        tmux_pane = binding.get("tmux_pane")
-        pane_detail = f" pane {tmux_pane}" if tmux_pane else ""
-        details.append(
-            "tmux "
-            f"{binding.get('host')}:{binding.get('tmux_session')} "
-            f"socket {tmux_socket}{pane_detail}"
+    title: str | None,
+    project: str | None,
+    footer: str | None,
+) -> tuple[str, list[dict[str, Any]]]:
+    heading = (
+        " · ".join(
+            " ".join(part.split()) for part in (title, project) if part
         )
-    if details:
-        lines.append(" | ".join(details))
-    if first_message and binding:
-        lines.append(
-            "Reply in this thread to send text to the bound tmux pane "
-            "when it is idle. status, tail, p, n, and cancel "
-            "keep their tmux controls."
+        or "Codex turn finished"
+    )
+    if len(heading) > 150:  # Slack header block limit.
+        heading = heading[:149].rstrip() + "…"
+
+    footer_text = f"\n\n{footer}" if footer else ""
+    limit = MAX_SLACK_TEXT_CHARS - len(heading) - 2 - len(footer_text)
+    body = _truncate_slack_notification(message, limit)
+    body = _truncate_slack_notification(_codex_slack_markdown(body), limit)
+    blocks = [
+        {"type": "header", "text": _block_plain_text(heading)},
+        {"type": "markdown", "text": body},
+    ]
+    if footer:
+        blocks.append(
+            {"type": "context", "elements": [_block_plain_text(footer)]}
         )
-    elif first_message and app_server_candidate:
-        lines.append(
-            "Reply in this thread to continue the exact Codex session. "
-            "Use status, steer <text>, cancel, or help for app controls."
-        )
-    elif first_message:
-        lines.append(
-            "No interactive transport was verified. This notification is "
-            "read-only."
-        )
-    if metadata_error:
-        lines.append(f"Codex metadata lookup degraded: {metadata_error}.")
-    lines.append("")
-    lines.append(message)
-    return "\n".join(lines)
+    fallback = _codex_slack_plain_text(body)
+    return f"{heading}\n\n{fallback}{footer_text}", blocks
 
 
 def _codex_app_server_metadata_eligible(
@@ -9812,11 +9872,27 @@ def notify_codex_agent_stop(
                         raise
 
                 delivery_stage_callback = update_delivery_stage
-            first_message = not (channel_id and thread_ts)
             route = (
                 SlackbotRoute(channel_id=channel_id, thread_ts=thread_ts)
                 if channel_id and thread_ts
                 else SlackbotRoute(dm_user_id=notify_user_id)
+            )
+            footer = None
+            if not route.thread_ts:
+                if binding:
+                    footer = "Reply in this thread when the terminal is idle."
+                elif app_server_candidate:
+                    footer = "Reply in this thread to continue."
+                else:
+                    footer = "This notification is read-only."
+            cwd = _codex_hook_text_value(payload, "cwd") or metadata.cwd
+            fallback, blocks = _render_codex_stop_notification(
+                message,
+                title=codex_thread_name(
+                    session_id, environment=hook_environment
+                ),
+                project=Path(cwd).name if cwd else None,
+                footer=footer,
             )
             try:
                 with (
@@ -9838,17 +9914,8 @@ def notify_codex_agent_stop(
                         client_msg_id=client_msg_id,
                     ),
                 ):
-                    response = post_slack_message(
-                        config,
-                        route,
-                        _render_codex_stop_notification(
-                            payload,
-                            binding,
-                            message,
-                            first_message=first_message,
-                            app_server_candidate=app_server_candidate,
-                            metadata_error=decision.metadata_error,
-                        ),
+                    response = post_slack_blocks(
+                        config, route, fallback, blocks
                     )
             except Exception as exc:
                 if turn_id is None and _slack_post_failure_is_definitive(exc):
