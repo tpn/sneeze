@@ -4,6 +4,7 @@ from pathlib import Path
 
 import sneeze.slackbot as slackbot_module
 from sneeze.codex_sessions import (
+    codex_thread_name,
     resolve_codex_hook_message,
     resolve_codex_session_metadata,
 )
@@ -113,6 +114,24 @@ def _write_session(
     finally:
         connection.close()
     return rollout_path
+
+
+def test_codex_thread_name_uses_latest_valid_name(tmp_path):
+    environment = {"CODEX_HOME": str(tmp_path)}
+    assert codex_thread_name("target", environment=environment) is None
+    (tmp_path / "session_index.jsonl").write_bytes(
+        b'{"id":"target","thread_name":"First name"}\n'
+        b'{"id":"target","thread_name":" Updated name "}\n'
+        b'{"id":"target","thread_name":"  "}\n'
+        b'{"id":"target","thread_name":42}\n'
+        b'{"id":"other","thread_name":"Another chat"}\n'
+        b'[]\n\xff\n{"id":"target",'
+    )
+    assert codex_thread_name("target", environment=environment) == (
+        "Updated name"
+    )
+    assert codex_thread_name("unlisted", environment=environment) is None
+    assert codex_thread_name(None, environment=environment) is None
 
 
 def test_exact_session_and_turn_resolve_from_codex_root(tmp_path):
@@ -395,7 +414,7 @@ def test_stop_hook_skips_roborev_before_slack_delivery(
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.setattr(
         slackbot_module,
-        "post_slack_message",
+        "post_slack_blocks",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("Roborev Stop hook reached Slack delivery")
         ),
