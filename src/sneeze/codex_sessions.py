@@ -66,6 +66,33 @@ def codex_home_path(
     )
 
 
+def codex_thread_name(
+    session_id: str | None,
+    *,
+    environment: dict[str, str] | None = None,
+) -> str | None:
+    """Return the latest saved name for this chat, including renames."""
+    if not session_id:
+        return None
+    index = codex_home_path(environment=environment) / "session_index.jsonl"
+    latest_name = None
+    try:
+        with index.open("rb") as records:
+            for line in records:
+                try:
+                    record = json.loads(line)
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                name = record.get("thread_name")
+                if record.get("id") == session_id and isinstance(name, str):
+                    latest_name = name.strip() or latest_name
+    except OSError:
+        pass
+    return latest_name
+
+
 def _safe_rollout_path(value: Any, codex_home: Path) -> Path | None:
     text = _text(value)
     if not text:

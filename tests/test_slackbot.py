@@ -4046,14 +4046,6 @@ def test_tmux_binding_records_unqualified_default_server(
     assert tmux_socket == slackbot_module.TMUX_DEFAULT_SERVER_SOCKET
     assert "-L" not in command
     assert "-S" not in command
-    rendered = slackbot_module._render_codex_stop_notification(
-        {},
-        binding,
-        "Done.",
-        first_message=True,
-    )
-    assert "socket default" in rendered
-    assert slackbot_module.TMUX_DEFAULT_SERVER_SOCKET not in rendered
 
 
 def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
@@ -4068,31 +4060,42 @@ def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
         + "SAMPLE_AGENT_NOTIFY_SLACK_USER_ID=U111\n",
         encoding="utf-8",
     )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    index = tmp_path / "session_index.jsonl"
+    index.write_text(
+        '{"id":"codex-session-1","thread_name":"Review benchmark"}\n',
+        encoding="utf-8",
+    )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_slack_api_post(token, method, payload):
         policy = slackbot_module.SLACK_API_REQUEST_POLICY.get()
         assert policy["timeout_seconds"] == 2.0
         assert policy["attempts"] == 2
         assert policy["retry_delay_seconds"] == 1.0
         assert policy["deadline_monotonic"] > time.monotonic()
-        calls.append((route, text))
-        if len(calls) == 1:
-            assert route.dm_user_id == "U111"
-            assert route.thread_ts is None
-            return {"channel": "D111", "ts": "1.000001"}
-        assert route.channel_id == "D111"
-        assert route.thread_ts == "1.000001"
+        if method == "conversations.open":
+            assert payload["users"] == "U111"
+            return {"channel": {"id": "D111"}}
+        assert method == "chat.postMessage"
+        assert payload["channel"] == "D111"
+        calls.append(payload)
         return {"channel": "D111", "ts": f"{len(calls)}.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr(
+        slackbot_module, "slack_api_post", fake_slack_api_post
+    )
 
+    answer = (
+        "**Fix the `run.py` harness first.**\n\n"
+        "1. See [PR #42](https://example.org/pull/42)."
+    )
     payload = {
         "session_id": "codex-session-1",
         "turn_id": "turn-1",
-        "cwd": str(tmp_path),
+        "cwd": str(tmp_path / "cccl"),
         "hook_event_name": "Stop",
-        "last_assistant_message": "Ready for review.",
+        "last_assistant_message": answer,
     }
     result = notify_codex_agent_stop(
         profile,
@@ -4107,6 +4110,10 @@ def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
         tmux_socket="codex",
     )
     payload["turn_id"] = "turn-2"
+    with index.open("a", encoding="utf-8") as handle:
+        handle.write(
+            '{"id":"codex-session-1","thread_name":"Renamed review"}\n'
+        )
     payload["last_assistant_message"] = "Second stop."
     second = notify_codex_agent_stop(
         profile,
@@ -4129,8 +4136,29 @@ def test_codex_stop_hook_creates_reuses_and_dedupes_dm_thread(
     assert second["thread_ts"] == "1.000001"
     assert fallback["key"] == "session:codex-session-1"
     assert len(calls) == 3
-    assert "Reply in this thread" in calls[0][1]
-    assert "Second stop." in calls[1][1]
+    first, followup, sessionless = calls
+    assert "thread_ts" not in first
+    assert followup["thread_ts"] == sessionless["thread_ts"] == "1.000001"
+    heading, body, footer = first["blocks"]
+    assert heading["type"] == "header"
+    assert heading["text"]["text"] == "Review benchmark · cccl"
+    assert body == {"type": "markdown", "text": answer}
+    assert footer["type"] == "context"
+    assert footer["elements"][0]["text"] == (
+        "Reply in this thread when the terminal is idle."
+    )
+    assert first["text"].startswith("Review benchmark · cccl")
+    assert "Fix the run.py harness first." in first["text"]
+    assert "PR #42" in first["text"]
+    assert "https://" not in first["text"]
+    assert "codex-session-1" not in first["text"]
+    assert "turn-1" not in first["text"]
+    assert "codex-work" not in first["text"]
+    assert str(tmp_path) not in first["text"]
+    second_heading, second_body = followup["blocks"]
+    assert second_heading["text"]["text"] == "Renamed review · cccl"
+    assert second_body == {"type": "markdown", "text": "Second stop."}
+    assert "Reply in this thread" not in followup["text"]
     binding = query_agent_tmux_thread(
         profile,
         channel_id="D111",
@@ -4166,8 +4194,8 @@ def test_codex_stop_hook_repairs_invalid_sessions_state(
         {"sessions": ["invalid"], "preserved": True},
     )
     monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
-        lambda config, route, text: {
+        "sneeze.slackbot.post_slack_blocks",
+        lambda config, route, text, blocks: {
             "channel": "D111",
             "ts": "1.000001",
         },
@@ -4193,7 +4221,14 @@ def test_codex_stop_hook_repairs_invalid_sessions_state(
     assert "session:codex-session-repair" in repaired["sessions"]
 
 
-def test_codex_stop_hook_posts_long_notification_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("message", "prefix"),
+    [("x" * 8000, "x" * 3000), (("[/x](/x) " * 450).rstrip(), "`/x` ")],
+    ids=["plain", "local-links"],
+)
+def test_codex_stop_hook_posts_long_notification_once(
+    tmp_path, monkeypatch, message, prefix
+):
     profile = make_profile(tmp_path)
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
     env_path = Path(load_config(profile).paths.env_path)
@@ -4223,7 +4258,7 @@ def test_codex_stop_hook_posts_long_notification_once(tmp_path, monkeypatch):
             {
                 "session_id": "codex-session-long",
                 "turn_id": "turn-1",
-                "last_assistant_message": "x" * 8000,
+                "last_assistant_message": message,
             }
         ),
     )
@@ -4235,16 +4270,20 @@ def test_codex_stop_hook_posts_long_notification_once(tmp_path, monkeypatch):
         slackbot_module._codex_hook_client_msg_id(
             key="session:codex-session-long",
             turn_id="turn-1",
-            message_hash=slackbot_module._codex_hook_message_hash("x" * 8000),
+            message_hash=slackbot_module._codex_hook_message_hash(message),
             notify_user_id="U111",
             transcript_path=None,
         )
     )
-    assert len(calls[0]["text"]) == slackbot_module.MAX_SLACK_TEXT_CHARS
-    assert calls[0]["text"].endswith(
-        "[Notification truncated to fit one Slack message.]"
-    )
-    assert "`" not in calls[0]["text"]
+    heading, body, footer = calls[0]["blocks"]
+    assert heading["text"]["text"] == "Codex turn finished"
+    assert footer["elements"][0]["text"] == "This notification is read-only."
+    assert body["text"].startswith(prefix)
+    marker = "[Notification truncated to fit one Slack message.]"
+    assert body["text"].endswith(marker)
+    assert len(calls[0]["text"]) <= slackbot_module.MAX_SLACK_TEXT_CHARS
+    assert calls[0]["text"].endswith(footer["elements"][0]["text"])
+    assert marker in calls[0]["text"]
 
 
 @pytest.mark.parametrize("manual_session", (None, "manual-session"))
@@ -4278,11 +4317,11 @@ def test_codex_stop_hook_rejected_pane_clears_only_stale_binding(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append(route)
         return {"channel": "D111", "ts": f"{len(calls)}.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     payload = {
         "session_id": "codex-session-1",
         "turn_id": "turn-1",
@@ -4373,8 +4412,8 @@ def test_codex_stop_hook_tmux_oserror_posts_read_only_notification(
     )
     posts = []
     monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
-        lambda config, route, text: (
+        "sneeze.slackbot.post_slack_blocks",
+        lambda config, route, text, blocks: (
             posts.append(text) or {"channel": "D111", "ts": "1.000001"}
         ),
     )
@@ -4438,8 +4477,8 @@ def test_codex_stop_hook_session_binding_replaces_stale_pane_fields(
         fake_pane_identity,
     )
     monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
-        lambda config, route, text: {
+        "sneeze.slackbot.post_slack_blocks",
+        lambda config, route, text, blocks: {
             "channel": "D111",
             "ts": "1.000001",
         },
@@ -4522,8 +4561,8 @@ def test_codex_stop_hook_unresolved_requested_pane_clears_binding(
     )
     calls = []
     monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
-        lambda config, route, text: (
+        "sneeze.slackbot.post_slack_blocks",
+        lambda config, route, text, blocks: (
             calls.append(route)
             or {"channel": "D111", "ts": f"{len(calls)}.000001"}
         ),
@@ -4617,8 +4656,8 @@ def test_codex_stop_hook_unresolved_payload_pane_ignores_inherited_socket(
         fake_pane_identity,
     )
     monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
-        lambda config, route, text: {
+        "sneeze.slackbot.post_slack_blocks",
+        lambda config, route, text, blocks: {
             "channel": "D111",
             "ts": "1.000001",
         },
@@ -4678,8 +4717,8 @@ def test_codex_stop_hook_named_session_omits_mismatched_ambient_pane_key(
         ),
     )
     monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
-        lambda config, route, text: {
+        "sneeze.slackbot.post_slack_blocks",
+        lambda config, route, text, blocks: {
             "channel": "D111",
             "ts": "1.000001",
         },
@@ -4750,8 +4789,8 @@ def test_codex_stop_hook_payload_pane_rejects_unavailable_fallback(
     )
     calls = []
     monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
-        lambda config, route, text: (
+        "sneeze.slackbot.post_slack_blocks",
+        lambda config, route, text, blocks: (
             calls.append(route) or {"channel": "D111", "ts": "1.000001"}
         ),
     )
@@ -4806,8 +4845,8 @@ def test_codex_stop_hook_explicit_socket_without_pane_rejects_stale_binding(
     ):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
-        lambda config, route, text: {
+        "sneeze.slackbot.post_slack_blocks",
+        lambda config, route, text, blocks: {
             "channel": "D111",
             "ts": "1.000001",
         },
@@ -4905,11 +4944,11 @@ def test_codex_stop_hook_bounds_dedupe_without_turn_id(tmp_path, monkeypatch):
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append(route)
         return {"channel": "D111", "ts": f"{len(calls)}.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -4953,7 +4992,7 @@ def test_codex_stop_hook_refuses_to_repeat_ambiguous_sessionless_post(
     clock = [119.9]
     client_msg_ids = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         slackbot_module._mark_slack_delivery_stage("posting")
         client_msg_ids.append(slackbot_module.SLACK_CLIENT_MSG_ID.get())
         if len(client_msg_ids) == 1:
@@ -4961,7 +5000,7 @@ def test_codex_stop_hook_refuses_to_repeat_ambiguous_sessionless_post(
         return {"channel": "D111", "ts": "1.000001"}
 
     monkeypatch.setattr(slackbot_module.time, "time", lambda: clock[0])
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -5136,7 +5175,7 @@ def test_codex_stop_hook_retries_after_definitive_slack_rejection(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append(route)
         if len(calls) == 1:
             raise SlackApiError(
@@ -5145,7 +5184,7 @@ def test_codex_stop_hook_retries_after_definitive_slack_rejection(
             )
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -5184,7 +5223,7 @@ def test_codex_stop_hook_preserves_receipt_for_transient_slack_error(
     )
     monkeypatch.setattr(
         slackbot_module,
-        "post_slack_message",
+        "post_slack_blocks",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             SlackApiError(
                 "chat.postMessage",
@@ -5235,7 +5274,7 @@ def test_codex_stop_hook_classifies_http_failure_for_receipt(
     )
     monkeypatch.setattr(
         slackbot_module,
-        "post_slack_message",
+        "post_slack_blocks",
         lambda *args, **kwargs: (_ for _ in ()).throw(error),
     )
     payload = json.dumps(
@@ -5285,7 +5324,7 @@ def test_codex_stop_hook_fails_closed_for_malformed_receipt(
     posts = []
     monkeypatch.setattr(
         slackbot_module,
-        "post_slack_message",
+        "post_slack_blocks",
         lambda *args, **kwargs: posts.append(args),
     )
 
@@ -5411,7 +5450,7 @@ def test_codex_stop_hook_recovers_partial_pending_receipt_write(
 
     client_msg_ids = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         client_msg_ids.append(slackbot_module.SLACK_CLIENT_MSG_ID.get())
         return {"channel": "D111", "ts": "1.000001"}
 
@@ -5419,7 +5458,7 @@ def test_codex_stop_hook_recovers_partial_pending_receipt_write(
         "sneeze.slackbot.write_json_atomic",
         fail_second_pending_write,
     )
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -5484,7 +5523,7 @@ def test_codex_stop_hook_cleans_partial_posting_receipt_write(
 
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         slackbot_module._mark_slack_delivery_stage("posting")
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
@@ -5494,7 +5533,7 @@ def test_codex_stop_hook_cleans_partial_posting_receipt_write(
         "write_json_atomic",
         fail_second_posting_write,
     )
-    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -5543,14 +5582,14 @@ def test_sessionless_retry_recovers_aged_legacy_delivered_receipt(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
     def fail_bind(*args, **kwargs):
         raise OSError("simulated binding failure")
 
-    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
     monkeypatch.setattr(slackbot_module, "bind_agent_tmux_thread", fail_bind)
     payload = json.dumps(
         {
@@ -5619,7 +5658,7 @@ def test_codex_stop_hook_starts_new_thread_when_recipient_changes(
         monkeypatch.delenv(env_name, raising=False)
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         if route.dm_user_id == "U111":
             return {"channel": "D111", "ts": "1.000001"}
@@ -5629,7 +5668,7 @@ def test_codex_stop_hook_starts_new_thread_when_recipient_changes(
             return {"channel": "D333", "ts": "4.000001"}
         return {"channel": route.channel_id, "ts": "3.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     payload = {
         "session_id": "codex-session-1",
         "turn_id": "turn-1",
@@ -5733,12 +5772,12 @@ def test_codex_stop_hook_keeps_distinct_sessions_on_same_tmux_separate(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append(route)
         index = len(calls)
         return {"channel": "D111", "ts": f"{index}.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
 
     for session_id in ("codex-session-1", "codex-session-2"):
         notify_codex_agent_stop(
@@ -5888,8 +5927,8 @@ def test_codex_stop_hook_migrates_named_socket_alias_without_duplicate(
         monkeypatch.delenv(env_name, raising=False)
     calls = []
     monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
-        lambda config, route, text: (
+        "sneeze.slackbot.post_slack_blocks",
+        lambda config, route, text, blocks: (
             calls.append(route) or {"channel": "D111", "ts": "1.000001"}
         ),
     )
@@ -5959,11 +5998,11 @@ def test_codex_stop_hook_keeps_sessionless_tmux_panes_separate(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append(route)
         return {"channel": f"D{len(calls)}", "ts": f"{len(calls)}.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
 
     def hook_payload(pane, turn_id):
         return json.dumps(
@@ -6054,11 +6093,11 @@ def test_codex_stop_hook_sessionless_rejects_unavailable_requested_pane(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append(route)
         return {"channel": f"D{len(calls)}", "ts": f"{len(calls)}.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     payload = {
         "turn_id": "turn-1",
         "last_assistant_message": "Initial stop.",
@@ -6118,11 +6157,11 @@ def test_codex_stop_hook_migrates_legacy_sessionless_pane_key(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append(route)
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     payload = {
         "turn_id": "turn-1",
         "last_assistant_message": "First pane stop.",
@@ -6168,12 +6207,12 @@ def test_codex_stop_hook_suppresses_overlapping_duplicate(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         time.sleep(0.05)
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     for env_name in (
         "WEBMUX_AGENT_SESSION",
         "CODEX_TMUX_SESSION_NAME",
@@ -6227,12 +6266,12 @@ def test_codex_stop_hook_serializes_session_and_fallback_aliases(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         time.sleep(0.05)
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     payload = {
         "session_id": "codex-session-1",
         "turn_id": "turn-1",
@@ -6284,12 +6323,12 @@ def test_codex_stop_hook_serializes_persisted_aliases_without_binding(
         monkeypatch.delenv(env_name, raising=False)
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         time.sleep(0.05)
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     initial_payload = {
         "session_id": "codex-session-1",
         "turn_id": "turn-1",
@@ -6369,11 +6408,11 @@ def test_codex_stop_hook_recovers_legacy_null_fallback_key(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     notify_codex_agent_stop(
         profile,
         json.dumps(
@@ -6438,7 +6477,7 @@ def test_codex_stop_hook_busy_alias_does_not_block_unrelated_session(
     unrelated_posted = threading.Event()
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         if "Slow stop." in text:
             slow_post_started.set()
@@ -6447,7 +6486,7 @@ def test_codex_stop_hook_busy_alias_does_not_block_unrelated_session(
             unrelated_posted.set()
         return {"channel": "D111", "ts": f"{len(calls)}.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     slow_payload = json.dumps(
         {
             "session_id": "codex-session-slow",
@@ -6514,12 +6553,12 @@ def test_codex_stop_hook_times_out_waiting_for_busy_alias(
     slow_post_started = threading.Event()
     release_slow_post = threading.Event()
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         slow_post_started.set()
         release_slow_post.wait(timeout=2)
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-slow",
@@ -6608,7 +6647,7 @@ def test_codex_stop_hook_pre_delivery_state_timeout_is_retryable(
     )
     monkeypatch.setattr(
         slackbot_module,
-        "post_slack_message",
+        "post_slack_blocks",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("pre-delivery timeout must not post")
         ),
@@ -6650,7 +6689,7 @@ def test_codex_stop_hook_fails_closed_for_corrupt_state(
     state_path.write_text('{"sessions":', encoding="utf-8")
     monkeypatch.setattr(
         slackbot_module,
-        "post_slack_message",
+        "post_slack_blocks",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("corrupt state must fail before Slack delivery")
         ),
@@ -6749,13 +6788,13 @@ def test_codex_stop_hook_recovers_receipt_after_post_state_timeout(
     holder = threading.Thread(target=hold_state_lock)
     holder.start()
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         start_holder.set()
         assert lock_held.wait(timeout=1)
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -6830,7 +6869,7 @@ def test_codex_stop_hook_recovers_legacy_receipt_identity(
         },
     )
     monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
+        "sneeze.slackbot.post_slack_blocks",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("legacy receipt should prevent a second post")
         ),
@@ -6913,7 +6952,7 @@ def test_legacy_receipt_without_cutoff_preserves_rejected_route(
     )
     monkeypatch.setattr(
         slackbot_module,
-        "post_slack_message",
+        "post_slack_blocks",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("legacy receipt should prevent a second post")
         ),
@@ -7501,7 +7540,7 @@ def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
     state_path = slackbot_module.agent_codex_hook_state_path(config.paths)
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
@@ -7512,7 +7551,7 @@ def test_codex_stop_hook_wraps_post_receipt_state_io_failure(
             raise OSError("state disk error")
         return original_write_json(path, data, *args, **kwargs)
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     monkeypatch.setattr(
         "sneeze.slackbot.write_json_atomic",
         fail_state_write,
@@ -7612,7 +7651,7 @@ def test_codex_stop_hook_finalizes_state_after_first_receipt_write_failure(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
@@ -7623,7 +7662,7 @@ def test_codex_stop_hook_finalizes_state_after_first_receipt_write_failure(
             raise OSError("first receipt disk error")
         return original_write_json(path, data, *args, **kwargs)
 
-    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
     monkeypatch.setattr(
         slackbot_module,
         "write_json_atomic",
@@ -7694,8 +7733,8 @@ def test_codex_stop_hook_rejects_mismatched_receipt_binding(
     )
     calls = []
     monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
-        lambda config, route, text: (
+        "sneeze.slackbot.post_slack_blocks",
+        lambda config, route, text, blocks: (
             calls.append(route) or {"channel": "D111", "ts": "1.000001"}
         ),
     )
@@ -7768,7 +7807,7 @@ def test_codex_stop_hook_wraps_durable_receipt_cleanup_failure(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
@@ -7779,7 +7818,7 @@ def test_codex_stop_hook_wraps_durable_receipt_cleanup_failure(
             raise OSError("cleanup disk error")
         return original_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     monkeypatch.setattr(Path, "unlink", fail_receipt_unlink)
     payload = json.dumps(
         {
@@ -7818,11 +7857,11 @@ def test_codex_stop_hook_wraps_duplicate_receipt_cleanup_failure(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -7891,7 +7930,7 @@ def test_codex_stop_hook_receipt_does_not_cross_shared_tmux_sessions(
     holder = threading.Thread(target=hold_state_lock)
     holder.start()
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         if len(calls) == 1:
             start_holder.set()
@@ -7901,7 +7940,7 @@ def test_codex_stop_hook_receipt_does_not_cross_shared_tmux_sessions(
             "ts": f"{len(calls)}.000001",
         }
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
 
     def payload(session_id):
         return json.dumps(
@@ -8009,7 +8048,7 @@ def test_codex_stop_hook_recovers_binding_without_duplicate_post(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
@@ -8031,7 +8070,7 @@ def test_codex_stop_hook_recovers_binding_without_duplicate_post(
         config.paths.agent_tmux_bindings_path,
         bindings,
     )
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     monkeypatch.setattr("sneeze.slackbot.bind_agent_tmux_thread", fail_bind)
     payload = json.dumps(
         {
@@ -8101,14 +8140,14 @@ def test_codex_stop_hook_finalizes_superseded_route_read_only(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
     def fail_bind(*args, **kwargs):
         raise OSError("simulated binding failure")
 
-    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
     monkeypatch.setattr(slackbot_module, "bind_agent_tmux_thread", fail_bind)
     payload = json.dumps(
         {
@@ -8195,11 +8234,11 @@ def test_codex_stop_hook_does_not_restore_guardless_legacy_notification(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -8265,14 +8304,14 @@ def test_codex_stop_hook_finalizes_guardless_legacy_receipt_read_only(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
     def fail_bind(*args, **kwargs):
         raise OSError("simulated binding failure")
 
-    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
     monkeypatch.setattr(slackbot_module, "bind_agent_tmux_thread", fail_bind)
     payload = json.dumps(
         {
@@ -8347,11 +8386,11 @@ def test_codex_stop_hook_does_not_restore_after_tombstone_age_eviction(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -8429,11 +8468,11 @@ def test_codex_stop_hook_does_not_restore_after_tombstone_capacity_eviction(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -8509,11 +8548,11 @@ def test_codex_stop_hook_recovery_cutoff_matches_transcript(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -8596,7 +8635,7 @@ def test_codex_stop_hook_preserves_route_claimed_during_slack_delivery(
         else "codex-work"
     )
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         bind_agent_tmux_thread(
             profile,
@@ -8608,7 +8647,7 @@ def test_codex_stop_hook_preserves_route_claimed_during_slack_delivery(
         )
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -8685,7 +8724,7 @@ def test_codex_stop_hook_preserves_more_specific_same_route_binding(
     )
     concurrent_bindings = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         concurrent_bindings.append(
             bind_agent_tmux_thread(
                 profile,
@@ -8702,7 +8741,7 @@ def test_codex_stop_hook_preserves_more_specific_same_route_binding(
         )
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
 
     notify_codex_agent_stop(
         profile,
@@ -8744,11 +8783,11 @@ def test_duplicate_rejected_cleanup_uses_original_binding_cutoff(
     )
     calls = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         calls.append((route, text))
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr(slackbot_module, "post_slack_message", fake_post)
+    monkeypatch.setattr(slackbot_module, "post_slack_blocks", fake_post)
     payload = json.dumps(
         {
             "session_id": "codex-session-1",
@@ -8798,11 +8837,24 @@ def test_duplicate_rejected_cleanup_uses_original_binding_cutoff(
     )
 
 
+@pytest.mark.parametrize(
+    ("app_enabled", "footer"),
+    [
+        (False, "This notification is read-only."),
+        (True, "Reply in this thread to continue."),
+    ],
+)
 def test_codex_stop_hook_can_notify_without_tmux_binding(
     tmp_path,
     monkeypatch,
+    app_enabled,
+    footer,
 ):
-    profile = make_profile(tmp_path)
+    profile = replace(
+        make_profile(tmp_path),
+        codex_app_server_interaction_enabled=app_enabled,
+        codex_app_server_interaction_sources=("vscode",),
+    )
     scaffold_runtime(profile, bot_token="xoxb-test", app_token="xapp-test")
     env_path = Path(load_config(profile).paths.env_path)
     env_path.write_text(
@@ -8816,17 +8868,24 @@ def test_codex_stop_hook_can_notify_without_tmux_binding(
         "TMUX_PANE",
     ):
         monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    rollout = tmp_path / "desktop-session.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":'
+        '{"id":"codex-session-1","source":"vscode"}}\n',
+        encoding="utf-8",
+    )
     calls = []
 
-    def fake_post(config, route, text):
-        calls.append((route, text))
+    def fake_post(config, route, text, blocks):
+        calls.append(blocks)
         return {
             "channel": "D111",
             "ts": "1.000001",
         }
 
     monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
+        "sneeze.slackbot.post_slack_blocks",
         fake_post,
     )
 
@@ -8835,6 +8894,7 @@ def test_codex_stop_hook_can_notify_without_tmux_binding(
         json.dumps(
             {
                 "session_id": "codex-session-1",
+                "transcript_path": str(rollout),
                 "turn_id": "turn-1",
                 "last_assistant_message": "Ready for review.",
             }
@@ -8843,8 +8903,7 @@ def test_codex_stop_hook_can_notify_without_tmux_binding(
 
     assert result["status"] == "notified"
     assert result["tmux_binding"] is None
-    assert "read-only" in calls[0][1]
-    assert "Reply in this thread" not in calls[0][1]
+    assert calls[0][-1]["elements"][0]["text"] == footer
     assert query_codex_agent_threads(profile)["agent_tmux_bindings"] == {}
 
 
@@ -17428,11 +17487,11 @@ def test_unbound_notification_thread_replies_are_read_only(
         monkeypatch.delenv(env_name, raising=False)
     posts = []
 
-    def fake_post(config, route, text):
+    def fake_post(config, route, text, blocks):
         posts.append(text)
         return {"channel": "D111", "ts": "1.000001"}
 
-    monkeypatch.setattr("sneeze.slackbot.post_slack_message", fake_post)
+    monkeypatch.setattr("sneeze.slackbot.post_slack_blocks", fake_post)
     notify_codex_agent_stop(
         profile,
         json.dumps(
@@ -17444,6 +17503,10 @@ def test_unbound_notification_thread_replies_are_read_only(
         ),
     )
     posts.clear()
+    monkeypatch.setattr(
+        "sneeze.slackbot.post_slack_message",
+        lambda config, route, text: posts.append(text),
+    )
     bot = SlackSocketBot(load_config(profile))
     monkeypatch.setattr(
         bot,
@@ -17491,8 +17554,8 @@ def test_authorized_unbound_notification_thread_uses_normal_dm_dispatch(
     ):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setattr(
-        "sneeze.slackbot.post_slack_message",
-        lambda config, route, text: {
+        "sneeze.slackbot.post_slack_blocks",
+        lambda config, route, text, blocks: {
             "channel": "D111",
             "ts": "1.000001",
         },
@@ -18570,3 +18633,53 @@ def test_tmux_dev_resolves_conda_manager_from_env_prefix(
     monkeypatch.setattr("sneeze.tmux_dev.shutil.which", lambda name: None)
 
     assert resolve_executable(None, "mamba") == str(mamba)
+
+
+def test_codex_slack_answer_formats_links_and_preview():
+    original = (
+        "## Review\n"
+        "**Use `run_all` here.** See [PR at `abc123`]"
+        "(https://example.org/pulls/1#discussion).\n"
+        "1. [Runner](/work/run.py:42)\n"
+        "2. [Log](</work/PR 1/results (old).log>)"
+    )
+    markdown = slackbot_module._codex_slack_markdown(original)
+    assert markdown == (
+        "## Review\n"
+        "**Use `run_all` here.** See [PR at `abc123`]"
+        "(https://example.org/pulls/1#discussion).\n"
+        "1. Runner (`/work/run.py:42`)\n"
+        "2. Log (`/work/PR 1/results (old).log`)"
+    )
+    assert slackbot_module._codex_slack_plain_text(markdown) == (
+        "Review\nUse run_all here. See PR at abc123.\n"
+        "1. Runner (/work/run.py:42)\n"
+        "2. Log (/work/PR 1/results (old).log)"
+    )
+
+
+def test_codex_slack_answer_keeps_literal_examples():
+    text = (
+        "Example: `[name](/a/b)`\n"
+        "```python\nprint('[name](/a/b)', '**bold**')\n```\n"
+        "~~~\n[unfinished](/a/b)\n"
+    )
+    assert slackbot_module._codex_slack_markdown(text) == text
+    assert slackbot_module._codex_slack_plain_text(text) == (
+        "Example: [name](/a/b)\n"
+        "print('[name](/a/b)', '**bold**')\n[unfinished](/a/b)"
+    )
+
+
+def test_codex_slack_preview_keeps_unpaired_emphasis_markers():
+    text = (
+        "Check *.py, foo_, and file_*.log. **Keep `code` bold.**\n"
+        "Read _the [review](https://example.org/pr/1)_ and ~~old~~ notes.\n"
+        "**One **nested** phrase.**\n"
+        "An *unfinished thought.\n\nThe last word*."
+    )
+    assert slackbot_module._codex_slack_plain_text(text) == (
+        "Check *.py, foo_, and file_*.log. Keep code bold.\n"
+        "Read the review and old notes.\nOne nested phrase.\n"
+        "An *unfinished thought.\n\nThe last word*."
+    )

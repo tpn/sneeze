@@ -879,7 +879,7 @@ def test_review_turn_revokes_cached_app_server_candidate(
     )
     monkeypatch.setattr(
         slackbot_module,
-        "post_slack_message",
+        "post_slack_blocks",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("review hook must not post")
         ),
@@ -1074,8 +1074,8 @@ def test_degraded_metadata_revalidates_and_revokes_cached_candidate(
     posts = []
     monkeypatch.setattr(
         slackbot_module,
-        "post_slack_message",
-        lambda config, recovered_route, text: (
+        "post_slack_blocks",
+        lambda config, recovered_route, text, blocks: (
             posts.append((recovered_route, text))
             or {"channel": "D111", "ts": "2.000002"}
         ),
